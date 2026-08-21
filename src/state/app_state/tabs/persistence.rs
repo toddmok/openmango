@@ -404,10 +404,14 @@ impl AppState {
     }
 
     pub(in crate::state::app_state) fn update_workspace_selection(&mut self) {
-        if let Some(index) = self.workspace.active_tab
-            && let Some(tab) = self.tabs.open.get(index)
-        {
-            match tab {
+        let active_tab = match self.tabs.active {
+            ActiveTab::Index(index) => self.tabs.open.get(index).cloned(),
+            ActiveTab::Preview => self.tabs.preview.clone().map(TabKey::Collection),
+            ActiveTab::None => None,
+        };
+
+        if let Some(tab) = active_tab {
+            match &tab {
                 TabKey::Collection(key) => {
                     self.workspace.selected_database = Some(key.database.clone());
                     self.workspace.selected_collection = Some(key.collection.clone());
@@ -536,6 +540,37 @@ mod tests {
         assert_eq!(state.workspace.open_tabs.len(), 2);
         assert_eq!(state.workspace.active_tab, Some(1));
         assert_eq!(state.workspace.open_tabs[1].collection, "preview");
+    }
+
+    #[test]
+    fn workspace_selection_uses_actual_active_tab_after_connection_filtering() {
+        let mut state = AppState::new();
+        let selected_connection = Uuid::new_v4();
+        let other_connection = Uuid::new_v4();
+        let forge_id = Uuid::new_v4();
+
+        state.conn.selected_connection = Some(selected_connection);
+        state.tabs.open.push(TabKey::Collection(SessionKey::new(
+            other_connection,
+            "sales",
+            "orders",
+        )));
+        state.tabs.open.push(TabKey::Forge(ForgeTabKey {
+            id: forge_id,
+            connection_id: selected_connection,
+            database: "application".to_string(),
+        }));
+        state.forge_tabs.insert(
+            forge_id,
+            ForgeTabState { collection: Some("users".to_string()), ..ForgeTabState::default() },
+        );
+        state.tabs.active = ActiveTab::Index(1);
+
+        state.update_workspace_tabs();
+
+        assert_eq!(state.workspace.active_tab, Some(0));
+        assert_eq!(state.workspace.selected_database.as_deref(), Some("application"));
+        assert_eq!(state.workspace.selected_collection.as_deref(), Some("users"));
     }
 
     #[test]
