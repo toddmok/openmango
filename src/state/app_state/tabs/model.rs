@@ -19,8 +19,10 @@ const COLLECTION_FORGE_QUERY_SUFFIX: &str =
     "\n})\n// .projection({_id: 1})\n.sort({createdAt:-1}).limit(10).maxTimeMS(5000)";
 
 fn collection_forge_content(collection: &str) -> (String, usize) {
-    let collection =
-        serde_json::to_string(collection).expect("serializing a collection name cannot fail");
+    let collection = serde_json::to_string(collection)
+        .expect("serializing a collection name cannot fail")
+        .replace('\u{2028}', "\\u2028")
+        .replace('\u{2029}', "\\u2029");
     let prefix = format!("db.getCollection({collection}).find({{\n    ");
     let cursor = prefix.len();
     (format!("{prefix}{COLLECTION_FORGE_QUERY_SUFFIX}"), cursor)
@@ -1092,13 +1094,16 @@ mod tests {
 
     #[test]
     fn collection_forge_template_escapes_javascript_string_content() {
-        let (content, cursor) = collection_forge_content("archive\"\\\n2026");
+        let (content, cursor) = collection_forge_content("archive\"\\\n\u{2028}\u{2029}2026");
 
         assert_eq!(
             content,
-            "db.getCollection(\"archive\\\"\\\\\\n2026\").find({\n    \n})\n// .projection({_id: 1})\n.sort({createdAt:-1}).limit(10).maxTimeMS(5000)"
+            "db.getCollection(\"archive\\\"\\\\\\n\\u2028\\u20292026\").find({\n    \n})\n// .projection({_id: 1})\n.sort({createdAt:-1}).limit(10).maxTimeMS(5000)"
         );
-        assert_eq!(cursor, "db.getCollection(\"archive\\\"\\\\\\n2026\").find({\n    ".len());
+        assert_eq!(
+            cursor,
+            "db.getCollection(\"archive\\\"\\\\\\n\\u2028\\u20292026\").find({\n    ".len()
+        );
     }
 
     #[cfg(target_os = "macos")]
