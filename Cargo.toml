@@ -72,6 +72,9 @@ rmcp = { version = "=3.1.2", default-features = false, features = ["client", "tr
 testcontainers = "0.27"
 testcontainers-modules = { version = "0.15.0", features = ["mongo"] }
 
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+gpui = { version = "0.2.2", features = ["test-support"] }
+
 [profile.dev]
 opt-level = 1
 split-debuginfo = "unpacked"

@@ -116,27 +116,33 @@ EOF2
 SIGNING_IDENTITY="${MACOS_SIGNING_IDENTITY:-}"
 if [[ -n "$SIGNING_IDENTITY" ]]; then
     echo "Codesigning app with identity: $SIGNING_IDENTITY"
-    # Sign bundled tools first (required before signing the app bundle)
-    if [[ -f "$APP_DIR/Contents/Resources/bin/mongodump" ]]; then
-        codesign --force --options runtime --timestamp --sign "$SIGNING_IDENTITY" "$APP_DIR/Contents/Resources/bin/mongodump"
-    fi
-    if [[ -f "$APP_DIR/Contents/Resources/bin/mongorestore" ]]; then
-        codesign --force --options runtime --timestamp --sign "$SIGNING_IDENTITY" "$APP_DIR/Contents/Resources/bin/mongorestore"
-    fi
-    if [[ -f "$APP_DIR/Contents/Resources/bin/mongosh-sidecar" ]]; then
-        codesign --force --options runtime --timestamp --sign "$SIGNING_IDENTITY" "$APP_DIR/Contents/Resources/bin/mongosh-sidecar"
-    fi
-    # Sign the main app bundle
-    codesign --force --options runtime --timestamp --deep --sign "$SIGNING_IDENTITY" "$APP_DIR"
-    codesign --verify --deep --strict "$APP_DIR"
+    CODESIGN_ARGS=(--options runtime --timestamp --sign "$SIGNING_IDENTITY")
+else
+    # GitHub forks and local test builds usually do not have a Developer ID
+    # certificate. An ad-hoc signature still seals every executable in the
+    # bundle, but it does not replace Developer ID signing or notarization.
+    SIGNING_IDENTITY="-"
+    CODESIGN_ARGS=(--sign "$SIGNING_IDENTITY")
+    echo "No signing certificate provided; applying an ad-hoc signature."
 fi
+
+# Sign bundled tools first, then seal and verify the complete app bundle.
+for tool in mongodump mongorestore mongosh-sidecar; do
+    tool_path="$APP_DIR/Contents/Resources/bin/$tool"
+    if [[ -f "$tool_path" ]]; then
+        codesign --force "${CODESIGN_ARGS[@]}" "$tool_path"
+    fi
+done
+codesign --force --deep "${CODESIGN_ARGS[@]}" "$APP_DIR"
+codesign --verify --deep --strict "$APP_DIR"
+codesign --display --verbose=4 "$APP_DIR" 2>&1
 
 ZIP_PATH="$DIST_DIR/${APP_NAME}-${VERSION}-${ARCH_SUFFIX}.zip"
 rm -f "$ZIP_PATH"
 
 ditto -c -k --sequesterRsrc --keepParent "$APP_DIR" "$ZIP_PATH"
 
-if [[ -n "${APPLE_API_KEY_ID:-}" && -n "${APPLE_API_ISSUER_ID:-}" ]]; then
+if [[ "$SIGNING_IDENTITY" != "-" && -n "${APPLE_API_KEY_ID:-}" && -n "${APPLE_API_ISSUER_ID:-}" ]]; then
     NOTARY_KEY_PATH="${APPLE_API_KEY_PATH:-"$DIST_DIR/AuthKey.p8"}"
     if [[ -n "${APPLE_API_KEY:-}" ]]; then
         if base64 --help 2>&1 | grep -q -- "-d"; then
@@ -160,6 +166,8 @@ if [[ -n "${APPLE_API_KEY_ID:-}" && -n "${APPLE_API_ISSUER_ID:-}" ]]; then
     # Re-create zip with stapled app
     rm -f "$ZIP_PATH"
     ditto -c -k --sequesterRsrc --keepParent "$APP_DIR" "$ZIP_PATH"
+elif [[ "$SIGNING_IDENTITY" == "-" && ( -n "${APPLE_API_KEY_ID:-}" || -n "${APPLE_API_ISSUER_ID:-}" ) ]]; then
+    echo "Warning: skipping notarization because no Developer ID signing identity was provided."
 fi
 
 echo "Built: $APP_DIR"

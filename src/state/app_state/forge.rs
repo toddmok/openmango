@@ -35,12 +35,15 @@ impl AppState {
     /// Get Forge tab label for display
     pub fn forge_tab_label(&self, id: Uuid) -> String {
         use super::types::TabKey;
-        // Find the forge tab key to get the database name
         for tab in &self.tabs.open {
             if let TabKey::Forge(key) = tab
                 && key.id == id
             {
-                return format!("Forge: {}", key.database);
+                return match self.forge_tabs.get(&id).and_then(|state| state.collection.as_deref())
+                {
+                    Some(collection) => format!("Forge: {}/{}", key.database, collection),
+                    None => format!("Forge: {}", key.database),
+                };
             }
         }
         "Forge".to_string()
@@ -49,6 +52,11 @@ impl AppState {
     /// Get the stored content for a Forge tab.
     pub fn forge_tab_content(&self, id: Uuid) -> Option<&str> {
         self.forge_tabs.get(&id).map(|state| state.content.as_str())
+    }
+
+    /// Get the collection associated with a Forge tab, if it was opened for one.
+    pub fn forge_tab_collection(&self, id: Uuid) -> Option<&str> {
+        self.forge_tabs.get(&id).and_then(|state| state.collection.as_deref())
     }
 
     /// Update the stored content for a Forge tab.

@@ -4,6 +4,16 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      architecture:
+        description: macOS architecture to build
+        required: true
+        default: all
+        type: choice
+        options:
+          - all
+          - arm64
+          - x86_64
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -23,11 +33,7 @@ jobs:
     runs-on: macos-latest
     strategy:
       matrix:
-        include:
-          - target: aarch64-apple-darwin
-            suffix: macos-arm64
-          - target: x86_64-apple-darwin
-            suffix: macos-x86_64
+        include: ${{ fromJSON(inputs.architecture == 'arm64' && '[{"target":"aarch64-apple-darwin","suffix":"macos-arm64"}]' || inputs.architecture == 'x86_64' && '[{"target":"x86_64-apple-darwin","suffix":"macos-x86_64"}]' || '[{"target":"aarch64-apple-darwin","suffix":"macos-arm64"},{"target":"x86_64-apple-darwin","suffix":"macos-x86_64"}]') }}
     steps:
       - uses: actions/checkout@v4
 
@@ -103,6 +109,19 @@ jobs:
           REQUIRE_BUNDLED_TOOLS: "1"
         run: scripts/release_macos.sh ${{ matrix.target }}
 
+      - name: Verify packaged app signature
+        run: |
+          VERIFY_DIR="$RUNNER_TEMP/openmango-signature-verify"
+          mkdir -p "$VERIFY_DIR"
+          ZIP_PATHS=(dist/OpenMango-*-${{ matrix.suffix }}.zip)
+          if [[ ${#ZIP_PATHS[@]} -ne 1 || ! -f "${ZIP_PATHS[0]}" ]]; then
+            echo "Expected exactly one packaged app, found: ${ZIP_PATHS[*]}" >&2
+            exit 1
+          fi
+          ditto -x -k "${ZIP_PATHS[0]}" "$VERIFY_DIR"
+          codesign --verify --deep --strict "$VERIFY_DIR/OpenMango.app"
+          codesign --display --verbose=4 "$VERIFY_DIR/OpenMango.app" 2>&1
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
@@ -110,6 +129,7 @@ jobs:
           path: dist/OpenMango-*-${{ matrix.suffix }}.zip
 
   release:
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || inputs.architecture == 'all')
     needs: macos
     runs-on: ubuntu-latest
     steps:

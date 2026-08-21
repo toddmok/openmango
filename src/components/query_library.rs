@@ -27,10 +27,15 @@ use crate::views::documents::compile_filter_input;
 pub enum QueryLibraryTarget {
     Documents(SessionKey),
     Aggregation(SessionKey),
-    Forge(ForgeTabKey),
+    Forge { key: ForgeTabKey, collection: Option<String> },
 }
 
 impl QueryLibraryTarget {
+    pub fn forge(state: &AppState, key: ForgeTabKey) -> Self {
+        let collection = state.forge_tab_collection(key.id).map(str::to_string);
+        Self::Forge { key, collection }
+    }
+
     fn current(state: &AppState) -> Option<Self> {
         match state.current_view {
             View::Documents => {
@@ -41,7 +46,7 @@ impl QueryLibraryTarget {
                     _ => None,
                 }
             }
-            View::Forge => state.active_forge_tab_key().cloned().map(Self::Forge),
+            View::Forge => state.active_forge_tab_key().cloned().map(|key| Self::forge(state, key)),
             _ => None,
         }
     }
@@ -49,7 +54,7 @@ impl QueryLibraryTarget {
     fn connection_id(&self) -> Uuid {
         match self {
             Self::Documents(key) | Self::Aggregation(key) => key.connection_id,
-            Self::Forge(key) => key.connection_id,
+            Self::Forge { key, .. } => key.connection_id,
         }
     }
 
@@ -57,7 +62,7 @@ impl QueryLibraryTarget {
         match self {
             Self::Documents(_) => QueryKind::Documents,
             Self::Aggregation(_) => QueryKind::Aggregation,
-            Self::Forge(_) => QueryKind::Forge,
+            Self::Forge { .. } => QueryKind::Forge,
         }
     }
 
@@ -75,9 +80,12 @@ impl QueryLibraryTarget {
                 &key.database,
                 Some(&key.collection),
             ),
-            Self::Forge(key) => {
-                definition.matches_scope(QueryKind::Forge, key.connection_id, &key.database, None)
-            }
+            Self::Forge { key, collection } => definition.matches_scope(
+                QueryKind::Forge,
+                key.connection_id,
+                &key.database,
+                collection.as_deref(),
+            ),
         }
     }
 
@@ -87,7 +95,10 @@ impl QueryLibraryTarget {
             Self::Documents(key) | Self::Aggregation(key) => {
                 format!("{connection} / {}.{}", key.database, key.collection)
             }
-            Self::Forge(key) => format!("{connection} / {}", key.database),
+            Self::Forge { key, collection } => match collection {
+                Some(collection) => format!("{connection} / {}.{collection}", key.database),
+                None => format!("{connection} / {}", key.database),
+            },
         }
     }
 
@@ -124,10 +135,10 @@ impl QueryLibraryTarget {
                     },
                 )
             }
-            Self::Forge(key) => (
+            Self::Forge { key, collection } => (
                 key.connection_id,
                 key.database.clone(),
-                None,
+                collection.clone(),
                 QueryContent::Forge { statement: state.forge_tab_content(key.id)?.to_string() },
             ),
         };
@@ -418,7 +429,9 @@ impl QueryLibraryDialog {
                 QueryLibraryTarget::Aggregation(key) => {
                     state.restore_aggregation_query(key, &definition)
                 }
-                QueryLibraryTarget::Forge(key) => state.restore_forge_query(key, &definition),
+                QueryLibraryTarget::Forge { key, .. } => {
+                    state.restore_forge_query(key, &definition)
+                }
             };
             if result.is_ok() {
                 state.set_status_message(Some(StatusMessage::info(status)));
@@ -443,7 +456,7 @@ impl QueryLibraryDialog {
                 QueryLibraryTarget::Aggregation(key) => {
                     crate::views::documents::request_run_aggregation(state, key, false, window, cx);
                 }
-                QueryLibraryTarget::Forge(_) => {
+                QueryLibraryTarget::Forge { .. } => {
                     window.dispatch_action(Box::new(RunForgeAll), cx);
                 }
             });
@@ -1579,4 +1592,34 @@ fn connection_label(state: &AppState, connection_id: Uuid) -> String {
 
 fn format_timestamp(timestamp: DateTime<Utc>) -> String {
     timestamp.with_timezone(&Local).format("%b %-d, %H:%M").to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::QueryLibraryTarget;
+    use crate::state::{ForgeTabKey, QueryContent, QueryDefinition};
+    use uuid::Uuid;
+
+    #[test]
+    fn collection_forge_target_matches_only_its_collection_scope() {
+        let connection_id = Uuid::new_v4();
+        let target = QueryLibraryTarget::Forge {
+            key: ForgeTabKey {
+                id: Uuid::new_v4(),
+                connection_id,
+                database: "application".to_string(),
+            },
+            collection: Some("users".to_string()),
+        };
+        let definition = |collection: Option<&str>| QueryDefinition {
+            connection_id,
+            database: "application".to_string(),
+            collection: collection.map(str::to_string),
+            content: QueryContent::Forge { statement: "db.version()".to_string() },
+        };
+
+        assert!(target.matches_scope(&definition(Some("users"))));
+        assert!(!target.matches_scope(&definition(Some("events"))));
+        assert!(!target.matches_scope(&definition(None)));
+    }
 }

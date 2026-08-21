@@ -17,7 +17,7 @@ use crate::components::filter_builder::FilterBuilderPanel;
 use crate::helpers::auto_pair::AutoPairState;
 use crate::perf::log_tabs_duration;
 use crate::state::{
-    AppCommands, AppEvent, AppState, CollectionSubview, SessionDocument, SessionKey,
+    AppCommands, AppEvent, AppState, CollectionSubview, SessionDocument, SessionKey, View,
 };
 
 use super::node_meta::NodeMeta;
@@ -95,6 +95,13 @@ fn defer_aggregation_shortcut_to_keymap(command: bool, is_aggregation: bool) -> 
     command && is_aggregation
 }
 
+fn session_for_documents_view(
+    current_view: View,
+    session: Option<SessionKey>,
+) -> Option<SessionKey> {
+    matches!(current_view, View::Documents).then_some(session).flatten()
+}
+
 impl CollectionView {
     pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
         let mut subscriptions = vec![cx.observe(&state, |this, state, cx| {
@@ -120,6 +127,9 @@ impl CollectionView {
                 return;
             }
             view.update(cx, |this, cx| {
+                if !matches!(this.state.read(cx).current_view, View::Documents) {
+                    return;
+                }
                 let mut handled = false;
 
                 let save_selected_document =
@@ -242,7 +252,8 @@ impl CollectionView {
 
         let current_session = {
             let state_ref = state.read(cx);
-            let session = state_ref.current_session_key();
+            let session =
+                session_for_documents_view(state_ref.current_view, state_ref.current_session_key());
             if let Some(session_key) = session.clone() {
                 let should_load =
                     state_ref.session_data(&session_key).map(|data| !data.loaded).unwrap_or(true);
@@ -259,13 +270,18 @@ impl CollectionView {
         subscriptions.push(cx.subscribe(&state, |this, state, event, cx| match event {
             AppEvent::ViewChanged | AppEvent::Connected(_) => {
                 let start = Instant::now();
-                let next_session = state.read(cx).current_session_key();
+                let next_session = {
+                    let state_ref = state.read(cx);
+                    session_for_documents_view(
+                        state_ref.current_view,
+                        state_ref.current_session_key(),
+                    )
+                };
                 if this.input_session != next_session {
                     this.persist_query_input_drafts(cx);
                 }
 
                 let state_ref = state.read(cx);
-                let next_session = state_ref.current_session_key();
                 let should_load = next_session
                     .as_ref()
                     .map(|session| {
@@ -1040,12 +1056,25 @@ impl SearchMatcher {
 
 #[cfg(test)]
 mod shortcut_tests {
-    use super::defer_aggregation_shortcut_to_keymap;
+    use super::{defer_aggregation_shortcut_to_keymap, session_for_documents_view};
+    use crate::state::{SessionKey, View};
+    use uuid::Uuid;
 
     #[test]
     fn aggregation_command_shortcuts_are_not_globally_intercepted() {
         assert!(defer_aggregation_shortcut_to_keymap(true, true));
         assert!(!defer_aggregation_shortcut_to_keymap(true, false));
         assert!(!defer_aggregation_shortcut_to_keymap(false, true));
+    }
+
+    #[test]
+    fn forge_view_does_not_expose_a_document_session() {
+        let session = SessionKey::new(Uuid::new_v4(), "db", "users");
+
+        assert_eq!(
+            session_for_documents_view(View::Documents, Some(session.clone())),
+            Some(session.clone())
+        );
+        assert_eq!(session_for_documents_view(View::Forge, Some(session)), None);
     }
 }

@@ -73,7 +73,9 @@ impl AppState {
         let workspace_tabs = self.workspace.open_tabs.clone();
         let mut restored_tabs: Vec<TabKey> = Vec::new();
         let mut restored_meta: Vec<(SessionKey, WorkspaceTab)> = Vec::new();
-        for tab in &workspace_tabs {
+        let mut restored_active_tab = None;
+        for (workspace_index, tab) in workspace_tabs.iter().enumerate() {
+            let restored_index = restored_tabs.len();
             match tab.kind {
                 WorkspaceTabKind::Collection => {
                     if tab.collection.is_empty() {
@@ -136,6 +138,8 @@ impl AppState {
                         let key = ForgeTabKey { id, connection_id, database: tab.database.clone() };
                         let state = ForgeTabState {
                             content: tab.forge_content.clone(),
+                            collection: (!tab.collection.is_empty())
+                                .then(|| tab.collection.clone()),
                             is_running: false,
                             error: None,
                             pending_cursor: None,
@@ -144,6 +148,12 @@ impl AppState {
                         restored_tabs.push(TabKey::Forge(key));
                     }
                 }
+            }
+
+            if restored_tabs.len() > restored_index
+                && self.workspace.active_tab == Some(workspace_index)
+            {
+                restored_active_tab = Some(restored_index);
             }
         }
 
@@ -161,31 +171,9 @@ impl AppState {
             }
         }
 
-        self.tabs.open = restored_tabs.clone();
+        self.tabs.open = restored_tabs;
         self.tabs.preview = None;
         self.tabs.dirty.clear();
-
-        let active_tab =
-            self.workspace.active_tab.and_then(|idx| workspace_tabs.get(idx)).and_then(|tab| {
-                restored_tabs.iter().position(|key| match (tab.kind, key) {
-                    (WorkspaceTabKind::Collection, TabKey::Collection(session)) => {
-                        session.database == tab.database && session.collection == tab.collection
-                    }
-                    (WorkspaceTabKind::Database, TabKey::Database(database)) => {
-                        database.database == tab.database
-                    }
-                    (WorkspaceTabKind::Transfer, TabKey::Transfer(transfer)) => {
-                        let Some(state) = self.transfer_tabs.get(&transfer.id) else {
-                            return false;
-                        };
-                        state.config.source_database == tab.database
-                    }
-                    (WorkspaceTabKind::Forge, TabKey::Forge(forge)) => {
-                        forge.database == tab.database
-                    }
-                    _ => false,
-                })
-            });
 
         for (key, tab) in restored_meta.iter() {
             let session = self.ensure_session(key.clone());
@@ -229,7 +217,7 @@ impl AppState {
             }
         }
 
-        active_tab
+        restored_active_tab
     }
 
     fn build_workspace_tab(&self, tab: &TabKey) -> WorkspaceTab {
@@ -362,7 +350,11 @@ impl AppState {
                     .unwrap_or_default();
                 WorkspaceTab {
                     database: key.database.clone(),
-                    collection: String::new(),
+                    collection: self
+                        .forge_tabs
+                        .get(&key.id)
+                        .and_then(|state| state.collection.clone())
+                        .unwrap_or_default(),
                     kind: WorkspaceTabKind::Forge,
                     transfer: None,
                     filter_raw: String::new(),
@@ -412,10 +404,14 @@ impl AppState {
     }
 
     pub(in crate::state::app_state) fn update_workspace_selection(&mut self) {
-        if let Some(index) = self.workspace.active_tab
-            && let Some(tab) = self.tabs.open.get(index)
-        {
-            match tab {
+        let active_tab = match self.tabs.active {
+            ActiveTab::Index(index) => self.tabs.open.get(index).cloned(),
+            ActiveTab::Preview => self.tabs.preview.clone().map(TabKey::Collection),
+            ActiveTab::None => None,
+        };
+
+        if let Some(tab) = active_tab {
+            match &tab {
                 TabKey::Collection(key) => {
                     self.workspace.selected_database = Some(key.database.clone());
                     self.workspace.selected_collection = Some(key.collection.clone());
@@ -438,7 +434,8 @@ impl AppState {
                 }
                 TabKey::Forge(key) => {
                     self.workspace.selected_database = Some(key.database.clone());
-                    self.workspace.selected_collection = None;
+                    self.workspace.selected_collection =
+                        self.forge_tabs.get(&key.id).and_then(|state| state.collection.clone());
                 }
                 TabKey::AgentActivity | TabKey::Settings | TabKey::Changelog => {
                     // Utility tabs don't affect selection
@@ -543,6 +540,131 @@ mod tests {
         assert_eq!(state.workspace.open_tabs.len(), 2);
         assert_eq!(state.workspace.active_tab, Some(1));
         assert_eq!(state.workspace.open_tabs[1].collection, "preview");
+    }
+
+    #[test]
+    fn workspace_selection_uses_actual_active_tab_after_connection_filtering() {
+        let mut state = AppState::new();
+        let selected_connection = Uuid::new_v4();
+        let other_connection = Uuid::new_v4();
+        let forge_id = Uuid::new_v4();
+
+        state.conn.selected_connection = Some(selected_connection);
+        state.tabs.open.push(TabKey::Collection(SessionKey::new(
+            other_connection,
+            "sales",
+            "orders",
+        )));
+        state.tabs.open.push(TabKey::Forge(ForgeTabKey {
+            id: forge_id,
+            connection_id: selected_connection,
+            database: "application".to_string(),
+        }));
+        state.forge_tabs.insert(
+            forge_id,
+            ForgeTabState { collection: Some("users".to_string()), ..ForgeTabState::default() },
+        );
+        state.tabs.active = ActiveTab::Index(1);
+
+        state.update_workspace_tabs();
+
+        assert_eq!(state.workspace.active_tab, Some(0));
+        assert_eq!(state.workspace.selected_database.as_deref(), Some("application"));
+        assert_eq!(state.workspace.selected_collection.as_deref(), Some("users"));
+    }
+
+    #[test]
+    fn workspace_roundtrips_multiple_collection_forge_tabs() {
+        let mut state = AppState::new();
+        let conn_id = Uuid::new_v4();
+        state.conn.selected_connection = Some(conn_id);
+
+        for collection in ["users", "events"] {
+            let id = Uuid::new_v4();
+            state.tabs.open.push(TabKey::Forge(ForgeTabKey {
+                id,
+                connection_id: conn_id,
+                database: "application".to_string(),
+            }));
+            state.forge_tabs.insert(
+                id,
+                ForgeTabState {
+                    content: format!("db.getCollection(\"{collection}\").find({{}})"),
+                    collection: Some(collection.to_string()),
+                    ..ForgeTabState::default()
+                },
+            );
+        }
+        state.tabs.active = ActiveTab::Index(1);
+
+        state.update_workspace_tabs();
+
+        assert_eq!(state.workspace.active_tab, Some(1));
+        assert_eq!(state.workspace.open_tabs.len(), 2);
+        assert_eq!(state.workspace.open_tabs[0].collection, "users");
+        assert_eq!(state.workspace.open_tabs[1].collection, "events");
+
+        let mut restored = AppState::new();
+        restored.workspace = state.workspace.clone();
+        let active = restored.restore_tabs_from_workspace(conn_id, &["application".to_string()]);
+        let collections = restored
+            .tabs
+            .open
+            .iter()
+            .filter_map(|tab| match tab {
+                TabKey::Forge(key) => {
+                    restored.forge_tabs.get(&key.id).and_then(|state| state.collection.as_deref())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(active, Some(1));
+        assert_eq!(collections, vec!["users", "events"]);
+    }
+
+    #[test]
+    fn workspace_restores_active_duplicate_forge_tab_by_index() {
+        let mut state = AppState::new();
+        let conn_id = Uuid::new_v4();
+        state.conn.selected_connection = Some(conn_id);
+
+        for content in ["first query", "second query"] {
+            let id = Uuid::new_v4();
+            state.tabs.open.push(TabKey::Forge(ForgeTabKey {
+                id,
+                connection_id: conn_id,
+                database: "application".to_string(),
+            }));
+            state.forge_tabs.insert(
+                id,
+                ForgeTabState {
+                    content: content.to_string(),
+                    collection: Some("users".to_string()),
+                    ..ForgeTabState::default()
+                },
+            );
+        }
+        state.tabs.active = ActiveTab::Index(1);
+        state.update_workspace_tabs();
+
+        let mut restored = AppState::new();
+        restored.workspace = state.workspace.clone();
+        let active = restored.restore_tabs_from_workspace(conn_id, &["application".to_string()]);
+        let contents = restored
+            .tabs
+            .open
+            .iter()
+            .filter_map(|tab| match tab {
+                TabKey::Forge(key) => {
+                    restored.forge_tabs.get(&key.id).map(|state| state.content.as_str())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(active, Some(1));
+        assert_eq!(contents, vec!["first query", "second query"]);
     }
 
     #[test]

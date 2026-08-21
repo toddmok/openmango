@@ -474,21 +474,19 @@ pub(crate) fn build_collection_menu(
 
     menu = menu
         .item(
-            PopupMenuItem::new("Open Collection")
-                .icon(Icon::new(IconName::Braces))
-                .action(Box::new(OpenSelection))
-                .on_click({
+            PopupMenuItem::new("Open Collection View").icon(Icon::new(IconName::Braces)).on_click(
+                {
                     let state = state.clone();
                     let database = database.clone();
                     let collection = collection.clone();
                     move |_, _window, cx| {
                         state.update(cx, |state, cx| {
                             state.select_connection(Some(connection_id), cx);
-                            state.select_database(database.clone(), cx);
                             state.select_collection(database.clone(), collection.clone(), cx);
                         });
                     }
-                }),
+                },
+            ),
         )
         .item(
             menu_item_with_shortcut("Open Forge", &OpenForge, window)

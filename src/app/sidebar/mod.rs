@@ -610,8 +610,7 @@ impl Sidebar {
             )
         {
             self.state.update(cx, |state, cx| {
-                state.select_connection(Some(node_id.connection_id()), cx);
-                state.select_collection(db, col, cx);
+                state.open_forge_tab(node_id.connection_id(), db, Some(col), cx);
             });
             window.dispatch_action(Box::new(FocusContent), cx);
         }
