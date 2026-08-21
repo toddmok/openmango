@@ -248,6 +248,7 @@ pub const DEFAULT_FORGE_CONTENT: &str = "";
 #[allow(dead_code)]
 pub struct ForgeTabState {
     pub content: String,
+    pub collection: Option<String>,
     pub is_running: bool,
     pub error: Option<String>,
     pub pending_cursor: Option<usize>,
@@ -257,6 +258,7 @@ impl Default for ForgeTabState {
     fn default() -> Self {
         Self {
             content: DEFAULT_FORGE_CONTENT.to_string(),
+            collection: None,
             is_running: false,
             error: None,
             pending_cursor: None,

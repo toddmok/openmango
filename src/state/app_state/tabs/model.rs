@@ -15,6 +15,17 @@ use crate::state::app_state::types::{
     TransferScope, TransferTabKey, TransferTabState, View,
 };
 
+const COLLECTION_FORGE_QUERY_SUFFIX: &str =
+    "\n})\n// .projection({_id: 1})\n.sort({createdAt:-1}).limit(10).maxTimeMS(5000)";
+
+fn collection_forge_content(collection: &str) -> (String, usize) {
+    let collection =
+        serde_json::to_string(collection).expect("serializing a collection name cannot fail");
+    let prefix = format!("db.getCollection({collection}).find({{\n    ");
+    let cursor = prefix.len();
+    (format!("{prefix}{COLLECTION_FORGE_QUERY_SUFFIX}"), cursor)
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(in crate::state::app_state) enum TabOpenMode {
     Preview,
@@ -134,7 +145,8 @@ impl AppState {
             TabKey::Forge(tab) => {
                 self.set_selected_connection_internal(tab.connection_id);
                 self.conn.selected_database = Some(tab.database.clone());
-                self.conn.selected_collection = None;
+                self.conn.selected_collection =
+                    self.forge_tabs.get(&tab.id).and_then(|state| state.collection.clone());
                 self.current_view = View::Forge;
             }
             TabKey::AgentActivity => {
@@ -551,7 +563,7 @@ impl AppState {
         cx.notify();
     }
 
-    /// Open a Forge query shell tab for a database (optionally prefilled for a collection).
+    /// Open a new Forge query shell tab for a database (optionally prefilled for a collection).
     pub fn open_forge_tab(
         &mut self,
         connection_id: Uuid,
@@ -559,38 +571,14 @@ impl AppState {
         collection: Option<String>,
         cx: &mut Context<Self>,
     ) {
-        // Check if a Forge tab for this database already exists
-        let existing_index = self.tabs.open.iter().position(|tab| {
-            matches!(
-                tab,
-                TabKey::Forge(key)
-                    if key.connection_id == connection_id && key.database == database
-            )
-        });
-
-        if let Some(index) = existing_index {
-            // Forge tab for this database already exists, select it
-            if self.active_index() != Some(index) {
-                self.set_active_index(index);
-                self.set_selected_connection_internal(connection_id);
-                self.conn.selected_database = Some(database);
-                self.current_view = View::Forge;
-                self.clear_error_status();
-                cx.emit(AppEvent::ViewChanged);
-                cx.notify();
-            }
-            return;
-        }
-
-        // Create new Forge tab
         let id = Uuid::new_v4();
         let key = ForgeTabKey { id, connection_id, database: database.clone() };
-        let mut state = ForgeTabState::default();
+        let mut state =
+            ForgeTabState { collection: collection.clone(), ..ForgeTabState::default() };
         let selected_collection = collection.clone();
-        if let Some(collection) = collection {
-            let escaped = collection.replace('"', "\\\"");
-            let content = format!("db.getCollection(\"{}\").find({{}})", escaped);
-            state.pending_cursor = content.rfind('{').map(|idx| idx + 1);
+        if let Some(collection) = collection.as_deref() {
+            let (content, cursor) = collection_forge_content(collection);
+            state.pending_cursor = Some(cursor);
             state.content = content;
         }
 
@@ -1063,8 +1051,12 @@ fn remap_active_index_after_tab_move(active: usize, from: usize, to: usize) -> u
 
 #[cfg(test)]
 mod tests {
-    use super::remap_active_index_after_tab_move;
+    use super::{collection_forge_content, remap_active_index_after_tab_move};
+    #[cfg(target_os = "macos")]
+    use crate::state::TabKey;
     use crate::state::{AppState, SessionKey};
+    #[cfg(target_os = "macos")]
+    use gpui::AppContext as _;
 
     #[test]
     fn cleanup_session_removes_or_retains() {
@@ -1096,5 +1088,68 @@ mod tests {
         // Active tab unaffected when move does not cross it.
         assert_eq!(remap_active_index_after_tab_move(0, 3, 5), 0);
         assert_eq!(remap_active_index_after_tab_move(5, 1, 3), 5);
+    }
+
+    #[test]
+    fn collection_forge_template_escapes_javascript_string_content() {
+        let (content, cursor) = collection_forge_content("archive\"\\\n2026");
+
+        assert_eq!(
+            content,
+            "db.getCollection(\"archive\\\"\\\\\\n2026\").find({\n    \n})\n// .projection({_id: 1})\n.sort({createdAt:-1}).limit(10).maxTimeMS(5000)"
+        );
+        assert_eq!(cursor, "db.getCollection(\"archive\\\"\\\\\\n2026\").find({\n    ".len());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[gpui::test]
+    fn collection_forge_tabs_are_independent_and_use_the_collection_template(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let state = cx.new(|_| AppState::new());
+        let connection_id = uuid::Uuid::new_v4();
+
+        state.update(cx, |state, cx| {
+            state.open_forge_tab(
+                connection_id,
+                "application".into(),
+                Some("users".into()),
+                cx,
+            );
+            state.open_forge_tab(
+                connection_id,
+                "application".into(),
+                Some("events".into()),
+                cx,
+            );
+
+            let forge_ids = state
+                .open_tabs()
+                .iter()
+                .filter_map(|tab| match tab {
+                    TabKey::Forge(key) => Some(key.id),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+
+            assert_eq!(forge_ids.len(), 2);
+            assert_eq!(
+                state.forge_tab_content(forge_ids[0]),
+                Some(
+                    "db.getCollection(\"users\").find({\n    \n})\n// .projection({_id: 1})\n.sort({createdAt:-1}).limit(10).maxTimeMS(5000)"
+                )
+            );
+            assert_eq!(
+                state.forge_tab_content(forge_ids[1]),
+                Some(
+                    "db.getCollection(\"events\").find({\n    \n})\n// .projection({_id: 1})\n.sort({createdAt:-1}).limit(10).maxTimeMS(5000)"
+                )
+            );
+            assert_eq!(state.forge_tab_label(forge_ids[0]), "Forge: application/users");
+            assert_eq!(state.forge_tab_label(forge_ids[1]), "Forge: application/events");
+
+            state.select_tab(0, cx);
+            assert_eq!(state.selected_collection_name().as_deref(), Some("users"));
+        });
     }
 }

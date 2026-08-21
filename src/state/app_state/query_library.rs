@@ -22,7 +22,7 @@ impl AppState {
         self.record_query(QueryDefinition {
             connection_id: key.connection_id,
             database: key.database.clone(),
-            collection: None,
+            collection: self.forge_tabs.get(&key.id).and_then(|state| state.collection.clone()),
             content: QueryContent::Forge { statement },
         })
     }

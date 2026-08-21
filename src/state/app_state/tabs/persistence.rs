@@ -136,6 +136,8 @@ impl AppState {
                         let key = ForgeTabKey { id, connection_id, database: tab.database.clone() };
                         let state = ForgeTabState {
                             content: tab.forge_content.clone(),
+                            collection: (!tab.collection.is_empty())
+                                .then(|| tab.collection.clone()),
                             is_running: false,
                             error: None,
                             pending_cursor: None,
@@ -182,6 +184,12 @@ impl AppState {
                     }
                     (WorkspaceTabKind::Forge, TabKey::Forge(forge)) => {
                         forge.database == tab.database
+                            && self
+                                .forge_tabs
+                                .get(&forge.id)
+                                .and_then(|state| state.collection.as_deref())
+                                .unwrap_or_default()
+                                == tab.collection
                     }
                     _ => false,
                 })
@@ -362,7 +370,11 @@ impl AppState {
                     .unwrap_or_default();
                 WorkspaceTab {
                     database: key.database.clone(),
-                    collection: String::new(),
+                    collection: self
+                        .forge_tabs
+                        .get(&key.id)
+                        .and_then(|state| state.collection.clone())
+                        .unwrap_or_default(),
                     kind: WorkspaceTabKind::Forge,
                     transfer: None,
                     filter_raw: String::new(),
@@ -438,7 +450,8 @@ impl AppState {
                 }
                 TabKey::Forge(key) => {
                     self.workspace.selected_database = Some(key.database.clone());
-                    self.workspace.selected_collection = None;
+                    self.workspace.selected_collection =
+                        self.forge_tabs.get(&key.id).and_then(|state| state.collection.clone());
                 }
                 TabKey::AgentActivity | TabKey::Settings | TabKey::Changelog => {
                     // Utility tabs don't affect selection
@@ -543,6 +556,56 @@ mod tests {
         assert_eq!(state.workspace.open_tabs.len(), 2);
         assert_eq!(state.workspace.active_tab, Some(1));
         assert_eq!(state.workspace.open_tabs[1].collection, "preview");
+    }
+
+    #[test]
+    fn workspace_roundtrips_multiple_collection_forge_tabs() {
+        let mut state = AppState::new();
+        let conn_id = Uuid::new_v4();
+        state.conn.selected_connection = Some(conn_id);
+
+        for collection in ["users", "events"] {
+            let id = Uuid::new_v4();
+            state.tabs.open.push(TabKey::Forge(ForgeTabKey {
+                id,
+                connection_id: conn_id,
+                database: "application".to_string(),
+            }));
+            state.forge_tabs.insert(
+                id,
+                ForgeTabState {
+                    content: format!("db.getCollection(\"{collection}\").find({{}})"),
+                    collection: Some(collection.to_string()),
+                    ..ForgeTabState::default()
+                },
+            );
+        }
+        state.tabs.active = ActiveTab::Index(1);
+
+        state.update_workspace_tabs();
+
+        assert_eq!(state.workspace.active_tab, Some(1));
+        assert_eq!(state.workspace.open_tabs.len(), 2);
+        assert_eq!(state.workspace.open_tabs[0].collection, "users");
+        assert_eq!(state.workspace.open_tabs[1].collection, "events");
+
+        let mut restored = AppState::new();
+        restored.workspace = state.workspace.clone();
+        let active = restored.restore_tabs_from_workspace(conn_id, &["application".to_string()]);
+        let collections = restored
+            .tabs
+            .open
+            .iter()
+            .filter_map(|tab| match tab {
+                TabKey::Forge(key) => {
+                    restored.forge_tabs.get(&key.id).and_then(|state| state.collection.as_deref())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(active, Some(1));
+        assert_eq!(collections, vec!["users", "events"]);
     }
 
     #[test]
