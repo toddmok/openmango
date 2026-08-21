@@ -4,6 +4,84 @@ use mongodb::bson::{Bson, Document};
 
 use super::DocumentKey;
 
+/// A BSON path validated for safe use with MongoDB dotted field syntax.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct DottedPath(String);
+
+impl DottedPath {
+    pub fn new(path: &[PathSegment]) -> Result<Self, DottedPathError> {
+        if path.is_empty() {
+            return Err(DottedPathError::EmptyPath);
+        }
+        if matches!(path.first(), Some(PathSegment::Index(_))) {
+            return Err(DottedPathError::RootArrayIndex);
+        }
+
+        let mut parts = Vec::with_capacity(path.len());
+        for segment in path {
+            match segment {
+                PathSegment::Key(key) => {
+                    if key.is_empty() {
+                        return Err(DottedPathError::EmptyKey);
+                    }
+                    if key.contains('.') {
+                        return Err(DottedPathError::ContainsDot(key.clone()));
+                    }
+                    if key.starts_with('$') {
+                        return Err(DottedPathError::StartsWithDollar(key.clone()));
+                    }
+                    if key.contains('\0') {
+                        return Err(DottedPathError::ContainsNull(key.clone()));
+                    }
+                    parts.push(key.clone());
+                }
+                PathSegment::Index(index) => parts.push(index.to_string()),
+            }
+        }
+
+        Ok(Self(parts.join(".")))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for DottedPath {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DottedPathError {
+    EmptyPath,
+    RootArrayIndex,
+    EmptyKey,
+    ContainsDot(String),
+    StartsWithDollar(String),
+    ContainsNull(String),
+}
+
+impl std::fmt::Display for DottedPathError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EmptyPath => formatter.write_str("MongoDB field path is empty"),
+            Self::RootArrayIndex => {
+                formatter.write_str("MongoDB field path cannot start with an array index")
+            }
+            Self::EmptyKey => formatter.write_str("MongoDB field path contains an empty key"),
+            Self::ContainsDot(key) => write!(formatter, "MongoDB field key contains '.': {key}"),
+            Self::StartsWithDollar(key) => {
+                write!(formatter, "MongoDB field key starts with '$': {key}")
+            }
+            Self::ContainsNull(key) => {
+                write!(formatter, "MongoDB field key contains a null byte: {key:?}")
+            }
+        }
+    }
+}
+
 /// Represents a segment in a path through a BSON document.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum PathSegment {
@@ -53,6 +131,13 @@ pub fn is_editable_value(value: &Bson, path: &[PathSegment]) -> bool {
             | Bson::Null
             | Bson::ObjectId(_)
             | Bson::DateTime(_)
+            | Bson::Decimal128(_)
+            | Bson::Timestamp(_)
+            | Bson::Binary(_)
+            | Bson::RegularExpression(_)
+            | Bson::JavaScriptCode(_)
+            | Bson::Symbol(_)
+            | Bson::DbPointer(_)
     )
 }
 
@@ -141,4 +226,43 @@ fn set_bson_in_value(value: &mut Bson, path: &[PathSegment], new_value: Bson) ->
     }
 
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dotted_path_accepts_keys_and_array_indexes() {
+        let path = vec![
+            PathSegment::Key("orders".into()),
+            PathSegment::Index(2),
+            PathSegment::Key("total".into()),
+        ];
+        assert_eq!(DottedPath::new(&path).expect("safe path").as_str(), "orders.2.total");
+    }
+
+    #[test]
+    fn dotted_path_rejects_unsafe_document_keys() {
+        for (path, expected) in [
+            (vec![PathSegment::Key(String::new())], DottedPathError::EmptyKey),
+            (vec![PathSegment::Key("a.b".into())], DottedPathError::ContainsDot("a.b".into())),
+            (
+                vec![PathSegment::Key("$set".into())],
+                DottedPathError::StartsWithDollar("$set".into()),
+            ),
+            (
+                vec![PathSegment::Key("bad\0key".into())],
+                DottedPathError::ContainsNull("bad\0key".into()),
+            ),
+        ] {
+            assert_eq!(DottedPath::new(&path), Err(expected));
+        }
+    }
+
+    #[test]
+    fn dotted_path_rejects_empty_and_root_array_paths() {
+        assert_eq!(DottedPath::new(&[]), Err(DottedPathError::EmptyPath));
+        assert_eq!(DottedPath::new(&[PathSegment::Index(0)]), Err(DottedPathError::RootArrayIndex));
+    }
 }

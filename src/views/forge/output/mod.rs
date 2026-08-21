@@ -7,11 +7,13 @@ pub use format::format_result_tab_label;
 pub use pipeline::documents_from_printable;
 
 use super::ForgeView;
-use super::types::{ForgeRunOutput, MAX_OUTPUT_LINES, MAX_OUTPUT_RUNS, SYSTEM_RUN_ID};
+use super::types::{
+    ForgeRunOutput, MAX_OUTPUT_LINES, MAX_OUTPUT_RUNS, ResultOrigin, SYSTEM_RUN_ID,
+};
 use chrono::Utc;
 
 impl ForgeView {
-    pub fn begin_run(&mut self, run_id: u64, code: &str) {
+    pub fn begin_run(&mut self, run_id: u64, code: &str, result_origin: ResultOrigin) {
         let preview = Self::code_preview(code);
         self.state.output.output_runs.push(ForgeRunOutput {
             id: run_id,
@@ -20,6 +22,7 @@ impl ForgeView {
             raw_lines: Vec::new(),
             error: None,
             last_print_line: None,
+            result_origin: Some(result_origin),
         });
         self.state.output.active_run_id = Some(run_id);
         self.trim_output_runs();
@@ -48,6 +51,7 @@ impl ForgeView {
                 raw_lines: Vec::new(),
                 error: None,
                 last_print_line: None,
+                result_origin: None,
             });
             self.trim_output_runs();
         }
@@ -72,11 +76,21 @@ impl ForgeView {
                 raw_lines: normalized,
                 error: None,
                 last_print_line: None,
+                result_origin: None,
             });
             self.trim_output_runs();
         }
 
         self.trim_output_lines();
+    }
+
+    pub fn result_origin_for_run(&self, run_id: u64) -> Option<ResultOrigin> {
+        self.state
+            .output
+            .output_runs
+            .iter()
+            .find(|run| run.id == run_id)
+            .and_then(|run| run.result_origin.clone())
     }
 
     pub fn append_eval_output(&mut self, run_id: u64, printable: &serde_json::Value) {
@@ -100,6 +114,7 @@ impl ForgeView {
             raw_lines: Vec::new(),
             error: Some(message.to_string()),
             last_print_line: None,
+            result_origin: None,
         });
         self.trim_output_runs();
     }

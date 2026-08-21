@@ -1,11 +1,13 @@
-use gpui::{Context, Div, InteractiveElement, Window};
+use gpui::{ClipboardItem, Context, Div, InteractiveElement, Window};
 
 use crate::components::request_connection_write;
 
 use crate::keyboard::{
-    CancelForgeRun, ClearForgeOutput, FindInForgeOutput, FocusForgeEditor, FocusForgeOutput,
-    RunForgeAll, RunForgeSelectionOrStatement,
+    CancelForgeRun, ClearForgeOutput, CopyForgeResults, FindInForgeOutput, FocusForgeEditor,
+    FocusForgeOutput, RunForgeAll, RunForgeSelectionOrStatement, SelectAllForgeResults,
 };
+use crate::views::results::ResultViewMode;
+use crate::views::results::table::ResultCopyFormat;
 
 use super::ForgeView;
 
@@ -79,5 +81,27 @@ pub fn bind_root_actions(root: Div, _window: &mut Window, cx: &mut Context<Forge
     .on_action(cx.listener(|this, _: &FindInForgeOutput, window, cx| {
         super::controller::ForgeController::find_in_output(this, window, cx);
         cx.stop_propagation();
+    }))
+    .on_action(cx.listener(|this, _: &SelectAllForgeResults, _window, cx| {
+        if this.state.output.output_tab == super::types::ForgeOutputTab::Results
+            && this.state.output.result_view_mode == ResultViewMode::Table
+            && let Some(table) = &this.state.output.result_table_state
+        {
+            table.update(cx, |table, cx| {
+                table.delegate_mut().select_all();
+                cx.notify();
+            });
+            cx.stop_propagation();
+        }
+    }))
+    .on_action(cx.listener(|this, _: &CopyForgeResults, _window, cx| {
+        if this.state.output.output_tab == super::types::ForgeOutputTab::Results
+            && this.state.output.result_view_mode == ResultViewMode::Table
+            && let Some(table) = &this.state.output.result_table_state
+        {
+            let text = table.read(cx).delegate().copy_text(ResultCopyFormat::ExcelHeaders);
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+            cx.stop_propagation();
+        }
     }))
 }

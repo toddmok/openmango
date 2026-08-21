@@ -12,6 +12,7 @@ pub(crate) mod logic;
 mod mongosh;
 mod output;
 pub(crate) mod parser;
+mod result_edit;
 mod runtime;
 mod state;
 mod types;
@@ -30,6 +31,7 @@ use crate::components::{
 };
 use crate::state::{AppEvent, AppState, View};
 use crate::theme::{fonts, islands, spacing};
+use crate::views::results::ResultViewMode;
 use controller::ForgeController;
 use output::format_result_tab_label;
 use state::ForgeState;
@@ -156,6 +158,69 @@ impl ForgeView {
                         _cx.notify();
                     });
                 }
+            });
+
+        let active_bg = cx.theme().secondary.opacity(0.55);
+        let tree_button = {
+            let mut button = Button::new("forge-result-view-tree")
+                .compact()
+                .ghost()
+                .icon(Icon::new(IconName::Menu).xsmall())
+                .tooltip("Tree view")
+                .on_click({
+                    let forge_view = forge_view.clone();
+                    move |_, _window, cx| {
+                        forge_view.update(cx, |view, cx| {
+                            view.state.output.result_view_mode = ResultViewMode::Tree;
+                            view.state.output.result_inline_edit = None;
+                            view.state.output.result_inline_subscription = None;
+                            if let Some(table) = &view.state.output.result_table_state {
+                                table.update(cx, |table, _cx| {
+                                    table.delegate_mut().clear_selection();
+                                });
+                            }
+                            cx.notify();
+                        });
+                    }
+                });
+            if self.state.output.result_view_mode == ResultViewMode::Tree {
+                button = button.active_style(active_bg);
+            }
+            button
+        };
+        let table_button = {
+            let mut button = Button::new("forge-result-view-table")
+                .compact()
+                .ghost()
+                .icon(Icon::new(IconName::LayoutDashboard).xsmall())
+                .tooltip("Table view")
+                .on_click({
+                    let forge_view = forge_view.clone();
+                    move |_, _window, cx| {
+                        forge_view.update(cx, |view, cx| {
+                            view.state.output.result_view_mode = ResultViewMode::Table;
+                            view.state.output.result_inline_edit = None;
+                            view.state.output.result_inline_subscription = None;
+                            if let Some(table) = &view.state.output.result_table_state {
+                                table.update(cx, |table, _cx| {
+                                    table.delegate_mut().clear_selection();
+                                });
+                            }
+                            cx.notify();
+                        });
+                    }
+                });
+            if self.state.output.result_view_mode == ResultViewMode::Table {
+                button = button.active_style(active_bg);
+            }
+            button
+        };
+        let result_view_toggle = div()
+            .flex()
+            .items_center()
+            .gap(px(2.0))
+            .when(self.state.output.output_tab == ForgeOutputTab::Results, |element| {
+                element.child(tree_button).child(table_button)
             });
 
         let selected_index = match self.state.output.output_tab {
@@ -293,7 +358,14 @@ impl ForgeView {
                             )
                             .child(tab_bar),
                     )
-                    .child(clear_button),
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(spacing::xs())
+                            .child(result_view_toggle)
+                            .child(clear_button),
+                    ),
             )
             .child(
                 div()

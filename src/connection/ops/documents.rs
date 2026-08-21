@@ -2,12 +2,41 @@
 
 use futures::TryStreamExt;
 use mongodb::Client;
-use mongodb::bson::{Document, doc};
+use mongodb::bson::{Bson, Document, doc};
 use mongodb::results::UpdateResult;
 
+use crate::bson::{DottedPath, PathSegment, get_bson_at_path};
 use crate::connection::ConnectionManager;
 use crate::connection::types::FindDocumentsOptions;
 use crate::error::Result;
+
+pub fn build_field_cas_documents(
+    id: Bson,
+    current: &Document,
+    path: &DottedPath,
+    replacement: Bson,
+) -> (Document, Document) {
+    // MongoDB's ordinary equality query semantics are not an exact value comparison:
+    // `{ field: null }` also matches a missing field, and `{ field: 1 }` matches an
+    // array containing `1`. Freeze the document image we just re-read so an
+    // intervening type change, deletion, or unrelated write becomes a conflict.
+    let filter = doc! {
+        "_id": id,
+        "$expr": { "$eq": ["$$ROOT", { "$literal": current.clone() }] },
+    };
+    let update = doc! { "$set": { path.as_str(): replacement } };
+    (filter, update)
+}
+
+pub struct FieldCasUpdate {
+    pub database: String,
+    pub collection: String,
+    pub id: Bson,
+    pub path_segments: Vec<PathSegment>,
+    pub dotted_path: DottedPath,
+    pub expected: Option<Bson>,
+    pub replacement: Bson,
+}
 
 pub struct AsyncFindOptions {
     pub filter: Document,
@@ -467,6 +496,34 @@ impl ConnectionManager {
         })
     }
 
+    /// Re-read and update one field only if its server value still matches the result snapshot.
+    pub fn update_field_if_current_matches(
+        &self,
+        client: &Client,
+        request: FieldCasUpdate,
+    ) -> Result<bool> {
+        let client = client.clone();
+
+        self.runtime.block_on(async {
+            let coll =
+                client.database(&request.database).collection::<Document>(&request.collection);
+            let Some(current) = coll.find_one(doc! { "_id": request.id.clone() }).await? else {
+                return Ok(false);
+            };
+            if get_bson_at_path(&current, &request.path_segments) != request.expected.as_ref() {
+                return Ok(false);
+            }
+            let (filter, update) = build_field_cas_documents(
+                request.id,
+                &current,
+                &request.dotted_path,
+                request.replacement,
+            );
+            let result = coll.update_one(filter, update).await?;
+            Ok(result.matched_count == 1)
+        })
+    }
+
     /// Delete only when the server document still matches the expected image.
     pub fn delete_document_if_current_matches(
         &self,
@@ -542,4 +599,46 @@ fn is_duplicate_key(error: &mongodb::error::Error) -> bool {
         mongodb::error::ErrorKind::Write(mongodb::error::WriteFailure::WriteError(write_error))
             if write_error.code == 11000
     )
+}
+
+#[cfg(test)]
+mod field_cas_tests {
+    use super::*;
+
+    #[test]
+    fn field_cas_uses_raw_id_expected_value_and_targeted_set() {
+        let id = Bson::Int64(7);
+        let current = doc! {
+            "_id": id.clone(),
+            "items": [{ "price": Bson::Int32(5) }, { "price": Bson::Int32(10) }],
+        };
+        let path = DottedPath::new(&[
+            PathSegment::Key("items".into()),
+            PathSegment::Index(1),
+            PathSegment::Key("price".into()),
+        ])
+        .expect("safe path");
+        let (filter, update) =
+            build_field_cas_documents(id.clone(), &current, &path, Bson::Int32(11));
+        assert_eq!(filter.get("_id"), Some(&id));
+        assert_eq!(
+            filter.get_document("$expr").expect("exact document guard"),
+            &doc! { "$eq": ["$$ROOT", { "$literal": current }] }
+        );
+        assert_eq!(update, doc! { "$set": { "items.1.price": Bson::Int32(11) } });
+    }
+
+    #[test]
+    fn field_cas_exact_guard_distinguishes_null_missing_and_array_membership() {
+        let id = Bson::ObjectId(mongodb::bson::oid::ObjectId::new());
+        let current = doc! { "_id": id.clone(), "value": Bson::Null };
+        let path = DottedPath::new(&[PathSegment::Key("value".into())]).expect("safe path");
+        let (filter, _) =
+            build_field_cas_documents(id, &current, &path, Bson::String("value".into()));
+        assert_eq!(
+            filter.get_document("$expr").expect("exact document guard"),
+            &doc! { "$eq": ["$$ROOT", { "$literal": current }] }
+        );
+        assert!(!filter.contains_key("value"));
+    }
 }

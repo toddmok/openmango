@@ -528,7 +528,7 @@ fn format_relaxed_object_compact(map: &serde_json::Map<String, Value>) -> String
 pub fn parse_edited_value(original: &Bson, input: &str) -> Result<Bson, String> {
     let trimmed = input.trim();
     match original {
-        Bson::String(_) => Ok(Bson::String(trimmed.to_string())),
+        Bson::String(_) => Ok(Bson::String(input.to_string())),
         Bson::Int32(_) => {
             trimmed.parse::<i32>().map(Bson::Int32).map_err(|_| "Expected int32".to_string())
         }
@@ -556,6 +556,23 @@ pub fn parse_edited_value(original: &Bson, input: &str) -> Result<Bson, String> 
         Bson::DateTime(_) => DateTime::parse_rfc3339_str(trimmed)
             .map(Bson::DateTime)
             .map_err(|_| "Expected RFC3339 date".to_string()),
+        Bson::Decimal128(_) => trimmed
+            .strip_prefix("NumberDecimal(\"")
+            .and_then(|value| value.strip_suffix("\")"))
+            .unwrap_or(trimmed)
+            .parse()
+            .map(Bson::Decimal128)
+            .map_err(|_| "Expected Decimal128 or NumberDecimal(\"…\")".to_string()),
+        Bson::Timestamp(_) | Bson::Binary(_) | Bson::RegularExpression(_) | Bson::DbPointer(_) => {
+            let parsed = parse_bson_from_relaxed_json(trimmed)?;
+            if std::mem::discriminant(&parsed) == std::mem::discriminant(original) {
+                Ok(parsed)
+            } else {
+                Err(format!("Expected {}", super::bson_type_label(original)))
+            }
+        }
+        Bson::Symbol(_) => Ok(Bson::Symbol(trimmed.to_string())),
+        Bson::JavaScriptCode(_) => Ok(Bson::JavaScriptCode(input.to_string())),
         _ => Err("Unsupported type".to_string()),
     }
 }
@@ -634,7 +651,7 @@ mod tests {
     use super::*;
     use mongodb::bson::oid::ObjectId;
     use mongodb::bson::spec::BinarySubtype;
-    use mongodb::bson::{Bson, DateTime};
+    use mongodb::bson::{Binary, Bson, DateTime, Regex, Timestamp};
 
     #[test]
     fn parses_object_id_shell_syntax() {
@@ -689,6 +706,46 @@ mod tests {
         } else {
             panic!("expected timestamp");
         }
+    }
+
+    #[test]
+    fn common_scalar_edit_values_roundtrip_with_their_bson_types() {
+        let decimal = Bson::Decimal128("12.50".parse().expect("decimal"));
+        let values = [
+            decimal,
+            Bson::Timestamp(Timestamp { time: 5, increment: 7 }),
+            Bson::Binary(Binary { subtype: BinarySubtype::Generic, bytes: vec![1, 2, 3] }),
+            Bson::RegularExpression(Regex { pattern: "a/b".into(), options: "i".into() }),
+            Bson::Symbol("symbol".into()),
+            Bson::JavaScriptCode("return value + 1;".into()),
+        ];
+        for value in values {
+            let editable = crate::bson::bson_value_for_edit(&value);
+            assert_eq!(parse_edited_value(&value, &editable), Ok(value));
+        }
+    }
+
+    #[test]
+    fn string_edits_preserve_leading_and_trailing_whitespace() {
+        assert_eq!(
+            parse_edited_value(&Bson::String("old".into()), "  replacement  "),
+            Ok(Bson::String("  replacement  ".into()))
+        );
+    }
+
+    #[test]
+    fn canonical_edit_text_roundtrips_nested_numeric_bson_types() {
+        let original = Bson::Document(mongodb::bson::doc! {
+            "int32": Bson::Int32(7),
+            "int64": Bson::Int64(7),
+            "double": Bson::Double(7.0),
+            "nested": { "value": Bson::Int32(9) },
+        });
+        let text = format_relaxed_json_value(&original.clone().into_canonical_extjson());
+        assert_eq!(
+            parse_bson_from_relaxed_json(&text).expect("parse canonical edit text"),
+            original
+        );
     }
 
     #[test]
