@@ -74,6 +74,16 @@ pub fn write_request_decision(
     }
 }
 
+// Callers often update the entity whose GPUI listener requested authorization. Running the
+// callback inline would attempt to lease that entity a second time and panic.
+fn defer_write_callback(
+    window: &mut Window,
+    cx: &mut App,
+    callback: impl FnOnce(&mut Window, &mut App) + 'static,
+) {
+    window.defer(cx, callback);
+}
+
 pub fn request_connection_write(
     state: Entity<AppState>,
     request: WriteRequest,
@@ -108,7 +118,7 @@ pub fn request_connection_write(
                 cx.notify();
             });
         }
-        WriteRequestDecision::Proceed => on_confirm(window, cx),
+        WriteRequestDecision::Proceed => defer_write_callback(window, cx, on_confirm),
         WriteRequestDecision::Confirm => {
             let confirmation = confirmation.unwrap_or_else(|| WriteConfirmation {
                 title: "Confirm Production write".into(),
@@ -351,4 +361,34 @@ fn open_confirm_dialog_boxed(
                 ),
         )
     });
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use gpui::{Context, IntoElement, Render, TestAppContext, Window, div};
+
+    struct Counter(usize);
+
+    impl Render for Counter {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+        }
+    }
+
+    #[gpui::test]
+    fn deferred_write_callback_can_update_the_current_entity(cx: &mut TestAppContext) {
+        let (view, cx) = cx.add_window_view(|_, _| Counter(0));
+        let callback_view = view.clone();
+
+        cx.update(|window, app| {
+            view.update(app, |_view, cx| {
+                super::defer_write_callback(window, cx, move |_window, cx| {
+                    callback_view.update(cx, |view, _cx| view.0 += 1);
+                });
+            });
+        });
+        cx.run_until_parked();
+
+        assert_eq!(cx.update(|_window, app| view.read(app).0), 1);
+    }
 }
