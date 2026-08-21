@@ -110,6 +110,7 @@ jobs:
           path: dist/OpenMango-*-${{ matrix.suffix }}.zip
 
   release:
+    if: github.ref == 'refs/heads/main'
     needs: macos
     runs-on: ubuntu-latest
     steps:
