@@ -9,7 +9,7 @@ use crate::state::{AppEvent, WindowState};
 use uuid::Uuid;
 
 use super::AppState;
-use super::types::{ActiveTab, TabKey, View};
+use super::types::{ActiveTab, ForgeTabKey, TabKey, View};
 
 impl AppState {
     pub fn workspace_autoconnect_id(&self) -> Option<Uuid> {
@@ -104,10 +104,7 @@ impl AppState {
                         self.current_view = View::Transfer;
                     }
                     TabKey::Forge(key) => {
-                        self.conn.selected_connection = Some(connection_id);
-                        self.conn.selected_database = Some(key.database.clone());
-                        self.conn.selected_collection = None;
-                        self.current_view = View::Forge;
+                        self.apply_restored_forge_selection(connection_id, &key);
                     }
                     TabKey::AgentActivity => {
                         self.current_view = View::AgentActivity;
@@ -154,6 +151,14 @@ impl AppState {
         cx.notify();
     }
 
+    fn apply_restored_forge_selection(&mut self, connection_id: Uuid, key: &ForgeTabKey) {
+        self.conn.selected_connection = Some(connection_id);
+        self.conn.selected_database = Some(key.database.clone());
+        self.conn.selected_collection =
+            self.forge_tabs.get(&key.id).and_then(|state| state.collection.clone());
+        self.current_view = View::Forge;
+    }
+
     fn update_workspace_from_state_inner(&mut self) {
         let last_connection_id =
             self.conn.selected_connection.or(self.workspace.last_connection_id);
@@ -192,5 +197,30 @@ impl AppState {
                 log::error!("Failed to save workspace: {err}");
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::ForgeTabState;
+
+    #[test]
+    fn restored_forge_selection_preserves_collection_context() {
+        let mut state = AppState::new();
+        let connection_id = Uuid::new_v4();
+        let key =
+            ForgeTabKey { id: Uuid::new_v4(), connection_id, database: "application".to_string() };
+        state.forge_tabs.insert(
+            key.id,
+            ForgeTabState { collection: Some("users".to_string()), ..ForgeTabState::default() },
+        );
+
+        state.apply_restored_forge_selection(connection_id, &key);
+
+        assert_eq!(state.conn.selected_connection, Some(connection_id));
+        assert_eq!(state.conn.selected_database.as_deref(), Some("application"));
+        assert_eq!(state.conn.selected_collection.as_deref(), Some("users"));
+        assert_eq!(state.current_view, View::Forge);
     }
 }

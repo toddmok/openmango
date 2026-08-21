@@ -127,7 +127,7 @@ impl ForgeView {
                             };
                             QueryLibraryDialog::open(
                                 state.clone(),
-                                QueryLibraryTarget::Forge(target),
+                                QueryLibraryTarget::forge(state.read(cx), target),
                                 window,
                                 cx,
                             );

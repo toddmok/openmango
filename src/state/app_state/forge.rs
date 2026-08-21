@@ -54,6 +54,11 @@ impl AppState {
         self.forge_tabs.get(&id).map(|state| state.content.as_str())
     }
 
+    /// Get the collection associated with a Forge tab, if it was opened for one.
+    pub fn forge_tab_collection(&self, id: Uuid) -> Option<&str> {
+        self.forge_tabs.get(&id).and_then(|state| state.collection.as_deref())
+    }
+
     /// Update the stored content for a Forge tab.
     pub fn set_forge_tab_content(&mut self, id: Uuid, content: String) {
         if let Some(state) = self.forge_tabs.get_mut(&id) {

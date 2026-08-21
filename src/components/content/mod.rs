@@ -55,6 +55,10 @@ impl ContentAreaInputs {
     }
 }
 
+fn should_create_collection_view(current_view: View, has_collection: bool) -> bool {
+    matches!(current_view, View::Documents) && has_collection
+}
+
 impl ContentArea {
     pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
         let mut subscriptions = vec![];
@@ -83,7 +87,10 @@ impl ContentArea {
                 ) = {
                     let state_ref = state.read(cx);
                     (
-                        state_ref.selected_collection().is_some(),
+                        should_create_collection_view(
+                            state_ref.current_view,
+                            state_ref.selected_collection().is_some(),
+                        ),
                         matches!(state_ref.current_view, View::Database)
                             && state_ref.selected_database().is_some(),
                         false,
@@ -129,7 +136,14 @@ impl ContentArea {
         }));
 
         // Check if we should create collection view initially
-        let collection_view = if state.read(cx).selected_collection().is_some() {
+        let should_create_collection = {
+            let state_ref = state.read(cx);
+            should_create_collection_view(
+                state_ref.current_view,
+                state_ref.selected_collection().is_some(),
+            )
+        };
+        let collection_view = if should_create_collection {
             Some(cx.new(|cx| CollectionView::new(state.clone(), cx)))
         } else {
             None
@@ -439,5 +453,18 @@ impl Render for ContentArea {
 
         let empty = render_empty_state(hint, cx);
         render_shell(error_text, self.state.clone(), empty, true, cx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_create_collection_view;
+    use crate::state::View;
+
+    #[test]
+    fn collection_view_is_created_only_for_documents() {
+        assert!(should_create_collection_view(View::Documents, true));
+        assert!(!should_create_collection_view(View::Forge, true));
+        assert!(!should_create_collection_view(View::Documents, false));
     }
 }
