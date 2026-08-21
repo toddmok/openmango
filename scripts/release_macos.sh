@@ -142,7 +142,7 @@ rm -f "$ZIP_PATH"
 
 ditto -c -k --sequesterRsrc --keepParent "$APP_DIR" "$ZIP_PATH"
 
-if [[ -n "${APPLE_API_KEY_ID:-}" && -n "${APPLE_API_ISSUER_ID:-}" ]]; then
+if [[ "$SIGNING_IDENTITY" != "-" && -n "${APPLE_API_KEY_ID:-}" && -n "${APPLE_API_ISSUER_ID:-}" ]]; then
     NOTARY_KEY_PATH="${APPLE_API_KEY_PATH:-"$DIST_DIR/AuthKey.p8"}"
     if [[ -n "${APPLE_API_KEY:-}" ]]; then
         if base64 --help 2>&1 | grep -q -- "-d"; then
@@ -166,6 +166,8 @@ if [[ -n "${APPLE_API_KEY_ID:-}" && -n "${APPLE_API_ISSUER_ID:-}" ]]; then
     # Re-create zip with stapled app
     rm -f "$ZIP_PATH"
     ditto -c -k --sequesterRsrc --keepParent "$APP_DIR" "$ZIP_PATH"
+elif [[ "$SIGNING_IDENTITY" == "-" && ( -n "${APPLE_API_KEY_ID:-}" || -n "${APPLE_API_ISSUER_ID:-}" ) ]]; then
+    echo "Warning: skipping notarization because no Developer ID signing identity was provided."
 fi
 
 echo "Built: $APP_DIR"
