@@ -1,4 +1,5 @@
 mod search;
+pub mod table;
 mod tree;
 mod types;
 
@@ -7,14 +8,17 @@ use std::sync::Arc;
 use gpui::*;
 use gpui_component::ActiveTheme as _;
 
+use crate::bson::get_bson_at_path;
 use crate::theme::spacing;
 use crate::views::documents::tree::lazy_row::compute_row_meta;
 use crate::views::documents::tree::lazy_tree::build_visible_rows;
-pub use types::{ResultEmptyState, ResultViewMode, ResultViewProps};
+pub use types::{ResultEmptyState, ResultInlineEditorView, ResultViewMode, ResultViewProps};
 
 pub fn render_results_view<T: 'static>(
     props: ResultViewProps,
     on_toggle_node: types::ToggleNodeCallback,
+    on_edit_value: types::EditValueCallback,
+    on_toggle_bool: types::ToggleBoolCallback,
     cx: &mut Context<T>,
 ) -> AnyElement {
     let cx_ref: &App = cx;
@@ -27,6 +31,8 @@ pub fn render_results_view<T: 'static>(
     }
     let visible_rows = Arc::new(visible_rows);
     let row_count = visible_rows.len();
+    let editable = props.editable;
+    let inline_editor = props.inline_editor.clone();
 
     let header = div()
         .flex()
@@ -78,7 +84,34 @@ pub fn render_results_view<T: 'static>(
                             .map(|ix| {
                                 let row = &visible_rows[ix];
                                 let meta = compute_row_meta(row, &documents, cx);
-                                tree::render_result_row(ix, row, &meta, on_toggle_node.clone(), cx)
+                                let value = if row.is_document_root {
+                                    None
+                                } else {
+                                    documents
+                                        .get(row.doc_index)
+                                        .and_then(|document| get_bson_at_path(&document.doc, &row.path))
+                                };
+                                let row_editable = editable
+                                    && !row.is_document_root
+                                    && documents
+                                        .get(row.doc_index)
+                                        .is_some_and(|document| document.doc.contains_key("_id"))
+                                    && crate::bson::DottedPath::new(&row.path).is_ok()
+                                    && !row.path.iter().any(|segment| {
+                                        matches!(segment, crate::bson::PathSegment::Key(key) if key == "_id")
+                                    });
+                                tree::render_result_row(
+                                    ix,
+                                    row,
+                                    &meta,
+                                    value,
+                                    row_editable,
+                                    inline_editor.as_ref(),
+                                    on_toggle_node.clone(),
+                                    on_edit_value.clone(),
+                                    on_toggle_bool.clone(),
+                                    cx,
+                                )
                             })
                             .collect()
                     }

@@ -53,12 +53,18 @@ fn render_jsonl(snapshot: &ViewExportSnapshot) -> String {
         .join("\n")
 }
 
-fn render_delimited(snapshot: &ViewExportSnapshot, delimiter: u8) -> String {
+pub fn render_delimited_with_headers(
+    snapshot: &ViewExportSnapshot,
+    delimiter: u8,
+    include_headers: bool,
+) -> String {
     let mut wtr = csv::WriterBuilder::new().delimiter(delimiter).from_writer(Vec::new());
 
-    let headers: Vec<&str> = snapshot.columns.iter().map(|c| c.key.as_str()).collect();
-    if wtr.write_record(&headers).is_err() {
-        return String::new();
+    if include_headers {
+        let headers: Vec<&str> = snapshot.columns.iter().map(|c| c.key.as_str()).collect();
+        if wtr.write_record(&headers).is_err() {
+            return String::new();
+        }
     }
 
     for doc in &snapshot.documents {
@@ -74,11 +80,19 @@ fn render_delimited(snapshot: &ViewExportSnapshot, delimiter: u8) -> String {
 }
 
 fn render_csv(snapshot: &ViewExportSnapshot) -> String {
-    render_delimited(snapshot, b',')
+    render_csv_with_headers(snapshot, true)
 }
 
 fn render_tsv(snapshot: &ViewExportSnapshot) -> String {
-    render_delimited(snapshot, b'\t')
+    render_tsv_with_headers(snapshot, true)
+}
+
+pub fn render_csv_with_headers(snapshot: &ViewExportSnapshot, include_headers: bool) -> String {
+    render_delimited_with_headers(snapshot, b',', include_headers)
+}
+
+pub fn render_tsv_with_headers(snapshot: &ViewExportSnapshot, include_headers: bool) -> String {
+    render_delimited_with_headers(snapshot, b'\t', include_headers)
 }
 
 fn render_markdown(snapshot: &ViewExportSnapshot) -> String {
@@ -143,5 +157,49 @@ fn bson_value_for_export(value: Option<&Bson>) -> String {
             serde_json::to_string(&json_val).unwrap_or_default()
         }
         other => format!("{other:?}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use mongodb::bson::doc;
+
+    use super::*;
+
+    fn snapshot() -> ViewExportSnapshot {
+        ViewExportSnapshot::from_documents(
+            vec![doc! { "_id": 1, "name": "Ada" }, doc! { "_id": 2, "name": "Lin" }],
+            "people".into(),
+            "test".into(),
+        )
+    }
+
+    #[test]
+    fn tsv_can_include_or_omit_headers() {
+        assert_eq!(render_tsv_with_headers(&snapshot(), true), "_id\tname\n1\tAda\n2\tLin\n");
+        assert_eq!(render_tsv_with_headers(&snapshot(), false), "1\tAda\n2\tLin\n");
+    }
+
+    #[test]
+    fn tsv_quotes_values_that_would_split_excel_cells_or_rows() {
+        let snapshot = ViewExportSnapshot::from_documents(
+            vec![doc! {
+                "name": "Ada\tLovelace",
+                "note": "line one\nline two",
+                "quote": "say \"hello\"",
+            }],
+            "people".into(),
+            "test".into(),
+        );
+        assert_eq!(
+            render_tsv_with_headers(&snapshot, false),
+            "\"Ada\tLovelace\"\t\"line one\nline two\"\t\"say \"\"hello\"\"\"\n"
+        );
+    }
+
+    #[test]
+    fn csv_can_include_or_omit_headers() {
+        assert_eq!(render_csv_with_headers(&snapshot(), true), "_id,name\n1,Ada\n2,Lin\n");
+        assert_eq!(render_csv_with_headers(&snapshot(), false), "1,Ada\n2,Lin\n");
     }
 }

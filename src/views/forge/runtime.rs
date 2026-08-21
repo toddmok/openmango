@@ -146,6 +146,22 @@ impl ForgeView {
 
         self.state.runtime.run_seq = self.state.runtime.run_seq.wrapping_add(1);
         let seq = self.state.runtime.run_seq;
+        let Some(forge_key_for_origin) = forge_key.as_ref() else {
+            self.state.output.last_error = Some("No active Forge session".to_string());
+            return;
+        };
+        let opened_collection = self
+            .app_state
+            .read(cx)
+            .forge_tab_collection(forge_key_for_origin.id)
+            .map(str::to_string);
+        let result_origin = super::types::ResultOrigin::capture(
+            forge_key_for_origin.id,
+            forge_key_for_origin.connection_id,
+            forge_key_for_origin.database.clone(),
+            opened_collection.as_deref(),
+            text,
+        );
         self.state.runtime.is_running = true;
         self.state.output.last_error = None;
         self.state.output.last_result = None;
@@ -155,7 +171,7 @@ impl ForgeView {
         let code = text.to_string();
         let history_statement = code.clone();
         super::controller::ForgeController::clear_result_pages(self, true);
-        self.begin_run(seq, &code);
+        self.begin_run(seq, &code, result_origin.clone());
         self.ensure_output_listener(cx);
         let bridge = bridge.clone();
 
@@ -213,7 +229,10 @@ impl ForgeView {
                                             Self::default_result_label_for_value(&eval.printable)
                                         });
                                 super::controller::ForgeController::push_result_page(
-                                    this, label, docs,
+                                    this,
+                                    label,
+                                    docs,
+                                    result_origin.clone(),
                                 );
                                 this.state.output.last_result = None;
                             } else if this.state.output.result_pages.is_empty() {

@@ -1,10 +1,14 @@
 use gpui::{FocusHandle, UniformListScrollHandle};
 use gpui_component::input::InputState;
+use gpui_component::table::TableState;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 
+use super::result_edit::ResultInlineEdit;
 use super::types::{ForgeOutputTab, ForgeRunOutput, ResultPage};
 use crate::helpers::auto_pair::AutoPairState;
+use crate::views::results::ResultViewMode;
+use crate::views::results::table::ResultTableDelegate;
 
 pub struct ForgeEditorState {
     pub editor_state: Option<gpui::Entity<InputState>>,
@@ -42,6 +46,12 @@ pub struct ForgeOutputState {
     pub result_signature: Option<u64>,
     pub result_expanded_nodes: std::collections::HashSet<String>,
     pub result_scroll: UniformListScrollHandle,
+    pub result_view_mode: ResultViewMode,
+    pub result_table_state: Option<gpui::Entity<TableState<ResultTableDelegate>>>,
+    pub result_table_page_id: Option<uuid::Uuid>,
+    pub result_table_signature: Option<u64>,
+    pub result_inline_edit: Option<ResultInlineEdit>,
+    pub result_inline_subscription: Option<gpui::Subscription>,
     pub output_visible: bool,
 }
 
@@ -84,6 +94,12 @@ impl ForgeState {
                 result_signature: None,
                 result_expanded_nodes: std::collections::HashSet::new(),
                 result_scroll: UniformListScrollHandle::new(),
+                result_view_mode: ResultViewMode::Tree,
+                result_table_state: None,
+                result_table_page_id: None,
+                result_table_signature: None,
+                result_inline_edit: None,
+                result_inline_subscription: None,
                 output_visible: true,
             },
             runtime: ForgeRuntimeState { run_seq: 0, is_running: false, mongosh_error: None },

@@ -23,6 +23,16 @@ pub struct ViewExportSnapshot {
 }
 
 impl ViewExportSnapshot {
+    pub fn from_documents_with_columns(
+        documents: Vec<Document>,
+        columns: Vec<String>,
+        collection_name: String,
+        database_name: String,
+    ) -> Self {
+        let columns = columns.into_iter().map(|key| ColumnInfo { key, pinned: false }).collect();
+        Self { documents, columns, collection_name, database_name }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn from_documents(
         documents: Vec<Document>,

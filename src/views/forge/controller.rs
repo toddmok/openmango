@@ -94,11 +94,10 @@ impl ForgeController {
         event: super::mongosh::MongoshEvent,
         cx: &mut Context<ForgeView>,
     ) {
-        let Ok(Some((session_id, _, _))) =
-            super::runtime::active_forge_session_info(view.app_state.read(cx))
-        else {
+        let Some(active_key) = view.app_state.read(cx).active_forge_tab_key().cloned() else {
             return;
         };
+        let session_id = active_key.id;
         let event_session_id = match &event {
             super::mongosh::MongoshEvent::Print { session_id, .. } => session_id,
             super::mongosh::MongoshEvent::Clear { session_id } => session_id,
@@ -131,6 +130,14 @@ impl ForgeController {
                     if let Some(active_run) = view.state.output.active_run_id
                         && resolved_run_id == active_run
                     {
+                        let result_origin =
+                            view.result_origin_for_run(resolved_run_id).unwrap_or_else(|| {
+                                super::types::ResultOrigin::unattributed(
+                                    active_key.id,
+                                    active_key.connection_id,
+                                    active_key.database.clone(),
+                                )
+                            });
                         let label = Self::take_run_print_label(view, resolved_run_id)
                             .unwrap_or_else(|| {
                                 values
@@ -146,7 +153,12 @@ impl ForgeController {
                                 } else {
                                     label.clone()
                                 };
-                                Self::push_result_page(view, tab_label, docs);
+                                Self::push_result_page(
+                                    view,
+                                    tab_label,
+                                    docs,
+                                    result_origin.clone(),
+                                );
                             }
                         }
                         Self::sync_output_tab(view);

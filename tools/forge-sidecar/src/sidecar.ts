@@ -55,7 +55,10 @@ function safePrintable(value: unknown) {
     return null;
   }
   try {
-    return EJSON.serialize(value as any, { relaxed: true });
+    // Structured payloads back the editable result views, so use canonical EJSON to
+    // preserve Int32/Int64/Double and every other BSON type exactly. Raw printed
+    // output remains relaxed and human-readable in formatPrintValue below.
+    return EJSON.serialize(value as any, { relaxed: false });
   } catch {
     // fall through
   }
@@ -128,6 +131,11 @@ async function createSession(params: Record<string, unknown>) {
       productName: "OpenMango",
       productDocsLink: "https://github.com/ggagosh/openmango",
       appName: "OpenMango",
+      // Editable result views compare the original BSON value before applying an
+      // update. Keep the driver's BSON wrappers instead of promoting integral
+      // doubles and other numeric values to plain JavaScript numbers.
+      promoteValues: false,
+      promoteLongs: false,
       ...driverOptions,
     },
     {},
@@ -232,6 +240,15 @@ async function evaluate(params: Record<string, unknown>) {
   }
 
   const session = requireSession(sessionId);
+  // Forge tabs are database-scoped. A previous query may have reassigned the
+  // mongosh global `db`, so restore the tab database before every evaluation.
+  // This keeps structured-result provenance and subsequent field edits bound to
+  // the database shown by OpenMango rather than stale shell state.
+  if (session.database) {
+    await session.runtime.evaluate(
+      `db = db.getSiblingDB(${JSON.stringify(session.database)})`
+    );
+  }
   session.currentRunId = runId;
   try {
     const result = await session.runtime.evaluate(code);

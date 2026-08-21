@@ -5,7 +5,7 @@ mod formats;
 mod snapshot;
 
 pub use file_export::FileExportFormat;
-pub use formats::render_to_clipboard;
+pub use formats::{render_csv_with_headers, render_to_clipboard, render_tsv_with_headers};
 pub use snapshot::{ExportScope, ViewExportSnapshot};
 
 use gpui_component::{Icon, IconName};
