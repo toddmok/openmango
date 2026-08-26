@@ -35,6 +35,13 @@ impl ConfigManager {
         Ok(Self { config_dir })
     }
 
+    /// Test-only: back the manager with an explicit (temp) directory so tests
+    /// never read or write the real user config.
+    #[cfg(test)]
+    pub(crate) fn with_config_dir(config_dir: PathBuf) -> Self {
+        Self { config_dir }
+    }
+
     /// Get the platform-specific config directory
     fn get_config_dir() -> Result<PathBuf> {
         dirs::config_dir().map(|p| p.join(APP_NAME)).context("Could not determine config directory")
@@ -181,12 +188,6 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-
-    impl ConfigManager {
-        fn with_config_dir(config_dir: PathBuf) -> Self {
-            Self { config_dir }
-        }
-    }
 
     #[test]
     fn save_connections_strips_all_credentials_from_disk() {

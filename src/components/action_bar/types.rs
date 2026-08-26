@@ -1,4 +1,21 @@
 use gpui::SharedString;
+use uuid::Uuid;
+
+/// Prefix for collection navigation action IDs produced by the palette.
+///
+/// The full format is `nav:col:<uuid>:<database>:<collection>`. Parsing
+/// splits on the first `:` after the UUID, so a database name containing a
+/// colon would mis-split; collection names keep any remaining colons.
+pub const COLLECTION_NAVIGATION_PREFIX: &str = "nav:col:";
+
+/// Build a palette action ID for navigating to a collection.
+pub fn collection_navigation_action_id(
+    connection_id: Uuid,
+    database: &str,
+    collection: &str,
+) -> String {
+    format!("{COLLECTION_NAVIGATION_PREFIX}{connection_id}:{database}:{collection}")
+}
 
 /// A single action in the palette.
 #[derive(Clone, Default)]

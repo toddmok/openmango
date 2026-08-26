@@ -12,7 +12,7 @@ use crate::state::TabKey;
 use crate::state::app_state::updater::UpdateStatus;
 use crate::state::settings::AppTheme;
 
-use super::types::{ActionCategory, ActionItem};
+use super::types::{ActionCategory, ActionItem, collection_navigation_action_id};
 
 /// Navigation: connections, databases, collections from active connections.
 pub fn navigation_actions(state: &AppState) -> Vec<ActionItem> {
@@ -48,7 +48,7 @@ pub fn navigation_actions(state: &AppState) -> Vec<ActionItem> {
             if let Some(collections) = conn.collections.get(db) {
                 for col in collections {
                     actions.push(ActionItem {
-                        id: SharedString::from(format!("nav:col:{}:{}:{}", conn_id, db, col)),
+                        id: SharedString::from(collection_navigation_action_id(*conn_id, db, col)),
                         label: SharedString::from(col.clone()),
                         detail: Some(SharedString::from(format!("{} / {}", conn_name, db))),
                         category: ActionCategory::Navigation,

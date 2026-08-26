@@ -155,8 +155,30 @@ impl AppState {
 
     /// Create new AppState with a custom ConnectionManager (for testing)
     pub fn with_connection_manager(connection_manager: Arc<ConnectionManager>) -> Self {
-        let config = ConfigManager::default();
+        Self::with_connection_manager_and_config(connection_manager, ConfigManager::default())
+    }
 
+    /// Test-only: a hermetic AppState backed by a temp config directory, so
+    /// tests never read or asynchronously write the user's real config.
+    /// Keep the returned `TempDir` alive for the test's duration.
+    #[cfg(test)]
+    // Only referenced from macOS-gated gpui tests today.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub(crate) fn new_for_tests() -> (Self, tempfile::TempDir) {
+        let temp_dir = tempfile::TempDir::new().expect("failed to create temp config dir");
+        let config = ConfigManager::with_config_dir(temp_dir.path().to_path_buf());
+        let state =
+            Self::with_connection_manager_and_config(Arc::new(ConnectionManager::new()), config);
+        (state, temp_dir)
+    }
+
+    /// Create new AppState with explicit dependencies. Tests should pass a
+    /// tempdir-backed [`ConfigManager`] so they never touch the user's real
+    /// config directory.
+    pub fn with_connection_manager_and_config(
+        connection_manager: Arc<ConnectionManager>,
+        config: ConfigManager,
+    ) -> Self {
         // A malformed connection file must never be replaced with an empty list.
         let (connections, connection_load_error) = match config.load_connections() {
             Ok(connections) => (connections, None),

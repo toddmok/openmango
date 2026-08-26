@@ -1,7 +1,7 @@
 use gpui::*;
 use uuid::Uuid;
 
-use crate::components::action_bar::ActionExecution;
+use crate::components::action_bar::{ActionExecution, COLLECTION_NAVIGATION_PREFIX};
 use crate::components::{
     ConnectionDialog, ContentArea, QueryLibraryDialog, request_disconnect_connection,
     request_unsaved_action,
@@ -19,6 +19,41 @@ use crate::views::CollectionView;
 
 use super::AppRoot;
 use super::dialogs::{open_create_collection_dialog, open_create_database_dialog};
+
+// Free functions rather than `AppRoot` methods so the palette's collection
+// navigation can be unit tested without a `Window`.
+
+/// Parse a collection navigation action ID built by
+/// [`collection_navigation_action_id`]: `nav:col:<uuid>:<database>:<collection>`.
+fn parse_collection_navigation_action(id: &str) -> Option<(Uuid, &str, &str)> {
+    let rest = id.strip_prefix(COLLECTION_NAVIGATION_PREFIX)?;
+    let (uuid, remainder) = rest.split_once(':')?;
+    let connection_id = Uuid::parse_str(uuid).ok()?;
+    let (database, collection) = remainder.split_once(':')?;
+    Some((connection_id, database, collection))
+}
+
+/// Open a Forge tab for a `nav:col:` palette action. Returns `true` only when
+/// the ID was valid and handled; malformed IDs are logged and fall through.
+fn execute_collection_navigation_action<C: AppContext>(
+    state: &Entity<AppState>,
+    id: &str,
+    cx: &mut C,
+) -> bool {
+    let Some((connection_id, database, collection)) = parse_collection_navigation_action(id) else {
+        if id.starts_with(COLLECTION_NAVIGATION_PREFIX) {
+            log::warn!("Ignoring malformed collection navigation action ID: {id}");
+        }
+        return false;
+    };
+
+    // `let _` because `C::Result` is `()` for `App` but `anyhow::Result` for
+    // async/test contexts; a dropped entity there is fine to ignore.
+    let _ = state.update(cx, |state, cx| {
+        state.open_forge_tab(connection_id, database.to_string(), Some(collection.to_string()), cx);
+    });
+    true
+}
 
 impl AppRoot {
     pub(super) fn install_global_shortcuts(cx: &mut Context<Self>) -> Subscription {
@@ -175,21 +210,12 @@ impl AppRoot {
             return;
         }
 
-        // Navigation: collections (format: "nav:col:<uuid>:<database>:<collection>")
-        if let Some(rest) = id.strip_prefix("nav:col:") {
-            // Parse: uuid:db:col (uuid is always 36 chars)
-            if rest.len() > 37 {
-                let uuid_str = &rest[..36];
-                let remainder = &rest[37..]; // skip the ':'
-                if let Ok(conn_id) = Uuid::parse_str(uuid_str)
-                    && let Some((database, collection)) = remainder.split_once(':')
-                {
-                    state.update(cx, |state, cx| {
-                        state.select_connection(Some(conn_id), cx);
-                        state.select_collection(database.to_string(), collection.to_string(), cx);
-                    });
-                }
-            }
+        // Navigation: collections — open a Forge tab and move focus into it,
+        // matching what sidebar Enter and the OpenForge action do.
+        if execute_collection_navigation_action(state, id, cx) {
+            content_area.update(cx, |content, cx| {
+                content.focus_current_view(window, cx);
+            });
             return;
         }
 
@@ -565,5 +591,76 @@ impl AppRoot {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use uuid::Uuid;
+
+    use crate::components::action_bar::collection_navigation_action_id;
+
+    use super::parse_collection_navigation_action;
+
+    #[cfg(target_os = "macos")]
+    use super::execute_collection_navigation_action;
+    #[cfg(target_os = "macos")]
+    use crate::state::{AppState, View};
+    #[cfg(target_os = "macos")]
+    use gpui::AppContext as _;
+
+    #[test]
+    fn collection_navigation_ids_round_trip_through_the_shared_builder() {
+        let connection_id = Uuid::new_v4();
+
+        // IDs built by the palette provider must parse back exactly, including
+        // collection names that themselves contain the `:` separator.
+        let action_id =
+            collection_navigation_action_id(connection_id, "application", "events:2026");
+        assert_eq!(
+            parse_collection_navigation_action(&action_id),
+            Some((connection_id, "application", "events:2026"))
+        );
+
+        assert_eq!(parse_collection_navigation_action("nav:db:not-a-collection"), None);
+        assert_eq!(parse_collection_navigation_action("nav:col:invalid:db:users"), None);
+        assert_eq!(
+            parse_collection_navigation_action(&format!("nav:col:{connection_id}:db-only")),
+            None
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[gpui::test]
+    fn collection_palette_navigation_opens_a_forge_tab(cx: &mut gpui::TestAppContext) {
+        let (app_state, _config_dir) = AppState::new_for_tests();
+        let state = cx.new(|_| app_state);
+        let connection_id = Uuid::new_v4();
+        let action_id = collection_navigation_action_id(connection_id, "application", "users");
+
+        assert!(execute_collection_navigation_action(&state, &action_id, cx));
+        state.update(cx, |state, _cx| {
+            assert_eq!(state.current_view, View::Forge);
+            assert_eq!(state.selected_connection_id(), Some(connection_id));
+            assert_eq!(state.selected_database_name().as_deref(), Some("application"));
+            assert_eq!(state.selected_collection_name().as_deref(), Some("users"));
+            assert_eq!(state.open_tabs().len(), 1);
+        });
+    }
+
+    #[cfg(target_os = "macos")]
+    #[gpui::test]
+    fn malformed_collection_navigation_ids_fall_through_without_changing_state(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (app_state, _config_dir) = AppState::new_for_tests();
+        let state = cx.new(|_| app_state);
+
+        assert!(!execute_collection_navigation_action(&state, "nav:col:not-a-uuid:db:col", cx));
+        assert!(!execute_collection_navigation_action(&state, "nav:db:something-else", cx));
+        state.update(cx, |state, _cx| {
+            assert_eq!(state.current_view, View::Welcome);
+            assert!(state.open_tabs().is_empty());
+        });
     }
 }

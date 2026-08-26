@@ -1,7 +1,7 @@
 mod providers;
 mod types;
 
-pub use types::ActionExecution;
+pub use types::{ActionExecution, COLLECTION_NAVIGATION_PREFIX, collection_navigation_action_id};
 
 use gpui::*;
 use gpui_component::ActiveTheme as _;

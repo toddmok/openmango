@@ -117,6 +117,13 @@ actions!(
 
 const DOCUMENT_EDIT_CONTEXT: &str = "Documents && !Input && !Aggregation";
 const FOCUS_CONTENT_KEYS: [&str; 2] = ["cmd-shift-1", "ctrl-shift-1"];
+// All four shortcuts share the single binding ID `open-action-bar.workspace`
+// in the Settings UI, like every other cmd/ctrl pair in this file: rebinding
+// or disabling the palette affects all of them together.
+// The k pair is registered last: the sidebar palette-button tooltip uses
+// `highest_precedence_binding_for_action`, which picks the last registered
+// binding, and it should keep advertising Ctrl+K/Cmd+K.
+const OPEN_ACTION_BAR_KEYS: [&str; 4] = ["cmd-p", "ctrl-p", "cmd-k", "ctrl-k"];
 
 pub fn bind_keymap(cx: &mut App, settings: &KeybindingSettings) {
     let (bindings, errors) = effective_keybindings(settings);
@@ -127,7 +134,7 @@ pub fn bind_keymap(cx: &mut App, settings: &KeybindingSettings) {
 }
 
 fn default_keybindings() -> Vec<KeyBinding> {
-    vec![
+    let mut bindings = vec![
         KeyBinding::new("enter", OpenSelection, Some("Sidebar")),
         KeyBinding::new("return", OpenSelection, Some("Sidebar")),
         KeyBinding::new("cmd-enter", OpenSelectionPreview, Some("Sidebar")),
@@ -326,8 +333,11 @@ fn default_keybindings() -> Vec<KeyBinding> {
         KeyBinding::new("ctrl-c", CopyAs, Some("Documents && !Input && !Aggregation")),
         KeyBinding::new("cmd-shift-c", CopyKey, Some("Documents && !Input")),
         KeyBinding::new("ctrl-shift-c", CopyKey, Some("Documents && !Input")),
-        KeyBinding::new("cmd-k", OpenActionBar, Some("Workspace")),
-        KeyBinding::new("ctrl-k", OpenActionBar, Some("Workspace")),
+    ];
+    for key in OPEN_ACTION_BAR_KEYS {
+        bindings.push(KeyBinding::new(key, OpenActionBar, Some("Workspace")));
+    }
+    bindings.extend([
         KeyBinding::new("cmd-shift-h", OpenQueryLibrary, Some("Workspace")),
         KeyBinding::new("ctrl-shift-h", OpenQueryLibrary, Some("Workspace")),
         KeyBinding::new("cmd-,", OpenSettings, Some("Workspace")),
@@ -425,7 +435,8 @@ fn default_keybindings() -> Vec<KeyBinding> {
             MoveAggregationStageDown,
             Some("Documents && Aggregation"),
         ),
-    ]
+    ]);
+    bindings
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -844,6 +855,22 @@ mod tests {
         assert!(!FOCUS_CONTENT_KEYS.contains(&"cmd-1"));
         assert!(!FOCUS_CONTENT_KEYS.contains(&"ctrl-1"));
         assert_eq!(FOCUS_CONTENT_KEYS, ["cmd-shift-1", "ctrl-shift-1"]);
+    }
+
+    #[test]
+    fn command_palette_defaults_include_cmd_p_and_ctrl_p() {
+        let command = keybinding_commands(&KeybindingSettings::default())
+            .into_iter()
+            .find(|command| command.id == "open-action-bar.workspace")
+            .expect("the command palette keybinding should be in the default catalog");
+
+        // Assert the literal shortcuts so a silent change to the constant
+        // fails the test rather than redefining "expected".
+        let expected = ["cmd-p", "ctrl-p", "cmd-k", "ctrl-k"]
+            .iter()
+            .map(|shortcut| normalize_shortcut(shortcut).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(command.default_shortcuts, expected);
     }
 
     #[test]
