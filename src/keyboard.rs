@@ -132,6 +132,8 @@ fn default_keybindings() -> Vec<KeyBinding> {
         KeyBinding::new("return", OpenSelection, Some("Sidebar")),
         KeyBinding::new("cmd-enter", OpenSelectionPreview, Some("Sidebar")),
         KeyBinding::new("ctrl-enter", OpenSelectionPreview, Some("Sidebar")),
+        KeyBinding::new("cmd-shift-f", OpenForge, Some("Sidebar")),
+        KeyBinding::new("ctrl-shift-f", OpenForge, Some("Sidebar")),
         KeyBinding::new("cmd-e", EditConnection, Some("Sidebar")),
         KeyBinding::new("ctrl-e", EditConnection, Some("Sidebar")),
         KeyBinding::new("cmd-shift-d", DisconnectConnection, Some("Sidebar")),
@@ -829,6 +831,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn open_forge_shortcut_matches_sidebar_without_conflicting_with_aggregation() {
+        let bindings = default_keybindings();
+        for shortcut in ["cmd-shift-f", "ctrl-shift-f"] {
+            assert!(bindings.iter().any(|binding| {
+                binding.action().as_any().is::<OpenForge>()
+                    && binding.keystrokes()
+                        == KeyBinding::new(shortcut, OpenForge, Some("Sidebar")).keystrokes()
+                    && binding.predicate().is_some_and(|context| {
+                        context
+                            .depth_of(&[
+                                KeyContext::parse("Workspace").unwrap(),
+                                KeyContext::parse("Sidebar").unwrap(),
+                            ])
+                            .is_some()
+                            && context
+                                .depth_of(&[
+                                    KeyContext::parse("Workspace").unwrap(),
+                                    KeyContext::parse("Documents Aggregation").unwrap(),
+                                ])
+                                .is_none()
+                    })
+            }));
+        }
+    }
+
+    #[test]
     fn document_duplicate_and_delete_do_not_match_aggregation() {
         let document = KeyBindingContextPredicate::parse(DOCUMENT_EDIT_CONTEXT).unwrap();
         let aggregation =
@@ -863,10 +891,12 @@ mod tests {
         assert!(
             shortcuts("show-schema-subview.").contains(&normalize_shortcut("ctrl-alt-5").unwrap())
         );
-        assert!(shortcuts("run-transfer.").contains(&"cmd-enter".to_string()));
-        assert!(shortcuts("run-transfer.").contains(&"ctrl-enter".to_string()));
+        assert!(shortcuts("run-transfer.").contains(&normalize_shortcut("cmd-enter").unwrap()));
+        assert!(shortcuts("run-transfer.").contains(&normalize_shortcut("ctrl-enter").unwrap()));
         assert!(shortcuts("cancel-transfer.").contains(&"escape".to_string()));
-        assert!(shortcuts("save-transfer-query.").contains(&"cmd-enter".to_string()));
+        assert!(
+            shortcuts("save-transfer-query.").contains(&normalize_shortcut("cmd-enter").unwrap())
+        );
         assert!(shortcuts("close-transfer-query-modal.").contains(&"escape".to_string()));
         assert!(!contexts_overlap(
             Some("Transfer && !TransferRunning && !TransferQueryModal"),
@@ -959,12 +989,17 @@ mod tests {
     #[test]
     fn invalid_and_reserved_shortcuts_fail_safely() {
         assert!(normalize_shortcut("").is_err());
-        let issues = validate_keybinding_override(
-            &KeybindingSettings::default(),
-            "open-action-bar.workspace",
-            "cmd-space",
-        )
-        .unwrap();
-        assert!(issues.iter().any(|issue| issue.severity == KeybindingIssueSeverity::Error));
+        // The reserved shortcuts are macOS system bindings. On other platforms,
+        // GPUI normalizes `cmd` to the platform's secondary modifier first.
+        #[cfg(target_os = "macos")]
+        {
+            let issues = validate_keybinding_override(
+                &KeybindingSettings::default(),
+                "open-action-bar.workspace",
+                "cmd-space",
+            )
+            .unwrap();
+            assert!(issues.iter().any(|issue| issue.severity == KeybindingIssueSeverity::Error));
+        }
     }
 }

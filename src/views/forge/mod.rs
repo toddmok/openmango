@@ -570,7 +570,7 @@ impl Render for ForgeView {
                     ),
             );
 
-        actions::bind_root_actions(root, window, cx).into_any_element()
+        actions::bind_root_actions(root, self.app_state.clone(), cx).into_any_element()
     }
 }
 

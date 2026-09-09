@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- Open a highlighted collection in Forge with Cmd/Ctrl+Shift+F, or choose Open Forge as the collection double-click action in Settings; queries start with `find({})`, ready to run ([#12](https://github.com/ggagosh/openmango/issues/12))
 - Authenticated local MCP agent access with per-connection sharing and write controls, bounded read tools, direct document insert/update/replace/delete, and metadata-only History restore tools
 - Native approval and Agent Activity workflows for Arcula database backups, syncs, and verified-backup reverts, including progress, cancellation, target fingerprints, and recovery interlocks
 - Encrypted passive document History with change-stream capture, visible coverage gaps, retention controls, concise batch details, and conflict-safe resumable restores
@@ -36,6 +37,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Reload a database to refresh its collection list from the server without reconnecting
 
 ### Fixed
+- Opening Forge now targets the highlighted collection, reuses matching find-all queries, and preserves existing query drafts
+- Running Forge queries or selected statements with keyboard shortcuts no longer causes a nested view-update crash
 - Transfer cancellation now blocks reruns and mode changes until the active operation has stopped, preventing stale completion races
 - macOS development runs use a stable Apple Development signature so Keychain access remains trusted across rebuilds
 - Workspace restore no longer crashes by re-entering the sidebar while a connection event is being handled
@@ -74,6 +77,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Applied fast filters now keep the text you typed instead of rewriting it into MongoDB JSON
 
 ### Changed
+- Settings now use a searchable full-content tab with General, Transfer, AI Assistant, Agents & MCP, and Keybindings pages
+- Connection management now uses a full-content singleton tab with explicit new-connection drafts, cancellation, draft-discard protection, and consistent New Connection entry points
 - History now observes MongoDB changes passively and never pre-reads, authorizes, approves, or blocks originating writes
 - Transfer now uses one compact Export, Import, and Copy workflow with progressive options and consistent aggregate progress across collection, database, JSON/CSV, and BSON operations
 - Updates now require published SHA-256 assets, verify the downloaded archive and macOS code signature, respect the automatic-update preference, and install only after Restart to Update

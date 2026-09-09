@@ -109,6 +109,9 @@ impl AppState {
                     TabKey::AgentActivity => {
                         self.current_view = View::AgentActivity;
                     }
+                    TabKey::Connections => {
+                        self.current_view = View::Connections;
+                    }
                     TabKey::Settings => {
                         self.current_view = View::Settings;
                     }

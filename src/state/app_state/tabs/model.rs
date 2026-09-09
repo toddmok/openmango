@@ -11,8 +11,8 @@ use crate::state::events::AppEvent;
 use crate::state::{AppState, StatusLevel};
 
 use crate::state::app_state::types::{
-    ActiveTab, DatabaseKey, ForgeTabKey, ForgeTabState, SessionKey, TabKey, TransferMode,
-    TransferScope, TransferTabKey, TransferTabState, View,
+    ActiveTab, ConnectionManagerRequest, DatabaseKey, ForgeTabKey, ForgeTabState, SessionKey,
+    TabKey, TransferMode, TransferScope, TransferTabKey, TransferTabState, View,
 };
 
 const COLLECTION_FORGE_QUERY_SUFFIX: &str =
@@ -153,6 +153,9 @@ impl AppState {
             }
             TabKey::AgentActivity => {
                 self.current_view = View::AgentActivity;
+            }
+            TabKey::Connections => {
+                self.current_view = View::Connections;
             }
             TabKey::Settings => {
                 self.current_view = View::Settings;
@@ -505,6 +508,38 @@ impl AppState {
         cx.notify();
     }
 
+    /// Open the connection manager as a singleton workspace tab.
+    pub fn open_connections_tab(
+        &mut self,
+        selected_id: Option<Uuid>,
+        creating_new: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.connection_manager_request = ConnectionManagerRequest {
+            generation: self.connection_manager_request.generation.wrapping_add(1),
+            selected_id,
+            creating_new,
+        };
+
+        if let Some(index) =
+            self.tabs.open.iter().position(|tab| matches!(tab, TabKey::Connections))
+        {
+            self.set_active_index(index);
+        } else {
+            self.tabs.open.push(TabKey::Connections);
+            self.set_active_index(self.tabs.open.len() - 1);
+        }
+
+        self.current_view = View::Connections;
+        self.clear_error_status();
+        cx.emit(AppEvent::ViewChanged);
+        cx.notify();
+    }
+
+    pub fn connection_manager_request(&self) -> ConnectionManagerRequest {
+        self.connection_manager_request
+    }
+
     /// Open settings tab (singleton - only one settings tab allowed)
     pub fn open_settings_tab(&mut self, cx: &mut Context<Self>) {
         // Check if settings tab already exists
@@ -573,13 +608,26 @@ impl AppState {
         collection: Option<String>,
         cx: &mut Context<Self>,
     ) {
+        let forge_content = collection.as_deref().map(collection_forge_content);
+        let existing_index = self.existing_forge_tab(
+            connection_id,
+            &database,
+            forge_content.as_ref().map(|(content, _)| content.as_str()),
+        );
+
+        if let Some(index) = existing_index {
+            self.select_tab(index, cx);
+            self.conn.selected_collection = collection.clone();
+            return;
+        }
+
+        // Create new Forge tab
         let id = Uuid::new_v4();
         let key = ForgeTabKey { id, connection_id, database: database.clone() };
         let mut state =
             ForgeTabState { collection: collection.clone(), ..ForgeTabState::default() };
         let selected_collection = collection.clone();
-        if let Some(collection) = collection.as_deref() {
-            let (content, cursor) = collection_forge_content(collection);
+        if let Some((content, cursor)) = forge_content {
             state.pending_cursor = Some(cursor);
             state.content = content;
         }
@@ -595,6 +643,20 @@ impl AppState {
         self.clear_error_status();
         cx.emit(AppEvent::ViewChanged);
         cx.notify();
+    }
+
+    // Reuse an untouched find-all query; never replace an existing Forge draft.
+    fn existing_forge_tab(
+        &self,
+        connection_id: Uuid,
+        database: &str,
+        content: Option<&str>,
+    ) -> Option<usize> {
+        self.tabs.open.iter().position(|tab| {
+            matches!(tab, TabKey::Forge(key)
+                if key.connection_id == connection_id && key.database == database
+                    && content.is_none_or(|content| self.forge_tab_content(key.id) == Some(content)))
+        })
     }
 
     /// Open a Forge tab with specific content (e.g. an aggregate command from AI chat).
@@ -769,7 +831,7 @@ impl AppState {
             TabKey::Forge(key) => {
                 self.forge_tabs.remove(&key.id);
             }
-            TabKey::AgentActivity | TabKey::Settings | TabKey::Changelog => {
+            TabKey::AgentActivity | TabKey::Connections | TabKey::Settings | TabKey::Changelog => {
                 // No cleanup needed
             }
         }
@@ -913,6 +975,7 @@ impl AppState {
                 }
                 TabKey::Transfer(_)
                 | TabKey::AgentActivity
+                | TabKey::Connections
                 | TabKey::Settings
                 | TabKey::Changelog => false,
             })
@@ -1033,6 +1096,7 @@ fn tab_kind_label(tab: &TabKey) -> &'static str {
         TabKey::Transfer(_) => "transfer",
         TabKey::Forge(_) => "forge",
         TabKey::AgentActivity => "agent_activity",
+        TabKey::Connections => "connections",
         TabKey::Settings => "settings",
         TabKey::Changelog => "changelog",
     }
@@ -1054,11 +1118,42 @@ fn remap_active_index_after_tab_move(active: usize, from: usize, to: usize) -> u
 #[cfg(test)]
 mod tests {
     use super::{collection_forge_content, remap_active_index_after_tab_move};
-    #[cfg(target_os = "macos")]
-    use crate::state::TabKey;
+    use crate::state::app_state::types::{ForgeTabKey, ForgeTabState, TabKey};
     use crate::state::{AppState, SessionKey};
     #[cfg(target_os = "macos")]
     use gpui::AppContext as _;
+
+    #[test]
+    fn collection_forge_queries_escape_names_and_preserve_drafts() {
+        let collection = "orders\\archive\"\n";
+        let (query, _) = collection_forge_content(collection);
+        let encoded =
+            query.strip_prefix("db.getCollection(").unwrap().split_once(").find(").unwrap().0;
+        assert_eq!(serde_json::from_str::<String>(encoded).unwrap(), collection);
+        assert_eq!(
+            collection_forge_content("users").0,
+            "db.getCollection(\"users\").find({\n    \n})\n// .projection({_id: 1})\n.sort({createdAt:-1}).limit(10).maxTimeMS(5000)"
+        );
+
+        let mut state = AppState::new();
+        let connection_id = uuid::Uuid::new_v4();
+        let id = uuid::Uuid::new_v4();
+        state.tabs.open.push(TabKey::Forge(ForgeTabKey {
+            id,
+            connection_id,
+            database: "db".into(),
+        }));
+        state.forge_tabs.insert(id, ForgeTabState { content: query.clone(), ..Default::default() });
+        assert_eq!(state.existing_forge_tab(connection_id, "db", Some(&query)), Some(0));
+        assert_eq!(state.existing_forge_tab(connection_id, "other", Some(&query)), None);
+        assert_eq!(state.existing_forge_tab(uuid::Uuid::new_v4(), "db", Some(&query)), None);
+        let users_query = collection_forge_content("users").0;
+        assert_eq!(state.existing_forge_tab(connection_id, "db", Some(&users_query)), None);
+        state.forge_tabs.get_mut(&id).unwrap().content.push_str(".limit(10)");
+        assert_eq!(state.existing_forge_tab(connection_id, "db", Some(&query)), None);
+        assert_eq!(state.existing_forge_tab(connection_id, "db", None), Some(0));
+        assert!(state.forge_tab_content(id).unwrap().ends_with(".limit(10)"));
+    }
 
     #[test]
     fn cleanup_session_removes_or_retains() {
@@ -1127,6 +1222,15 @@ mod tests {
                 Some("events".into()),
                 cx,
             );
+            // Upstream's shortcut/settings implementation reuses an untouched query for the
+            // same collection rather than opening duplicates. Different collections still get
+            // independent tabs, which is the fork's stronger collection-scoped behavior.
+            state.open_forge_tab(
+                connection_id,
+                "application".into(),
+                Some("users".into()),
+                cx,
+            );
 
             let forge_ids = state
                 .open_tabs()
@@ -1152,8 +1256,7 @@ mod tests {
             );
             assert_eq!(state.forge_tab_label(forge_ids[0]), "Forge: application/users");
             assert_eq!(state.forge_tab_label(forge_ids[1]), "Forge: application/events");
-
-            state.select_tab(0, cx);
+            assert_eq!(state.active_index(), Some(0));
             assert_eq!(state.selected_collection_name().as_deref(), Some("users"));
         });
     }
