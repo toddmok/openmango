@@ -1,7 +1,10 @@
-use gpui::*;
-use gpui_component::ActiveTheme as _;
-use gpui_component::resizable::{h_resizable, resizable_panel};
-use gpui_component::scroll::ScrollableElement;
+use gpui_kit::component::ActiveTheme as _;
+use gpui_kit::component::Disableable as _;
+use gpui_kit::component::Sizable as _;
+use gpui_kit::component::button::ButtonVariants as _;
+use gpui_kit::component::resizable::{h_resizable, resizable_panel};
+use gpui_kit::component::scroll::ScrollableElement;
+use gpui_kit::*;
 
 use crate::components::Button;
 use crate::helpers::format_number;
@@ -13,14 +16,43 @@ use crate::theme::spacing;
 use crate::views::CollectionView;
 
 impl CollectionView {
+    /// Closes the Explain modal if it is showing. Returns whether it was.
+    pub(in crate::views::documents) fn close_explain_modal(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(session_key) = self.view_model.current_session() else {
+            return false;
+        };
+        let open = self.state.read(cx).session(&session_key).is_some_and(|session| {
+            matches!(session.data.explain.open_mode, ExplainOpenMode::Modal)
+        });
+        if open {
+            self.state.update(cx, |state, cx| {
+                state.set_explain_open_mode(&session_key, ExplainOpenMode::Closed);
+                cx.notify();
+            });
+        }
+        open
+    }
+
     pub(in crate::views::documents) fn render_explain_modal_layer(
         &mut self,
         explain: &ExplainState,
         session_key: Option<SessionKey>,
         active_subview: CollectionSubview,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        if !matches!(explain.open_mode, ExplainOpenMode::Modal) {
+        // A modal takes focus when it opens and gives it back when it closes. Without that its
+        // Escape handler sat off the focus path until the user clicked inside.
+        let open = matches!(explain.open_mode, ExplainOpenMode::Modal);
+        if open != self.explain_was_open {
+            self.explain_was_open = open;
+            let target = if open { &self.explain_focus } else { &self.documents_focus };
+            window.focus(target, cx);
+        }
+        if !open {
             return div().into_any_element();
         }
 
@@ -35,9 +67,9 @@ impl CollectionView {
             .gap(spacing::xs())
             .child(
                 if explain.view_mode == ExplainViewMode::Tree {
-                    Button::new("explain-mode-tree").compact().primary().label("Visual Tree")
+                    Button::new("explain-mode-tree").xsmall().primary().label("Visual tree")
                 } else {
-                    Button::new("explain-mode-tree").compact().ghost().label("Visual Tree")
+                    Button::new("explain-mode-tree").xsmall().ghost().label("Visual tree")
                 }
                 .on_click({
                     let state = self.state.clone();
@@ -55,9 +87,9 @@ impl CollectionView {
             )
             .child(
                 if explain.view_mode == ExplainViewMode::Json {
-                    Button::new("explain-mode-json").compact().primary().label("Raw JSON")
+                    Button::new("explain-mode-json").xsmall().primary().label("Raw JSON")
                 } else {
-                    Button::new("explain-mode-json").compact().ghost().label("Raw JSON")
+                    Button::new("explain-mode-json").xsmall().ghost().label("Raw JSON")
                 }
                 .on_click({
                     let state = self.state.clone();
@@ -74,6 +106,16 @@ impl CollectionView {
                 }),
             );
 
+        // The explain run failed; say so instead of showing an empty or older plan.
+        let error_callout = explain.error.clone().filter(|_| !explain.loading).map(|error| {
+            div().px(spacing::md()).pt(spacing::sm()).child(
+                crate::components::ErrorCallout::new(
+                    "explain-error",
+                    crate::error::ErrorReport::from_message("Couldn't explain this", &error),
+                )
+                .state(self.state.clone()),
+            )
+        });
         let tab_hint = if explain.view_mode == ExplainViewMode::Tree {
             "Select a stage to inspect index usage, costs, and timings."
         } else {
@@ -87,7 +129,7 @@ impl CollectionView {
             .gap(spacing::xs())
             .child(
                 Button::new("explain-rerun")
-                    .compact()
+                    .xsmall()
                     .label("Explain")
                     .disabled(session_key.is_none() || explain.loading)
                     .on_click({
@@ -118,7 +160,7 @@ impl CollectionView {
             )
             .child(
                 Button::new("explain-copy-json")
-                    .compact()
+                    .xsmall()
                     .ghost()
                     .label("Copy JSON")
                     .disabled(explain.raw_json.is_none())
@@ -132,7 +174,7 @@ impl CollectionView {
                         }
                     }),
             )
-            .child(Button::new("explain-close").compact().ghost().label("Close").on_click({
+            .child(Button::new("explain-close").xsmall().ghost().label("Close").on_click({
                 let state = self.state.clone();
                 let session_key = session_key.clone();
                 move |_, _, cx| {
@@ -149,6 +191,7 @@ impl CollectionView {
         div()
             .absolute()
             .inset_0()
+            .track_focus(&self.explain_focus)
             .on_mouse_down(MouseButton::Left, |_, _, cx| {
                 cx.stop_propagation();
             })
@@ -186,7 +229,7 @@ impl CollectionView {
                         .flex()
                         .flex_col()
                         .bg(cx.theme().background)
-                        .rounded(px(10.0))
+                        .rounded(crate::theme::borders::radius_md())
                         .border_1()
                         .border_color(cx.theme().border)
                         .overflow_hidden()
@@ -230,7 +273,7 @@ impl CollectionView {
                                             div().into_any_element()
                                         })
                                         .child(if explain.loading {
-                                            explain_info_chip("Running...", cx.theme().primary, cx)
+                                            explain_info_chip("Running…", cx.theme().primary, cx)
                                                 .into_any_element()
                                         } else {
                                             div().into_any_element()
@@ -257,6 +300,7 @@ impl CollectionView {
                                         .child(tab_hint),
                                 ),
                         )
+                        .children(error_callout)
                         .child(
                             div()
                                 .flex()
@@ -318,7 +362,7 @@ impl CollectionView {
                 .gap(spacing::xs())
                 .px(spacing::md())
                 .py(spacing::sm())
-                .rounded(px(9.0))
+                .rounded(crate::theme::borders::radius_md())
                 .border_1()
                 .border_color(border)
                 .bg(bg)
@@ -428,7 +472,7 @@ impl CollectionView {
             .gap(spacing::xs())
             .child(
                 Button::new("explain-run-prev")
-                    .compact()
+                    .xsmall()
                     .ghost()
                     .label("Prev")
                     .disabled(session_key.is_none() || !can_prev_run)
@@ -455,7 +499,7 @@ impl CollectionView {
             )
             .child(
                 Button::new("explain-run-next")
-                    .compact()
+                    .xsmall()
                     .ghost()
                     .label("Next")
                     .disabled(session_key.is_none() || !can_next_run)
@@ -475,9 +519,9 @@ impl CollectionView {
             )
             .child(if diff_active {
                 Button::new("explain-clear-diff")
-                    .compact()
+                    .xsmall()
                     .ghost()
-                    .label("Clear Diff")
+                    .label("Clear diff")
                     .disabled(session_key.is_none())
                     .on_click({
                         let state = self.state.clone();
@@ -494,9 +538,9 @@ impl CollectionView {
                     })
             } else {
                 Button::new("explain-compare-prev")
-                    .compact()
+                    .xsmall()
                     .ghost()
-                    .label("Compare Prev")
+                    .label("Compare prev")
                     .disabled(session_key.is_none() || !can_compare_prev)
                     .on_click({
                         let state = self.state.clone();
@@ -514,7 +558,7 @@ impl CollectionView {
             })
             .child(
                 Button::new("explain-clear-history")
-                    .compact()
+                    .xsmall()
                     .ghost()
                     .label("Clear History")
                     .disabled(session_key.is_none() || !can_clear_history)
@@ -710,7 +754,7 @@ fn render_explain_bottlenecks(explain: &ExplainState, cx: &App) -> AnyElement {
                 .gap(px(4.0))
                 .px(spacing::sm())
                 .py(spacing::xs())
-                .rounded(px(8.0))
+                .rounded(crate::theme::borders::radius_md())
                 .bg(cx.theme().tab_bar.opacity(0.18))
                 .child(
                     div()
@@ -805,7 +849,7 @@ fn render_explain_rejected_plans(explain: &ExplainState, cx: &App) -> AnyElement
                 .gap(spacing::xs())
                 .px(spacing::sm())
                 .py(spacing::xs())
-                .rounded(px(8.0))
+                .rounded(crate::theme::borders::radius_md())
                 .bg(cx.theme().tab_bar.opacity(0.18))
                 .child(
                     div()
@@ -893,7 +937,7 @@ fn render_explain_diff(explain: &ExplainState, cx: &App) -> AnyElement {
                     .gap(px(3.0))
                     .px(spacing::sm())
                     .py(spacing::xs())
-                    .rounded(px(8.0))
+                    .rounded(crate::theme::borders::radius_md())
                     .bg(cx.theme().tab_bar.opacity(0.18))
                     .child(
                         div()
@@ -1135,7 +1179,7 @@ fn explain_metric_chip(label: &str, accent: Hsla, _cx: &App) -> Div {
     div()
         .px(spacing::xs())
         .py(px(2.0))
-        .rounded(px(5.0))
+        .rounded(crate::theme::borders::radius_sm())
         .bg(accent.opacity(0.13))
         .border_1()
         .border_color(accent.opacity(0.32))
@@ -1148,7 +1192,7 @@ fn explain_info_chip(label: &str, accent: Hsla, _cx: &App) -> Div {
     div()
         .px(spacing::xs())
         .py(px(2.0))
-        .rounded(px(5.0))
+        .rounded(crate::theme::borders::radius_sm())
         .bg(accent.opacity(0.1))
         .border_1()
         .border_color(accent.opacity(0.28))
@@ -1212,9 +1256,9 @@ fn explain_panel_tab_button(
     session_key: Option<SessionKey>,
 ) -> Button {
     let mut button = if active_tab == tab {
-        Button::new(id).compact().primary().label(tab.label())
+        Button::new(id).xsmall().primary().label(tab.label())
     } else {
-        Button::new(id).compact().ghost().label(tab.label())
+        Button::new(id).xsmall().ghost().label(tab.label())
     };
     button = button.disabled(disabled || session_key.is_none());
     button.on_click(move |_, _, cx| {
@@ -1284,7 +1328,7 @@ fn explain_section_card(
     div()
         .flex()
         .flex_col()
-        .rounded(px(10.0))
+        .rounded(crate::theme::borders::radius_md())
         .border_1()
         .border_color(cx.theme().border.opacity(0.55))
         .bg(cx.theme().background.opacity(0.5))
@@ -1369,7 +1413,7 @@ fn explain_hint_row(message: &str, accent: Hsla) -> Div {
     div()
         .px(spacing::xs())
         .py(px(4.0))
-        .rounded(px(6.0))
+        .rounded(crate::theme::borders::radius_sm())
         .border_1()
         .border_color(accent.opacity(0.3))
         .bg(accent.opacity(0.11))

@@ -5,19 +5,21 @@
 
 use std::rc::Rc;
 
-use gpui::{App, Hsla, Pixels, px};
-use gpui_component::ActiveTheme as _;
-use gpui_component::tab::TabBar;
-use gpui_component::theme::{ThemeConfig, ThemeSet};
+use gpui_kit::component::ActiveTheme as _;
+use gpui_kit::component::tab::TabBar;
+use gpui_kit::component::theme::{ThemeConfig, ThemeSet};
+use gpui_kit::{App, Entity, Hsla, Pixels, Styled as _, Window, WindowAppearance, px};
 
-use crate::state::{AppTheme, AppearanceSettings, IslandsTabStyle};
+use crate::state::{AppState, AppTheme, AppearanceSettings, IslandsTabStyle};
 
 // =============================================================================
 // Theme Loading & Switching
 // =============================================================================
 
 const THEME_SOURCES: &[(&str, &str)] = &[
-    ("vercel-dark", include_str!("../themes/openmango-dark.json")),
+    ("mango-dark", include_str!("../themes/mango-dark.json")),
+    ("mango-light", include_str!("../themes/mango-light.json")),
+    ("vercel-dark", include_str!("../themes/vercel-dark.json")),
     ("darcula-dark", include_str!("../themes/darcula-dark.json")),
     ("tokyo-night", include_str!("../themes/tokyo-night.json")),
     ("nord", include_str!("../themes/nord.json")),
@@ -38,45 +40,82 @@ pub fn load_theme_config(theme_id: &str) -> Option<Rc<ThemeConfig>> {
     theme_set.themes.into_iter().next().map(Rc::new)
 }
 
-pub fn apply_theme(
-    app_theme: AppTheme,
-    vibrancy: bool,
-    window: &mut gpui::Window,
-    cx: &mut gpui::App,
-) {
+/// Keep application geometry and typography consistent across all color themes.
+pub fn apply_design_tokens(cx: &mut App) {
+    let theme = gpui_kit::component::theme::Theme::global_mut(cx);
+    theme.font_family = fonts::ui().into();
+    theme.mono_font_family = fonts::mono().into();
+    theme.radius = borders::radius_sm();
+    theme.radius_lg = borders::radius_md();
+    // Writing to the theme's fields leaves the kit's Base layer on the colors it was built with,
+    // and that layer paints the markdown in the chat and the scrollbars. Without this a dark
+    // theme draws a white table on a dark answer.
+    gpui_kit::component::theme::Theme::sync_base(cx);
+    // Writing to the theme's fields leaves the kit's Base layer on the colors it was built with,
+    // and that layer paints the markdown in the chat and the scrollbars. Without this a dark
+    // theme draws a white table on a dark answer.
+}
+
+pub fn apply_theme(app_theme: AppTheme, window: &mut gpui_kit::Window, cx: &mut gpui_kit::App) {
     if let Some(config) = load_theme_config(app_theme.theme_id()) {
-        gpui_component::theme::Theme::global_mut(cx).apply_config(&config);
-
-        // Re-apply font family overrides
-        let theme = gpui_component::theme::Theme::global_mut(cx);
-        theme.font_family = fonts::ui().into();
-        theme.mono_font_family = fonts::mono().into();
-
-        if vibrancy {
-            apply_vibrancy(cx);
-        }
-
+        gpui_kit::component::theme::Theme::global_mut(cx).apply_config(&config);
+        apply_design_tokens(cx);
         window.refresh();
     }
 }
 
-pub fn effective_vibrancy(_app_theme: AppTheme, user_vibrancy: bool) -> bool {
-    user_vibrancy
+/// The theme to show: the Mango theme matching the system when following it, else the saved one.
+pub fn resolved_theme(appearance: &AppearanceSettings, system: WindowAppearance) -> AppTheme {
+    if !appearance.follow_system {
+        return appearance.theme;
+    }
+    match system {
+        WindowAppearance::Dark | WindowAppearance::VibrantDark => AppTheme::MangoDark,
+        WindowAppearance::Light | WindowAppearance::VibrantLight => AppTheme::MangoLight,
+    }
 }
 
-pub fn requires_vibrancy_restart(
-    startup_vibrancy: bool,
-    _target_theme: AppTheme,
-    user_vibrancy: bool,
-) -> bool {
-    startup_vibrancy != user_vibrancy
+/// Saves and applies a theme the user picked, which stops following the system appearance.
+pub fn pick_theme(state: &Entity<AppState>, theme: AppTheme, window: &mut Window, cx: &mut App) {
+    save_and_apply(state, theme, false, window, cx);
 }
 
-/// Reduce alpha on background/sidebar so the macOS blur effect shows through.
-pub fn apply_vibrancy(cx: &mut gpui::App) {
-    let theme = gpui_component::theme::Theme::global_mut(cx);
-    theme.background.a = 0.82;
-    theme.sidebar.a = 0.82;
+/// Turns system appearance following on, applying the matching Mango theme, or off.
+pub fn set_follow_system(
+    state: &Entity<AppState>,
+    follow: bool,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let mut appearance = state.read(cx).settings.appearance.clone();
+    appearance.follow_system = follow;
+    let theme = resolved_theme(&appearance, window.appearance());
+    save_and_apply(state, theme, follow, window, cx);
+}
+
+/// Re-applies the matching Mango theme after the system appearance changes.
+pub fn sync_system_theme(state: &Entity<AppState>, window: &mut Window, cx: &mut App) {
+    let appearance = &state.read(cx).settings.appearance;
+    let theme = resolved_theme(appearance, window.appearance());
+    if appearance.follow_system && theme != appearance.theme {
+        save_and_apply(state, theme, true, window, cx);
+    }
+}
+
+fn save_and_apply(
+    state: &Entity<AppState>,
+    theme: AppTheme,
+    follow_system: bool,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    state.update(cx, |state, cx| {
+        state.settings.appearance.theme = theme;
+        state.settings.appearance.follow_system = follow_system;
+        state.save_settings();
+        cx.notify();
+    });
+    apply_theme(theme, window, cx);
 }
 
 // =============================================================================
@@ -84,8 +123,8 @@ pub fn apply_vibrancy(cx: &mut gpui::App) {
 // =============================================================================
 
 pub mod colors {
-    use gpui::{App, Hsla};
-    use gpui_component::ActiveTheme as _;
+    use gpui_kit::component::ActiveTheme as _;
+    use gpui_kit::{App, Hsla};
 
     use crate::models::ConnectionColor;
 
@@ -127,6 +166,16 @@ pub mod colors {
     }
 
     // Dirty document highlight (warning color with alpha)
+    pub fn bg_added(cx: &App) -> Hsla {
+        cx.theme().success.opacity(0.1)
+    }
+    pub fn bg_removed(cx: &App) -> Hsla {
+        cx.theme().danger.opacity(0.1)
+    }
+    pub fn bg_changed(cx: &App) -> Hsla {
+        cx.theme().warning.opacity(0.1)
+    }
+
     pub fn bg_dirty(cx: &App) -> Hsla {
         let mut c = cx.theme().warning;
         c.a = 0.1;
@@ -142,7 +191,7 @@ pub mod colors {
 
     // Fully transparent (for invisible default borders/backgrounds)
     pub fn transparent() -> Hsla {
-        gpui::hsla(0.0, 0.0, 0.0, 0.0)
+        gpui_kit::hsla(0.0, 0.0, 0.0, 0.0)
     }
 
     // Modal backdrop — theme background darkened with alpha
@@ -182,8 +231,11 @@ pub mod islands {
     use super::*;
 
     pub fn tab_bar(bar: TabBar, appearance: &AppearanceSettings) -> TabBar {
+        let bar = bar.min_w(px(0.0)).max_width(px(260.0)).rounded(borders::radius_sm());
         match appearance.islands.tab_style {
-            IslandsTabStyle::Islands => bar.data_grip(),
+            // Keep the native selected surface neutral so connection colors and
+            // status badges remain legible in the surrounding application theme.
+            IslandsTabStyle::Islands => bar.segmented().bg(colors::transparent()),
             IslandsTabStyle::Segmented => bar.segmented(),
             IslandsTabStyle::Underline => bar.underline(),
         }
@@ -191,12 +243,12 @@ pub mod islands {
 
     pub fn radius_sm(appearance: &AppearanceSettings) -> Pixels {
         let _ = appearance;
-        px(8.0)
+        borders::radius_sm()
     }
 
     pub fn radius_md(appearance: &AppearanceSettings) -> Pixels {
         let _ = appearance;
-        px(8.0)
+        borders::radius_md()
     }
 
     pub fn panel_border(_appearance: &AppearanceSettings, cx: &App) -> Hsla {
@@ -242,21 +294,162 @@ pub mod islands {
 
 #[cfg(test)]
 mod tests {
-    use super::{effective_vibrancy, requires_vibrancy_restart};
     use crate::state::AppTheme;
 
-    #[test]
-    fn vibrancy_follows_user_toggle() {
-        assert!(!effective_vibrancy(AppTheme::VercelDark, false));
-        assert!(effective_vibrancy(AppTheme::VercelDark, true));
+    #[gpui_kit::test]
+    fn every_color_theme_uses_the_shared_radius_scale(cx: &mut gpui_kit::TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            for (id, _) in super::THEME_SOURCES {
+                let config = super::load_theme_config(id).expect("valid bundled theme");
+                let theme = gpui_kit::component::Theme::global_mut(cx);
+                theme.radius = gpui_kit::px(30.);
+                theme.radius_lg = gpui_kit::px(40.);
+                theme.apply_config(&config);
+                super::apply_design_tokens(cx);
+                let theme = gpui_kit::component::Theme::global(cx);
+                assert_eq!(theme.radius, super::borders::radius_sm(), "{id}");
+                assert_eq!(theme.radius_lg, super::borders::radius_md(), "{id}");
+                let base = gpui_kit::base::Theme::global(cx);
+                assert_eq!(base.tokens.radius.sm, super::borders::radius_xs(), "{id}");
+                assert_eq!(base.tokens.radius.md, super::borders::radius_sm(), "{id}");
+                assert_eq!(base.tokens.radius.lg, super::borders::radius_md(), "{id}");
+            }
+        });
+    }
+
+    /// The chat renders markdown through the kit's Base layer, which keeps its own copy of the
+    /// theme. Switching themes has to reach it, or a dark answer is drawn with light tables.
+    #[gpui_kit::test]
+    fn switching_themes_reaches_the_layer_that_draws_the_chat(cx: &mut gpui_kit::TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            for (theme, dark) in [(AppTheme::MangoDark, true), (AppTheme::MangoLight, false)] {
+                let config = super::load_theme_config(theme.theme_id()).expect("bundled theme");
+                gpui_kit::component::Theme::global_mut(cx).apply_config(&config);
+                super::apply_design_tokens(cx);
+                let base = gpui_kit::base::Theme::global(cx);
+                assert_eq!(
+                    base.appearance == gpui_kit::base::ThemeAppearance::Dark,
+                    dark,
+                    "{} left the rich-text layer on the other mode",
+                    theme.theme_id()
+                );
+            }
+        });
     }
 
     #[test]
-    fn restart_required_when_vibrancy_changes() {
-        assert!(requires_vibrancy_restart(true, AppTheme::VercelDark, false));
-        assert!(requires_vibrancy_restart(false, AppTheme::VercelDark, true));
-        assert!(!requires_vibrancy_restart(false, AppTheme::VercelDark, false));
-        assert!(!requires_vibrancy_restart(true, AppTheme::VercelDark, true));
+    fn every_listed_theme_loads_and_mango_leads_each_mode() {
+        let dark = AppTheme::dark_themes();
+        let light = AppTheme::light_themes();
+        assert_eq!(
+            (AppTheme::default(), dark[0], light[0]),
+            (AppTheme::MangoDark, AppTheme::MangoDark, AppTheme::MangoLight)
+        );
+        for (themes, is_dark) in [(dark, true), (light, false)] {
+            for theme in themes {
+                let config = super::load_theme_config(theme.theme_id())
+                    .unwrap_or_else(|| panic!("{} has no bundled theme", theme.theme_id()));
+                assert_eq!(config.mode.is_dark(), is_dark, "{}", theme.theme_id());
+            }
+        }
+    }
+
+    /// The Mango themes are ours, so their text colors must meet WCAG AA on the
+    /// surfaces they render on: content, sidebar and hover.
+    #[gpui_kit::test]
+    fn mango_theme_text_meets_contrast_on_every_surface(cx: &mut gpui_kit::TestAppContext) {
+        fn luminance(color: gpui_kit::Hsla) -> f32 {
+            let rgb = color.to_rgb();
+            let channel = |c: f32| {
+                if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) }
+            };
+            0.2126 * channel(rgb.r) + 0.7152 * channel(rgb.g) + 0.0722 * channel(rgb.b)
+        }
+        fn ratio(a: gpui_kit::Hsla, b: gpui_kit::Hsla) -> f32 {
+            let (a, b) = (luminance(a), luminance(b));
+            (a.max(b) + 0.05) / (a.min(b) + 0.05)
+        }
+
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            for theme_id in [AppTheme::MangoDark.theme_id(), AppTheme::MangoLight.theme_id()] {
+                let config = super::load_theme_config(theme_id).expect("bundled theme");
+                gpui_kit::component::Theme::global_mut(cx).apply_config(&config);
+                let t = gpui_kit::component::Theme::global(cx);
+                let surfaces =
+                    [("background", t.background), ("sidebar", t.sidebar), ("hover", t.accent)];
+                for (surface, bg) in surfaces {
+                    let text = [
+                        ("foreground", t.foreground, 7.0),
+                        ("muted", t.muted_foreground, 4.5),
+                        ("link", t.link, 4.5),
+                        ("red", t.red, 4.5),
+                        ("yellow", t.yellow, 4.5),
+                        ("green", t.green, 4.5),
+                        ("blue", t.blue, 4.5),
+                        ("magenta", t.magenta, 4.5),
+                        ("cyan", t.cyan, 4.5),
+                    ];
+                    for (name, fg, min) in text {
+                        let got = ratio(fg, bg);
+                        assert!(
+                            got >= min,
+                            "{theme_id}: {name} on {surface} is {got:.2}, needs {min}"
+                        );
+                    }
+                }
+                for (surface, tint) in [
+                    ("compare added", super::colors::bg_added(cx)),
+                    ("compare removed", super::colors::bg_removed(cx)),
+                    ("compare changed", super::colors::bg_changed(cx)),
+                ] {
+                    let bg = t.background.blend(tint);
+                    for (name, fg) in [
+                        ("foreground", t.foreground),
+                        ("muted", t.muted_foreground),
+                        ("string", t.green),
+                        ("number", t.blue),
+                        ("object id", t.cyan),
+                        ("date", t.magenta),
+                    ] {
+                        assert!(
+                            ratio(fg, bg) >= 4.5,
+                            "{theme_id}: {name} on {surface} is {:.2}",
+                            ratio(fg, bg)
+                        );
+                    }
+                }
+                let fills = [
+                    ("primary", t.primary_foreground, t.primary),
+                    ("primary hover", t.primary_foreground, t.primary_hover),
+                    ("danger", t.danger_foreground, t.danger),
+                    ("warning", t.warning_foreground, t.warning),
+                    ("success", t.success_foreground, t.success),
+                    ("info", t.info_foreground, t.info),
+                ];
+                for (name, fg, bg) in fills {
+                    let got = ratio(fg, bg);
+                    assert!(got >= 4.5, "{theme_id}: text on {name} is {got:.2}, needs 4.5");
+                }
+                let ring = ratio(t.ring, t.background);
+                assert!(ring >= 3.0, "{theme_id}: focus ring is {ring:.2}, needs 3");
+            }
+        });
+    }
+
+    #[test]
+    fn following_the_system_picks_the_matching_mango_theme() {
+        use gpui_kit::WindowAppearance::{Dark, VibrantDark, VibrantLight};
+        let mut appearance =
+            crate::state::AppearanceSettings { theme: AppTheme::Nord, ..Default::default() };
+        assert!(appearance.follow_system, "new installs follow the system");
+        assert_eq!(super::resolved_theme(&appearance, Dark), AppTheme::MangoDark);
+        assert_eq!(super::resolved_theme(&appearance, VibrantDark), AppTheme::MangoDark);
+        assert_eq!(super::resolved_theme(&appearance, VibrantLight), AppTheme::MangoLight);
+        appearance.follow_system = false;
+        assert_eq!(super::resolved_theme(&appearance, Dark), AppTheme::Nord);
     }
 }
 
@@ -265,7 +458,7 @@ mod tests {
 // =============================================================================
 
 pub mod spacing {
-    use gpui::{Pixels, px};
+    use gpui_kit::{Pixels, px};
 
     pub fn xs() -> Pixels {
         px(4.0)
@@ -286,7 +479,7 @@ pub mod spacing {
 // =============================================================================
 
 pub mod sizing {
-    use gpui::{Pixels, px};
+    use gpui_kit::{Pixels, px};
 
     // Layout
     pub fn status_bar_height() -> Pixels {
@@ -303,13 +496,6 @@ pub mod sizing {
     pub fn icon_md() -> Pixels {
         px(16.0)
     } // Standard icon size
-    pub fn icon_lg() -> Pixels {
-        px(20.0)
-    }
-
-    pub fn button_height() -> Pixels {
-        px(28.0)
-    }
 
     pub fn status_dot() -> Pixels {
         px(8.0)
@@ -321,11 +507,8 @@ pub mod sizing {
 // =============================================================================
 
 pub mod typography {
-    use gpui::{Pixels, px};
+    use gpui_kit::{Pixels, px};
 
-    pub fn text_2xs() -> Pixels {
-        px(9.0)
-    }
     pub fn text_xs() -> Pixels {
         px(10.0)
     }
@@ -339,21 +522,21 @@ pub mod typography {
 // =============================================================================
 
 pub mod fonts {
-    use gpui::relative;
+    use gpui_kit::relative;
 
     pub fn ui() -> &'static str {
-        "JetBrainsMono Nerd Font"
+        "JetBrains Mono"
     }
     pub fn heading() -> &'static str {
-        "JetBrainsMono Nerd Font"
+        "JetBrains Mono"
     }
     pub fn mono() -> &'static str {
-        "JetBrainsMono Nerd Font Mono"
+        "JetBrains Mono"
     }
     pub fn tabs() -> &'static str {
-        "Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif"
+        ui()
     }
-    pub fn ui_line_height() -> gpui::DefiniteLength {
+    pub fn ui_line_height() -> gpui_kit::DefiniteLength {
         relative(1.45)
     }
 }
@@ -363,12 +546,19 @@ pub mod fonts {
 // =============================================================================
 
 pub mod borders {
-    use gpui::{Pixels, px};
+    use gpui_kit::{Pixels, px};
 
+    /// Small indicators and chart marks; matches the toolkit's small radius tier.
+    pub fn radius_xs() -> Pixels {
+        radius_sm() / 2.0
+    }
+
+    /// Buttons, inputs, tabs, rows, menus, and small labels.
     pub fn radius_sm() -> Pixels {
-        px(3.0)
-    } // Subtler rounded corners
+        px(6.0)
+    }
 
+    /// Panels, dialogs, cards, and other larger surfaces.
     pub fn radius_md() -> Pixels {
         px(8.0)
     }

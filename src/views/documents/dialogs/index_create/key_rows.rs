@@ -1,8 +1,10 @@
 //! Index key row management for the index create dialog.
 
-use gpui::*;
-use gpui_component::ActiveTheme as _;
-use gpui_component::input::{InputEvent, InputState};
+use gpui_kit::component::ActiveTheme as _;
+use gpui_kit::component::Sizable as _;
+use gpui_kit::component::button::ButtonVariants as _;
+use gpui_kit::component::input::{InputEvent, InputState};
+use gpui_kit::*;
 
 use crate::components::Button;
 use crate::theme::spacing;
@@ -23,7 +25,7 @@ impl IndexCreateDialog {
     pub(super) fn add_row(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let row_id = self.next_row_id;
         self.next_row_id += 1;
-        let field_state = cx.new(|cx| InputState::new(window, cx).placeholder("Field"));
+        let field_state = cx.new(|cx| InputState::new(window, cx).placeholder("user.email"));
         let subscription = cx.subscribe_in(
             &field_state,
             window,
@@ -108,13 +110,14 @@ impl IndexCreateDialog {
         }
 
         let mut row_children = Vec::new();
-        for (index, suggestion) in suggestions.into_iter().enumerate() {
+        for suggestion in suggestions {
             let label = format!("{} ({})", suggestion.path, suggestion.count);
             let target = suggestion.path.clone();
             row_children.push(
-                Button::new((SharedString::from(format!("index-suggestion-{row_id}")), index))
+                // Keyed by path: the suggestions are re-sorted whenever the schema refreshes.
+                Button::new(format!("index-suggestion-{row_id}-{}", suggestion.path))
                     .ghost()
-                    .compact()
+                    .xsmall()
                     .label(label)
                     .on_click({
                         let target = target.clone();

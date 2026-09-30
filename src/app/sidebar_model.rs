@@ -29,7 +29,7 @@ impl SidebarModel {
         connections: Vec<SavedConnection>,
         active: std::collections::HashMap<Uuid, ActiveConnection>,
     ) -> Self {
-        let entries = Self::build_entries(&connections, &active, &HashSet::new());
+        let entries = Self::build_entries(&connections, &active, None, &HashSet::new(), false);
         let entry_index_by_id = Self::build_index(&entries);
         Self {
             connecting_connection: None,
@@ -46,12 +46,21 @@ impl SidebarModel {
         }
     }
 
+    // ponytail: a full rebuild per change, ~0.3us a row (27ms at 100k visible rows, under 2ms
+    // at 5k). Splice the toggled folder's child range in and out if trees ever get that big.
     pub(crate) fn refresh_entries(
         &mut self,
         connections: &[SavedConnection],
         active: &std::collections::HashMap<Uuid, ActiveConnection>,
+        show_system: bool,
     ) -> Option<usize> {
-        self.entries = Self::build_entries(connections, active, &self.expanded_nodes);
+        self.entries = Self::build_entries(
+            connections,
+            active,
+            self.connecting_connection,
+            &self.expanded_nodes,
+            show_system,
+        );
         self.rebuild_index();
         self.sync_selected_index();
         self.selected_index
@@ -88,45 +97,72 @@ impl SidebarModel {
         self.entries.len().checked_sub(1).and_then(|index| self.select_index(index))
     }
 
-    pub(crate) fn move_sidebar_page(
-        &mut self,
-        delta: isize,
-        page_size: usize,
-    ) -> Option<(usize, TreeNodeId)> {
-        if self.entries.is_empty() {
-            return None;
-        }
-        let current_index = self.selected_index.unwrap_or(0).min(self.entries.len() - 1);
-        let page_size = page_size.max(1) as isize;
-        let next = (current_index as isize + delta * page_size)
-            .clamp(0, self.entries.len().saturating_sub(1) as isize) as usize;
-        self.select_index(next)
+    /// Selects `node_id`, or its nearest visible ancestor while it sits under a collapsed row.
+    pub(crate) fn select_nearest(&mut self, node_id: TreeNodeId) -> Option<usize> {
+        self.selected_tree_id = Some(node_id);
+        self.sync_selected_index();
+        self.selected_index
     }
 
-    pub(crate) fn ensure_selection_from_state(
-        &mut self,
+    /// The row that stands for what the app is showing.
+    pub(crate) fn node_for_view(
         connection_id: Option<Uuid>,
         selected_db: Option<String>,
         selected_col: Option<String>,
-    ) -> Option<usize> {
+    ) -> Option<TreeNodeId> {
         let connection_id = connection_id?;
-        if let Some(db) = selected_db.as_ref() {
-            self.expanded_nodes.insert(TreeNodeId::connection(connection_id));
-            if selected_col.is_some() {
-                self.expanded_nodes.insert(TreeNodeId::database(connection_id, db));
-            }
+        Some(match (selected_db, selected_col) {
+            (Some(db), Some(col)) => TreeNodeId::collection(connection_id, db, col),
+            (Some(db), None) => TreeNodeId::database(connection_id, db),
+            _ => TreeNodeId::connection(connection_id),
+        })
+    }
+
+    /// Opens every row above `node_id`. Returns whether anything changed, in which case the
+    /// entries are stale until the caller rebuilds them.
+    pub(crate) fn expand_ancestors(&mut self, node_id: &TreeNodeId) -> bool {
+        let mut changed = false;
+        for ancestor in std::iter::successors(node_id.parent(), TreeNodeId::parent) {
+            changed |= self.expanded_nodes.insert(ancestor);
         }
+        changed
+    }
 
-        self.selected_tree_id = match (selected_db.as_ref(), selected_col.as_ref()) {
-            (Some(db), Some(col)) => {
-                Some(TreeNodeId::collection(connection_id, db.to_string(), col.to_string()))
-            }
-            (Some(db), None) => Some(TreeNodeId::database(connection_id, db.to_string())),
-            _ => None,
-        };
+    /// Opens or closes a row. Closing with `recursive` also forgets what was open below it, so
+    /// the subtree comes back collapsed. Returns whether anything changed.
+    pub(crate) fn set_expanded(
+        &mut self,
+        node_id: &TreeNodeId,
+        expanded: bool,
+        recursive: bool,
+    ) -> bool {
+        if expanded {
+            return self.expanded_nodes.insert(node_id.clone());
+        }
+        let before = self.expanded_nodes.len();
+        self.expanded_nodes.remove(node_id);
+        if recursive {
+            self.expanded_nodes.retain(|node| !node.is_descendant_of(node_id));
+        }
+        before != self.expanded_nodes.len()
+    }
 
-        self.sync_selected_index();
-        self.selected_index
+    /// The first row under an open folder.
+    pub(crate) fn first_child_index(&self, index: usize) -> Option<usize> {
+        let depth = self.entries.get(index)?.depth;
+        self.entries.get(index + 1).filter(|child| child.depth > depth).map(|_| index + 1)
+    }
+
+    /// The row at `depth` that `from` sits under, or `from` itself when it is at that depth.
+    pub(crate) fn ancestor_index(
+        entries: &[SidebarEntry],
+        from: usize,
+        depth: usize,
+    ) -> Option<usize> {
+        if entries.get(from)?.depth < depth {
+            return None;
+        }
+        (0..=from).rev().find(|&ix| entries[ix].depth == depth)
     }
 
     pub(crate) fn open_search(&mut self) {
@@ -168,13 +204,15 @@ impl SidebarModel {
         Some(next)
     }
 
+    /// Moves the selection by `delta` rows and stops at the ends. It does not wrap: a held
+    /// arrow key should come to rest, not loop past the top.
     pub(crate) fn move_sidebar_selection(&mut self, delta: isize) -> Option<(usize, TreeNodeId)> {
-        if self.entries.is_empty() {
-            return None;
-        }
-        let current_index = self.selected_index.unwrap_or(0).min(self.entries.len() - 1);
-        let len = self.entries.len() as isize;
-        let next = (current_index as isize + delta).rem_euclid(len) as usize;
+        let last = self.entries.len().checked_sub(1)?;
+        let next = match self.selected_index {
+            Some(index) => index.saturating_add_signed(delta).min(last),
+            None if delta < 0 => last,
+            None => 0,
+        };
         self.select_index(next)
     }
 
@@ -254,28 +292,30 @@ impl SidebarModel {
         Some((best.0, entry.id.clone()))
     }
 
-    pub(crate) fn find_parent_connection_index(
-        entries: &[SidebarEntry],
-        from: usize,
-    ) -> Option<usize> {
-        (0..=from).rev().find(|&i| entries[i].depth == 0)
-    }
-
+    /// The tree lists open connections only. A connection being opened shows too, so the
+    /// row that will hold its databases appears the moment the user asks for it.
     pub(crate) fn build_entries(
         connections: &[SavedConnection],
         active: &std::collections::HashMap<Uuid, ActiveConnection>,
+        connecting: Option<Uuid>,
         expanded: &HashSet<TreeNodeId>,
+        show_system: bool,
     ) -> Vec<SidebarEntry> {
         let mut items = Vec::new();
         for conn in connections {
             let active_conn = active.get(&conn.id);
-            if active_conn.is_none() {
-                continue; // Only show connected
+            if active_conn.is_none() && connecting != Some(conn.id) {
+                continue;
             }
-
             let conn_node_id = TreeNodeId::connection(conn.id);
-            let conn_expanded = expanded.contains(&conn_node_id);
-            items.push(SidebarEntry::new(conn_node_id, conn.name.clone(), 0, true, conn_expanded));
+            let conn_expanded = active_conn.is_some() && expanded.contains(&conn_node_id);
+            items.push(SidebarEntry::new(
+                conn_node_id,
+                conn.name.clone(),
+                0,
+                active_conn.is_some(),
+                conn_expanded,
+            ));
 
             if let Some(active_conn) = active_conn
                 && conn_expanded
@@ -292,7 +332,13 @@ impl SidebarModel {
                     ));
 
                     if db_expanded && let Some(collections) = active_conn.collections.get(db_name) {
-                        for col_name in collections {
+                        // Hidden here, not filtered from the data. When shown they go last,
+                        // so `system.views` never sits between two real collections.
+                        let (system, regular): (Vec<_>, Vec<_>) = collections
+                            .iter()
+                            .partition(|name| crate::models::is_system_collection(name));
+                        let system = if show_system { system } else { Vec::new() };
+                        for col_name in regular.into_iter().chain(system) {
                             let col_node_id = TreeNodeId::collection(conn.id, db_name, col_name);
                             items.push(SidebarEntry::new(
                                 col_node_id,
@@ -318,18 +364,139 @@ impl SidebarModel {
         entries.iter().enumerate().map(|(ix, entry)| (entry.id.clone(), ix)).collect()
     }
 
+    /// A selection hidden by a collapse moves to its nearest visible ancestor, as IDE trees do,
+    /// so the keyboard never loses its place.
     fn sync_selected_index(&mut self) {
-        self.selected_index =
-            self.selected_tree_id.as_ref().and_then(|id| self.entry_index_by_id.get(id).copied());
-        if self.selected_index.is_none() {
-            self.selected_tree_id = None;
-        }
+        let visible = std::iter::successors(self.selected_tree_id.take(), TreeNodeId::parent)
+            .find_map(|node| self.index_of(&node).map(|index| (node, index)));
+        (self.selected_tree_id, self.selected_index) = visible.unzip();
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tree_lists_only_open_and_connecting_connections() {
+        let saved = SavedConnection::new("Saved".into(), "mongodb://localhost".into());
+        let connecting = SavedConnection::new("Connecting".into(), "mongodb://localhost".into());
+        let id = TreeNodeId::connection(connecting.id);
+        let expanded = HashSet::from([id.clone(), TreeNodeId::connection(saved.id)]);
+        let entries = SidebarModel::build_entries(
+            &[saved, connecting.clone()],
+            &std::collections::HashMap::new(),
+            Some(connecting.id),
+            &expanded,
+            false,
+        );
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].id, id);
+        assert!(!entries[0].is_folder);
+        assert!(!entries[0].is_expanded);
+    }
+
+    #[test]
+    fn selected_connection_without_database_selects_its_row() {
+        let connection_id = Uuid::new_v4();
+        let id = TreeNodeId::connection(connection_id);
+        let mut model =
+            model_with_entries(vec![SidebarEntry::new(id.clone(), "Production", 0, true, false)]);
+
+        let node = SidebarModel::node_for_view(Some(connection_id), None, None).unwrap();
+        assert_eq!(model.select_nearest(node), Some(0));
+        assert_eq!(model.selected_tree_id, Some(id));
+    }
+
+    /// One open connection holding databases `a` and `b`, each with collection `c`.
+    fn open_model() -> (SidebarModel, Vec<SavedConnection>, HashMap<Uuid, ActiveConnection>) {
+        let saved = SavedConnection::new("Local".into(), "mongodb://localhost".into());
+        // The client is lazy: building it opens no socket, but it wants a runtime around.
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let client = runtime.block_on(async {
+            mongodb::Client::with_options(mongodb::options::ClientOptions::default()).unwrap()
+        });
+        let conn = ActiveConnection {
+            config: saved.clone(),
+            client,
+            databases: vec!["a".into(), "b".into()],
+            collections: HashMap::from([
+                ("a".to_string(), vec!["c".to_string()]),
+                ("b".to_string(), vec!["c".to_string()]),
+            ]),
+            collection_details: Default::default(),
+            runtime_meta: Default::default(),
+        };
+        let active = HashMap::from([(saved.id, conn)]);
+        let model = SidebarModel::new(vec![saved.clone()], active.clone());
+        (model, vec![saved], active)
+    }
+
+    #[test]
+    fn system_collections_are_hidden_or_listed_last() {
+        let (_, saved, mut active) = open_model();
+        let id = saved[0].id;
+        // A user collection that merely mentions "system" must never be treated as one.
+        let names = ["system.views", "system_audit", "zebra"].map(String::from).to_vec();
+        active.get_mut(&id).unwrap().collections.insert("a".into(), names);
+        let expanded = HashSet::from([TreeNodeId::connection(id), TreeNodeId::database(id, "a")]);
+        let labels = |show_system| {
+            SidebarModel::build_entries(&saved, &active, None, &expanded, show_system)
+                .into_iter()
+                .filter(|entry| entry.depth == 2)
+                .map(|entry| entry.label.to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(labels(false), ["system_audit", "zebra"]);
+        assert_eq!(labels(true), ["system_audit", "zebra", "system.views"]);
+    }
+
+    #[test]
+    fn collapsing_moves_the_selection_up_and_nothing_reopens() {
+        let (mut model, saved, active) = open_model();
+        let id = saved[0].id;
+        let col = TreeNodeId::collection(id, "a", "c");
+        assert!(model.expand_ancestors(&col));
+        model.refresh_entries(&saved, &active, false);
+        assert!(model.select_node(col).is_some());
+
+        // Collapse the database holding the selection: the selection lands on the database.
+        let db_a = TreeNodeId::database(id, "a");
+        assert!(model.set_expanded(&db_a, false, false));
+        model.refresh_entries(&saved, &active, false);
+        assert_eq!(model.selected_tree_id, Some(db_a.clone()));
+
+        // Opening a sibling leaves the collapsed one closed.
+        assert!(model.set_expanded(&TreeNodeId::database(id, "b"), true, false));
+        model.refresh_entries(&saved, &active, false);
+        assert!(!model.expanded_nodes.contains(&db_a));
+        assert_eq!(model.entries.len(), 4);
+    }
+
+    #[test]
+    fn recursive_collapse_forgets_the_subtree() {
+        let (mut model, saved, _) = open_model();
+        let id = saved[0].id;
+        model.expand_ancestors(&TreeNodeId::collection(id, "a", "c"));
+        assert!(model.set_expanded(&TreeNodeId::connection(id), false, true));
+        assert!(model.expanded_nodes.is_empty());
+    }
+
+    #[test]
+    fn arrows_stop_at_the_ends() {
+        let (mut model, saved, active) = open_model();
+        model.expand_ancestors(&TreeNodeId::database(saved[0].id, "a"));
+        model.refresh_entries(&saved, &active, false);
+
+        assert_eq!(model.move_sidebar_selection(1).map(|(ix, _)| ix), Some(0));
+        assert_eq!(model.move_sidebar_selection(-1).map(|(ix, _)| ix), Some(0));
+        assert_eq!(model.move_sidebar_selection(99).map(|(ix, _)| ix), Some(2));
+        assert_eq!(model.move_sidebar_selection(1).map(|(ix, _)| ix), Some(2));
+        assert_eq!(model.first_child_index(0), Some(1));
+        assert_eq!(model.first_child_index(2), None);
+        assert_eq!(SidebarModel::ancestor_index(&model.entries, 2, 0), Some(0));
+        assert_eq!(SidebarModel::ancestor_index(&model.entries, 0, 1), None);
+    }
 
     fn model_with_entries(entries: Vec<SidebarEntry>) -> SidebarModel {
         let entry_index_by_id = SidebarModel::build_index(&entries);

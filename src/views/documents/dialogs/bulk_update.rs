@@ -1,11 +1,13 @@
 //! Bulk update/replace dialog for documents.
 
-use gpui::*;
-use gpui_component::ActiveTheme as _;
-use gpui_component::WindowExt as _;
-use gpui_component::dialog::Dialog;
-use gpui_component::input::{Input, InputState};
-use gpui_component::menu::{DropdownMenu as _, PopupMenu, PopupMenuItem};
+use gpui_kit::component::ActiveTheme as _;
+use gpui_kit::component::Disableable as _;
+use gpui_kit::component::WindowExt as _;
+use gpui_kit::component::button::ButtonVariants as _;
+use gpui_kit::component::dialog::Dialog;
+use gpui_kit::component::input::{Editor, EditorState};
+use gpui_kit::component::menu::{DropdownMenu as _, PopupMenu, PopupMenuItem};
+use gpui_kit::*;
 use mongodb::bson::{Bson, Document, doc};
 
 use crate::bson::{DocumentKey, document_to_shell_string, parse_document_from_json};
@@ -16,7 +18,7 @@ use crate::theme::spacing;
 use super::bulk_update_support::{
     BulkUpdateMode, BulkUpdateScope, parse_update_doc, validate_update_doc,
 };
-use super::shared::{escape_key_subscription, status_text, styled_dropdown_button};
+use super::shared::{dialog_error, status_text, styled_dropdown_button};
 
 pub struct BulkUpdateDialog {
     state: Entity<AppState>,
@@ -24,8 +26,8 @@ pub struct BulkUpdateDialog {
     selected_doc: Option<DocumentKey>,
     scope: BulkUpdateScope,
     mode: BulkUpdateMode,
-    filter_state: Entity<InputState>,
-    update_state: Entity<InputState>,
+    filter_state: Entity<EditorState>,
+    update_state: Entity<EditorState>,
     error_message: Option<String>,
     updating: bool,
     cancellation: Option<crate::connection::types::CancellationToken>,
@@ -43,7 +45,7 @@ impl BulkUpdateDialog {
         let dialog_view =
             cx.new(|cx| Self::new(state.clone(), session_key, selected_doc, window, cx));
         window.open_dialog(cx, move |dialog: Dialog, _window: &mut Window, _cx: &mut App| {
-            dialog.title("Bulk Update / Replace").w(px(760.0)).child(dialog_view.clone())
+            dialog.title("Bulk update / replace").w(px(760.0)).child(dialog_view.clone())
         });
     }
 
@@ -55,15 +57,15 @@ impl BulkUpdateDialog {
         cx: &mut Context<Self>,
     ) -> Self {
         let filter_state = cx.new(|cx| {
-            InputState::new(window, cx)
-                .code_editor("javascript")
+            EditorState::new(window, cx)
+                .language("javascript")
                 .line_number(true)
                 .searchable(true)
                 .soft_wrap(true)
         });
         let update_state = cx.new(|cx| {
-            InputState::new(window, cx)
-                .code_editor("javascript")
+            EditorState::new(window, cx)
+                .language("javascript")
                 .line_number(true)
                 .searchable(true)
                 .soft_wrap(true)
@@ -125,8 +127,6 @@ impl BulkUpdateDialog {
                 }
             });
         dialog._subscriptions.push(subscription);
-
-        dialog._subscriptions.push(escape_key_subscription(cx));
 
         dialog
     }
@@ -197,10 +197,6 @@ impl BulkUpdateDialog {
         }
     }
 
-    fn is_read_only(&self, cx: &mut Context<Self>) -> bool {
-        self.state.read(cx).connection_read_only(self.session_key.connection_id)
-    }
-
     fn start_operation(&mut self, filter: Document, update_doc: Document, cx: &mut Context<Self>) {
         self.updating = true;
         self.error_message = None;
@@ -235,8 +231,8 @@ impl BulkUpdateDialog {
         if self.updating {
             return;
         }
-        if self.is_read_only(cx) {
-            self.error_message = Some("Read-only connection: writes are disabled.".to_string());
+        if let Some(reason) = self.state.read(cx).session_read_only_reason(&self.session_key) {
+            self.error_message = Some(reason);
             cx.notify();
             return;
         }
@@ -400,7 +396,7 @@ impl BulkUpdateDialog {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         styled_dropdown_button("bulk-scope", self.scope.label(), cx).dropdown_menu_with_anchor(
-            Corner::BottomLeft,
+            Anchor::BottomLeft,
             {
                 let view = view.clone();
                 move |menu: PopupMenu, _window, _cx| {
@@ -453,7 +449,7 @@ impl BulkUpdateDialog {
 
     fn mode_button(&self, view: Entity<Self>, cx: &mut Context<Self>) -> impl IntoElement {
         styled_dropdown_button("bulk-mode", self.mode.label(), cx).dropdown_menu_with_anchor(
-            Corner::BottomLeft,
+            Anchor::BottomLeft,
             {
                 let view = view.clone();
                 move |menu: PopupMenu, _window, _cx| {
@@ -488,7 +484,7 @@ impl Render for BulkUpdateDialog {
         let has_filter = !self.current_filter(cx).is_empty();
 
         let status =
-            status_text(self.error_message.as_ref(), self.updating, "Applying update...", "", cx);
+            status_text(self.error_message.as_ref(), self.updating, "Applying update…", "", cx);
 
         let scope_row = div()
             .flex()
@@ -527,7 +523,7 @@ impl Render for BulkUpdateDialog {
                         .child("Custom filter"),
                 )
                 .child(
-                    Input::new(&self.filter_state)
+                    Editor::new(&self.filter_state)
                         .font_family(crate::theme::fonts::mono())
                         .h(px(140.0))
                         .w_full()
@@ -586,13 +582,14 @@ impl Render for BulkUpdateDialog {
                             .child(update_label),
                     )
                     .child(
-                        Input::new(&self.update_state)
+                        Editor::new(&self.update_state)
                             .font_family(crate::theme::fonts::mono())
                             .h(px(240.0))
                             .w_full()
                             .disabled(self.updating),
                     ),
             )
+            .children(dialog_error("bulk-update-error", self.error_message.as_ref()))
             .child(
                 div()
                     .flex()

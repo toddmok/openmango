@@ -3,11 +3,11 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use gpui::AnyWindowHandle;
+use gpui_kit::AnyWindowHandle;
 use mongodb::bson::{Bson, Document};
 use uuid::Uuid;
 
-use crate::bson::{DocumentKey, document_to_shell_string};
+use crate::bson::{DocumentKey, document_to_json_string};
 use crate::state::app_state::SessionKey;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -185,7 +185,13 @@ impl EditorSessionStore {
             else {
                 return false;
             };
-            session.baseline_content = document_to_shell_string(&baseline_document);
+            session.baseline_content = if crate::bson::parse_document_from_json(&session.content)
+                .is_ok_and(|document| document == baseline_document)
+            {
+                session.content.clone()
+            } else {
+                document_to_json_string(&baseline_document)
+            };
             **current = baseline_document;
             true
         })
@@ -213,11 +219,6 @@ impl EditorSessionStore {
             session_key: session_key.clone(),
             doc_key: doc_key.clone(),
         };
-        self.with_inner(|inner| inner.keys.get(&key).copied()).flatten()
-    }
-
-    pub fn find_insert_session(&self, session_key: &SessionKey) -> Option<EditorSessionId> {
-        let key = EditorSessionKey::Insert { session_key: session_key.clone() };
         self.with_inner(|inner| inner.keys.get(&key).copied()).flatten()
     }
 
@@ -256,10 +257,6 @@ impl EditorSessionStore {
 
     pub fn window_handle(&self, id: EditorSessionId) -> Option<AnyWindowHandle> {
         self.with_inner(|inner| inner.windows.get(&id).copied()).flatten()
-    }
-
-    pub fn all_window_handles(&self) -> Vec<AnyWindowHandle> {
-        self.with_inner(|inner| inner.windows.values().copied().collect()).unwrap_or_default()
     }
 
     fn with_inner<T>(&self, f: impl FnOnce(&EditorSessionStoreInner) -> T) -> Option<T> {
@@ -343,6 +340,12 @@ mod tests {
             panic!("expected document target");
         };
         assert_eq!(baseline_document.get_str("name").ok(), Some("after"));
+        let content = "{ \"_id\": 1, \"name\": \"after\" }".to_string();
+        store.update_content(session_id, content.clone());
+        store.refresh_document_baseline(session_id, doc! { "_id": 1, "name": "after" });
+        let snapshot = store.snapshot(session_id).unwrap();
+        assert_eq!(snapshot.content, content);
+        assert!(!snapshot.is_dirty());
     }
 
     #[test]

@@ -1,12 +1,13 @@
 //! Property-level edit dialogs for document fields.
 
-use gpui::*;
-use gpui_component::ActiveTheme as _;
-use gpui_component::dialog::Dialog;
-use gpui_component::input::{Input, InputState};
-use gpui_component::menu::{DropdownMenu, PopupMenuItem};
-use gpui_component::{Disableable as _, WindowExt as _};
-use mongodb::bson::{self, Bson, Document, doc, oid::ObjectId};
+use gpui_kit::component::ActiveTheme as _;
+use gpui_kit::component::button::ButtonVariants as _;
+use gpui_kit::component::dialog::Dialog;
+use gpui_kit::component::input::{Editor, EditorState, Input, InputState};
+use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
+use gpui_kit::component::{Disableable as _, WindowExt as _};
+use gpui_kit::*;
+use mongodb::bson::{Bson, Document, doc};
 
 use crate::bson::{DocumentKey, PathSegment, parse_document_from_json};
 use crate::components::{Button, WriteConfirmation, cancel_button, request_connection_write};
@@ -16,15 +17,16 @@ use crate::views::documents::node_meta::NodeMeta;
 
 use super::property_dialog_support::{
     PropertyActionKind, UpdateScope, ValueType, display_path, display_segment, dot_path,
-    format_bson_for_input, parent_path, parse_bool, parse_date, parse_f64, parse_i32, parse_i64,
+    format_bson_for_input, parent_path,
 };
-use super::shared::{escape_key_subscription, status_text, styled_dropdown_button};
+use super::shared::{dialog_error, status_text, styled_dropdown_button};
 
 pub struct PropertyActionDialog {
     state: Entity<AppState>,
     session_key: SessionKey,
     doc_key: DocumentKey,
     action: PropertyActionKind,
+    path: Vec<PathSegment>,
     path_dot: String,
     parent_dot: String,
     array_dot: String,
@@ -34,7 +36,7 @@ pub struct PropertyActionDialog {
     parent_state: Entity<InputState>,
     field_display_state: Entity<InputState>,
     field_state: Entity<InputState>,
-    value_state: Entity<InputState>,
+    value_state: Entity<EditorState>,
     error_message: Option<String>,
     updating: bool,
     _subscriptions: Vec<Subscription>,
@@ -61,7 +63,7 @@ impl PropertyActionDialog {
             )
         });
         window.open_dialog(cx, move |dialog: Dialog, _window: &mut Window, _cx: &mut App| {
-            dialog.title("Edit Value / Type").w(px(640.0)).child(dialog_view.clone())
+            dialog.title("Edit value / type").w(px(640.0)).child(dialog_view.clone())
         });
     }
 
@@ -85,7 +87,7 @@ impl PropertyActionDialog {
             )
         });
         window.open_dialog(cx, move |dialog: Dialog, _window: &mut Window, _cx: &mut App| {
-            dialog.title("Add Field/Value").w(px(640.0)).child(dialog_view.clone())
+            dialog.title("Add field/value").w(px(640.0)).child(dialog_view.clone())
         });
     }
 
@@ -109,7 +111,7 @@ impl PropertyActionDialog {
             )
         });
         window.open_dialog(cx, move |dialog: Dialog, _window: &mut Window, _cx: &mut App| {
-            dialog.title("Rename Field").w(px(600.0)).child(dialog_view.clone())
+            dialog.title("Rename field").w(px(600.0)).child(dialog_view.clone())
         });
     }
 
@@ -133,7 +135,7 @@ impl PropertyActionDialog {
             )
         });
         window.open_dialog(cx, move |dialog: Dialog, _window: &mut Window, _cx: &mut App| {
-            dialog.title("Remove Field").w(px(560.0)).child(dialog_view.clone())
+            dialog.title("Remove field").w(px(560.0)).child(dialog_view.clone())
         });
     }
 
@@ -157,7 +159,7 @@ impl PropertyActionDialog {
             )
         });
         window.open_dialog(cx, move |dialog: Dialog, _window: &mut Window, _cx: &mut App| {
-            dialog.title("Add Element").w(px(640.0)).child(dialog_view.clone())
+            dialog.title("Add element").w(px(640.0)).child(dialog_view.clone())
         });
     }
 
@@ -181,7 +183,7 @@ impl PropertyActionDialog {
             )
         });
         window.open_dialog(cx, move |dialog: Dialog, _window: &mut Window, _cx: &mut App| {
-            dialog.title("Remove Matching Values").w(px(640.0)).child(dialog_view.clone())
+            dialog.title("Remove matching values").w(px(640.0)).child(dialog_view.clone())
         });
     }
 
@@ -194,6 +196,9 @@ impl PropertyActionDialog {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let allow_bulk = allow_bulk && !meta.path.iter().any(|segment| {
+            matches!(segment, PathSegment::Key(key) if key.contains('.') || key.starts_with('$'))
+        });
         let mut parent_path = parent_path(&meta.path);
         if action == PropertyActionKind::AddField && matches!(meta.value, Some(Bson::Document(_))) {
             parent_path = meta.path.clone();
@@ -240,9 +245,9 @@ impl PropertyActionDialog {
         });
         let field_state = cx.new(|cx| InputState::new(window, cx).placeholder("Field name"));
         let value_state = cx.new(|cx| {
-            InputState::new(window, cx)
+            EditorState::new(window, cx)
                 .placeholder(ValueType::String.placeholder())
-                .code_editor("javascript")
+                .language("javascript")
                 .soft_wrap(true)
         });
 
@@ -273,7 +278,12 @@ impl PropertyActionDialog {
         }
 
         if should_prefill_value && let Some(value) = meta.value.as_ref() {
-            let raw = format_bson_for_input(value);
+            let raw = if value_type == ValueType::ExtendedJson {
+                serde_json::to_string_pretty(&value.clone().into_canonical_extjson())
+                    .expect("Extended JSON is serializable")
+            } else {
+                format_bson_for_input(value)
+            };
             value_state.update(cx, |state, cx| {
                 state.set_value(raw, window, cx);
             });
@@ -284,6 +294,7 @@ impl PropertyActionDialog {
             session_key,
             doc_key: meta.doc_key.clone(),
             action,
+            path: meta.path.clone(),
             path_dot,
             parent_dot,
             array_dot,
@@ -323,7 +334,19 @@ impl PropertyActionDialog {
             });
         dialog._subscriptions.push(subscription);
 
-        dialog._subscriptions.push(escape_key_subscription(cx));
+        // The value field is multi-line, so Cmd/Ctrl+Enter submits, as in other multi-line
+        // query and value editors.
+        let weak = cx.entity().downgrade();
+        dialog._subscriptions.push(cx.intercept_keystrokes(move |event, window, cx| {
+            let key = event.keystroke.key.as_str();
+            if matches!(key, "enter" | "return")
+                && event.keystroke.modifiers.secondary()
+                && let Some(dialog) = weak.upgrade()
+            {
+                dialog.update(cx, |dialog, cx| dialog.submit(window, cx));
+                cx.stop_propagation();
+            }
+        }));
 
         dialog
     }
@@ -354,17 +377,10 @@ impl PropertyActionDialog {
         let raw = self.value_state.read(cx).value().to_string();
         let trimmed = raw.trim();
 
+        if let Some(sample) = self.value_type.sample() {
+            return crate::bson::parse_edited_value(&sample, &raw);
+        }
         match self.value_type {
-            ValueType::String => Ok(Bson::String(raw)),
-            ValueType::Bool => parse_bool(trimmed),
-            ValueType::Int32 => parse_i32(trimmed),
-            ValueType::Int64 => parse_i64(trimmed),
-            ValueType::Double => parse_f64(trimmed),
-            ValueType::Null => Ok(Bson::Null),
-            ValueType::ObjectId => ObjectId::parse_str(trimmed)
-                .map(Bson::ObjectId)
-                .map_err(|_| "Expected ObjectId hex".to_string()),
-            ValueType::Date => parse_date(trimmed),
             ValueType::Document => {
                 let raw = if trimmed.is_empty() { "{}" } else { trimmed };
                 parse_document_from_json(raw)
@@ -373,14 +389,14 @@ impl PropertyActionDialog {
             }
             ValueType::Array => {
                 let raw = if trimmed.is_empty() { "[]" } else { trimmed };
-                let value: serde_json::Value =
-                    serde_json::from_str(raw).map_err(|e| e.to_string())?;
-                let bson = bson::Bson::try_from(value).map_err(|e| e.to_string())?;
-                match bson {
-                    Bson::Array(arr) => Ok(Bson::Array(arr)),
-                    _ => Err("Root JSON must be an array".to_string()),
+                match crate::bson::parse_bson_from_relaxed_json(raw)
+                    .map_err(|err| format!("Invalid JSON: {err}"))?
+                {
+                    Bson::Array(values) => Ok(Bson::Array(values)),
+                    _ => Err("Enter an array like [1, 2, 3]".to_string()),
                 }
             }
+            _ => crate::bson::parse_bson_from_relaxed_json(trimmed),
         }
     }
 
@@ -390,6 +406,15 @@ impl PropertyActionDialog {
         }
 
         self.error_message = None;
+        if self.effective_scope() == UpdateScope::CurrentDocument {
+            if let Err(error) = self.stage_property_edit(cx) {
+                self.error_message = Some(error);
+                cx.notify();
+            } else {
+                window.close_dialog(cx);
+            }
+            return;
+        }
         let update_doc = match self.build_update_doc(cx) {
             Ok(doc) => doc,
             Err(err) => {
@@ -400,38 +425,7 @@ impl PropertyActionDialog {
         };
 
         match self.effective_scope() {
-            UpdateScope::CurrentDocument => {
-                let state = self.state.clone();
-                let state_for_write = state.clone();
-                let session_key = self.session_key.clone();
-                let session_for_write = session_key.clone();
-                let doc_key = self.doc_key.clone();
-                let view = cx.entity();
-                request_connection_write(
-                    state,
-                    crate::components::WriteRequest::new(
-                        session_key.connection_id,
-                        session_key.namespace(),
-                        "Update a document property",
-                        None,
-                    ),
-                    window,
-                    cx,
-                    move |_window, cx| {
-                        view.update(cx, |view, cx| {
-                            view.updating = true;
-                            cx.notify();
-                            AppCommands::update_document_by_key(
-                                state_for_write,
-                                session_for_write,
-                                doc_key,
-                                update_doc,
-                                cx,
-                            );
-                        });
-                    },
-                );
-            }
+            UpdateScope::CurrentDocument => unreachable!("single-document edits are staged above"),
             UpdateScope::MatchQuery => {
                 self.confirm_bulk_update(self.current_filter(cx), update_doc, window, cx);
             }
@@ -439,6 +433,52 @@ impl PropertyActionDialog {
                 self.confirm_bulk_update(Document::new(), update_doc, window, cx);
             }
         }
+    }
+
+    fn stage_property_edit(&self, cx: &mut Context<Self>) -> Result<(), String> {
+        let state = self.state.read(cx);
+        if let Some(reason) = state.document_field_edit_restriction(&self.session_key) {
+            return Err(reason.into());
+        }
+        let baseline = state
+            .document_edit_baseline(&self.session_key, &self.doc_key)
+            .ok_or("Document is no longer available.")?;
+        let mut document = state
+            .session_draft_or_document(&self.session_key, &self.doc_key)
+            .ok_or("Document is no longer available.")?;
+        let value = if matches!(
+            self.action,
+            PropertyActionKind::RenameField | PropertyActionKind::RemoveField
+        ) {
+            Bson::Null
+        } else {
+            self.parse_value(cx)?
+        };
+        let field = self.field_state.read(cx).value().to_string();
+        super::property_dialog_support::apply_property_edit(
+            &mut document,
+            &self.path,
+            self.action,
+            field.trim(),
+            value,
+        )?;
+        self.state.update(cx, |state, cx| {
+            if document == baseline {
+                state.clear_draft(&self.session_key, &self.doc_key);
+            } else {
+                state.set_draft(&self.session_key, self.doc_key.clone(), document);
+            }
+            let session = state.ensure_session(self.session_key.clone());
+            session.generation = session.generation.wrapping_add(1);
+            state.set_collection_dirty(
+                self.session_key.clone(),
+                !state.session_view(&self.session_key).is_none_or(|view| view.dirty.is_empty()),
+                cx,
+            );
+            cx.emit(AppEvent::DocumentDraftChanged { session: self.session_key.clone() });
+            cx.notify();
+        });
+        Ok(())
     }
 
     fn confirm_bulk_update(
@@ -604,7 +644,7 @@ impl PropertyActionDialog {
     fn scope_button(&self, view: Entity<Self>, cx: &mut Context<Self>) -> impl IntoElement {
         styled_dropdown_button("property-scope", self.effective_scope().label(), cx)
             .disabled(!self.allow_bulk)
-            .dropdown_menu_with_anchor(Corner::BottomLeft, {
+            .dropdown_menu_with_anchor(Anchor::BottomLeft, {
                 let view = view.clone();
                 move |menu, _window, _cx| {
                     menu.item(PopupMenuItem::new(UpdateScope::CurrentDocument.label()).on_click({
@@ -639,7 +679,7 @@ impl PropertyActionDialog {
 
     fn type_button(&self, view: Entity<Self>, cx: &mut Context<Self>) -> impl IntoElement {
         styled_dropdown_button("property-type", self.value_type.label(), cx)
-            .dropdown_menu_with_anchor(Corner::BottomLeft, {
+            .dropdown_menu_with_anchor(Anchor::BottomLeft, {
                 let view = view.clone();
                 move |menu, _window, _cx| {
                     let mut menu = menu;
@@ -654,6 +694,7 @@ impl PropertyActionDialog {
                         ValueType::Double,
                         ValueType::Date,
                         ValueType::Null,
+                        ValueType::ExtendedJson,
                     ] {
                         menu = menu.item(PopupMenuItem::new(kind.label()).on_click({
                             let view = view.clone();
@@ -695,20 +736,28 @@ impl Render for PropertyActionDialog {
                 | PropertyActionKind::RemoveMatchingValues
         );
 
-        let action_label = match self.action {
-            PropertyActionKind::EditValue => "Set Value",
-            PropertyActionKind::AddField => "Add Field",
-            PropertyActionKind::RenameField => "Rename",
-            PropertyActionKind::RemoveField => "Remove",
-            PropertyActionKind::AddElement => "Add Element",
-            PropertyActionKind::RemoveMatchingValues => "Remove",
+        let action_label = if self.effective_scope() == UpdateScope::CurrentDocument {
+            "Stage change"
+        } else {
+            match self.action {
+                PropertyActionKind::EditValue => "Set Value",
+                PropertyActionKind::AddField => "Add Field",
+                PropertyActionKind::RenameField => "Rename",
+                PropertyActionKind::RemoveField => "Remove",
+                PropertyActionKind::AddElement => "Add element",
+                PropertyActionKind::RemoveMatchingValues => "Remove",
+            }
         };
 
-        let default_label = if !self.allow_bulk { "Scope locked to current document." } else { "" };
+        let default_label = if self.effective_scope() == UpdateScope::CurrentDocument {
+            "Staged locally. Save the document to apply changes."
+        } else {
+            "Updates matching documents in the collection."
+        };
         let status = status_text(
             self.error_message.as_ref(),
             self.updating,
-            "Applying update...",
+            "Applying update…",
             default_label,
             cx,
         );
@@ -797,7 +846,7 @@ impl Render for PropertyActionDialog {
                 .gap(spacing::xs())
                 .child(div().text_xs().text_color(cx.theme().secondary_foreground).child("Value"))
                 .child(
-                    Input::new(&self.value_state)
+                    Editor::new(&self.value_state)
                         .font_family(crate::theme::fonts::mono())
                         .h(px(160.0))
                         .w_full(),
@@ -832,6 +881,7 @@ impl Render for PropertyActionDialog {
             .child(field_input)
             .child(scope_row)
             .child(value_row)
+            .children(dialog_error("property-update-error", self.error_message.as_ref()))
             .child(
                 div()
                     .flex()

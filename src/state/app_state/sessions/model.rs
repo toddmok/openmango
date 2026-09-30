@@ -73,8 +73,16 @@ impl SessionStore {
 }
 
 impl AppState {
-    /// Build a session key for the current connection + collection selection.
+    /// The view the user is looking at.
+    ///
+    /// Read from the active tab, because a collection can be open in more than one tab and each
+    /// tab can be showing a different view of it; the sidebar selection alone cannot say which.
     pub fn current_session_key(&self) -> Option<SessionKey> {
+        if let Some(key) = self.active_collection_session() {
+            return Some(key);
+        }
+        // Transfer tabs point the selection at their source namespace without owning a document
+        // session. The action bar and AI context still expect a key for it.
         let conn_id = self.conn.selected_connection?;
         if !self.conn.active.contains_key(&conn_id) {
             return None;
@@ -114,7 +122,7 @@ impl AppState {
         let selected_doc = session.view.selected_doc.clone();
         let selected_docs = session.view.selected_docs.clone();
         let selected_count = selected_docs.len();
-        let any_selected_dirty = selected_docs.iter().any(|k| session.view.dirty.contains(k));
+        let dirty_count = session.view.dirty.len();
         let subview = session.view.subview;
         let explain_active = session.data.explain.loading
             || !matches!(session.data.explain.open_mode, ExplainOpenMode::Closed);
@@ -132,14 +140,9 @@ impl AppState {
             selected_doc,
             selected_docs,
             selected_count,
-            any_selected_dirty,
+            dirty_count,
             filter_raw: session.data.filter_raw.clone(),
-            filter_compiled_raw: session
-                .data
-                .filter
-                .as_ref()
-                .map(format_document_compact)
-                .unwrap_or_default(),
+            filter_compiled_raw: session.data.filter_compiled_raw.clone(),
             sort_raw: session.data.sort_raw.clone(),
             projection_raw: session.data.projection_raw.clone(),
             query_options_open: session.view.query_options_open,
@@ -337,16 +340,20 @@ impl AppState {
         }
     }
 
-    pub fn aggregation_view_mode(&self, key: &SessionKey) -> super::super::types::DocumentViewMode {
-        self.session(key).map(|s| s.data.aggregation.results_view_mode).unwrap_or_default()
-    }
-
     pub fn session_mut(&mut self, key: &SessionKey) -> Option<&mut SessionState> {
         self.sessions.get_mut(key)
     }
 
     pub fn ensure_session(&mut self, key: SessionKey) -> &mut SessionState {
         self.sessions.ensure(key)
+    }
+}
+
+impl SessionData {
+    /// Sets the filter together with its compact JSON form, so the two cannot drift.
+    pub fn set_filter(&mut self, filter: Option<Document>) {
+        self.filter_compiled_raw = filter.as_ref().map(format_document_compact).unwrap_or_default();
+        self.filter = filter;
     }
 }
 

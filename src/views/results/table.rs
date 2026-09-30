@@ -1,14 +1,14 @@
 use std::collections::BTreeSet;
 use std::rc::Rc;
 
-use gpui::prelude::FluentBuilder;
-use gpui::*;
-use gpui_component::ActiveTheme as _;
-use gpui_component::input::{Input, InputState};
-use gpui_component::menu::{PopupMenu, PopupMenuItem};
-use gpui_component::switch::Switch;
-use gpui_component::table::{Column, ColumnSort, TableDelegate, TableState};
-use gpui_component::{Icon, IconName, Sizable as _};
+use gpui_kit::component::ActiveTheme as _;
+use gpui_kit::component::input::{Input, InputState};
+use gpui_kit::component::menu::{PopupMenu, PopupMenuItem};
+use gpui_kit::component::switch::Switch;
+use gpui_kit::component::table::{Column, ColumnSort, TableDelegate, TableState};
+use gpui_kit::component::{Icon, IconName, Sizable as _};
+use gpui_kit::prelude::FluentBuilder;
+use gpui_kit::*;
 use mongodb::bson::{Bson, Document};
 
 use crate::views::documents::export::{
@@ -105,6 +105,8 @@ pub struct ResultTableDelegate {
     database: String,
     collection: String,
     inline_editor: Option<(usize, String, Entity<InputState>)>,
+    /// Column under the last right-click; the kit's row context menu does not carry it.
+    context_column: Option<usize>,
 }
 
 impl ResultTableDelegate {
@@ -120,6 +122,7 @@ impl ResultTableDelegate {
             database: String::new(),
             collection: String::new(),
             inline_editor: None,
+            context_column: None,
         }
     }
 
@@ -215,8 +218,8 @@ impl TableDelegate for ResultTableDelegate {
         self.documents.len()
     }
 
-    fn column(&self, column: usize, _cx: &App) -> &Column {
-        &self.table_cols.column_defs[column]
+    fn column(&self, column: usize, _cx: &App) -> Column {
+        self.table_cols.column_def(column).clone()
     }
 
     fn perform_sort(
@@ -333,6 +336,12 @@ impl TableDelegate for ResultTableDelegate {
         }
         div()
             .size_full()
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |table, _, _, _| {
+                    table.delegate_mut().context_column = Some(column);
+                }),
+            )
             .when(can_edit, |element| {
                 element.on_mouse_down(MouseButton::Left, move |event, window, cx| {
                     if event.click_count == 2 {
@@ -363,7 +372,6 @@ impl TableDelegate for ResultTableDelegate {
     fn context_menu(
         &mut self,
         row: usize,
-        selected_column: Option<usize>,
         mut menu: PopupMenu,
         window: &mut Window,
         cx: &mut Context<TableState<Self>>,
@@ -392,7 +400,7 @@ impl TableDelegate for ResultTableDelegate {
 
         if self.editable
             && self.documents.get(row).is_some_and(|document| document.contains_key("_id"))
-            && let Some(column) = selected_column
+            && let Some(column) = self.context_column
             && let Some(key) = self.table_cols.columns.get(column).map(|column| column.key.clone())
             && key != "_id"
             && crate::bson::DottedPath::new(&[crate::bson::PathSegment::Key(key.clone())]).is_ok()

@@ -1,6 +1,8 @@
 //! Transfer view for import, export, and copy operations.
 
 mod helpers;
+#[cfg(test)]
+mod layout_tests;
 mod options;
 mod progress_panel;
 mod query_modal;
@@ -9,23 +11,23 @@ mod simple;
 
 pub use query_modal::QueryEditField;
 
-use gpui::*;
-use gpui_component::input::InputState;
-use gpui_component::select::{SearchableVec, SelectState};
-use gpui_component::tab::{Tab, TabBar};
-use gpui_component::{ActiveTheme as _, IndexPath, Sizable as _};
+use gpui_kit::component::input::{EditorState, InputState};
+use gpui_kit::component::select::{SearchableVec, SelectState};
+use gpui_kit::component::tab::{Tab, TabBar};
+use gpui_kit::component::{ActiveTheme as _, IndexPath, Sizable as _};
+use gpui_kit::*;
 use uuid::Uuid;
 
 use crate::components::{WriteConfirmation, open_confirm_dialog, request_connection_write};
 use crate::keyboard::{CancelTransfer, CloseTransferQueryModal, RunTransfer, SaveTransferQuery};
 use crate::state::{
-    AppCommands, AppState, InsertMode, StatusMessage, TargetWriteMode, TransferMode, TransferScope,
+    AppCommands, AppState, InsertMode, TargetWriteMode, TransferMode, TransferScope,
     TransferTabState, coerce_transfer_format, resolved_export_destination,
     transfer_write_connection, validate_transfer,
 };
 use crate::theme::{islands, sizing, spacing};
 
-use select_states::ConnectionItem;
+pub(crate) use select_states::ConnectionItem;
 
 pub struct TransferView {
     state: Entity<AppState>,
@@ -59,7 +61,7 @@ pub struct TransferView {
 
     // JSON editor modal state
     query_edit_modal: Option<QueryEditField>, // Which field is being edited (None = closed)
-    query_edit_input: Option<Entity<InputState>>, // Textarea content for modal
+    query_edit_input: Option<Entity<EditorState>>, // Textarea content for modal
     query_edit_transfer_id: Option<Uuid>,
     query_edit_previous_focus: Option<FocusHandle>,
 }
@@ -96,14 +98,14 @@ impl TransferView {
         }
     }
 
-    pub(crate) fn focus(&self, window: &mut Window, cx: &App) {
+    pub(crate) fn focus(&self, window: &mut Window, cx: &mut App) {
         let active_transfer = self.state.read(cx).active_transfer_tab_id();
         if self.query_edit_transfer_id == active_transfer
             && let Some(input) = self.query_edit_input.as_ref()
         {
-            window.focus(&input.read(cx).focus_handle(cx));
+            window.focus(&input.read(cx).focus_handle(cx), cx);
         } else {
-            window.focus(&self.focus_handle);
+            window.focus(&self.focus_handle, cx);
         }
     }
 }
@@ -212,7 +214,7 @@ fn run_active_transfer(state: Entity<AppState>, window: &mut Window, cx: &mut Ap
                 if let Some(tab) = state.transfer_tab_mut(transfer_id) {
                     tab.runtime.error_message = Some(message.to_string());
                 }
-                state.set_status_message(Some(StatusMessage::error(message)));
+                state.record_error(crate::error::ErrorReport::from_text(message));
                 cx.notify();
             });
             return;
@@ -226,9 +228,9 @@ fn run_active_transfer(state: Entity<AppState>, window: &mut Window, cx: &mut Ap
     };
     if let Some(connection_id) = write_connection {
         let ordinary = requires_confirmation.then(|| WriteConfirmation {
-            title: "Confirm destructive transfer".to_string(),
+            title: "Run destructive transfer?".to_string(),
             message,
-            confirm_label: "Run Transfer".to_string(),
+            confirm_label: "Run transfer".to_string(),
             destructive: true,
         });
         request_connection_write(
@@ -247,9 +249,9 @@ fn run_active_transfer(state: Entity<AppState>, window: &mut Window, cx: &mut Ap
         open_confirm_dialog(
             window,
             cx,
-            "Confirm destructive transfer",
+            "Run destructive transfer?",
             message,
-            "Run Transfer",
+            "Run transfer",
             true,
             run,
         );
@@ -364,6 +366,7 @@ impl Render for TransferView {
                     id: *id,
                     name: SharedString::from(identity.display_name()),
                     identity: identity.clone(),
+                    closed: false,
                 })
                 .collect();
 
@@ -675,7 +678,11 @@ impl Render for TransferView {
             .flex()
             .flex_col()
             .flex_1()
+            // A view's root has to claim the shell's height itself; `flex_1` alone leaves it
+            // content-sized, and the form's scroll region below then collapses to nothing.
+            .size_full()
             .min_w(px(0.0))
+            .min_h(px(0.0))
             .key_context(transfer_key_context)
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(|this, _: &RunTransfer, window, cx| {

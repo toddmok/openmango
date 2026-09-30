@@ -26,33 +26,43 @@ mod tests {
 
 pub mod action_bar;
 pub mod ai_blocks;
-pub mod button;
+mod busy_button;
 pub mod confirm;
-pub mod connection_dialog;
 pub mod connection_identity;
 pub mod connection_manager;
 mod content;
 pub mod dialog_helpers;
+pub mod drag;
+pub mod error_callout;
+pub mod error_history;
 pub mod file_picker;
 pub mod filter_builder;
 pub mod form_field;
+pub mod model_select;
+pub mod node_commands;
 pub mod query_library;
 mod status_bar;
+pub mod tri_checkbox;
 mod unsaved_guard;
-pub use button::Button;
+pub mod updater;
+pub use busy_button::busy_label;
 pub(crate) use confirm::with_scoped_production_authorizations;
 pub use confirm::{WriteConfirmation, WriteRequest, open_confirm_dialog, request_connection_write};
-pub use connection_dialog::ConnectionDialog;
 pub use connection_identity::{
     ConnectionIdentity, connection_identity_badge, connection_identity_for,
+    connection_identity_tags,
 };
 pub use connection_manager::ConnectionManager;
 pub use content::ContentArea;
+pub(crate) use content::OpenTabsBar;
 pub use dialog_helpers::{cancel_button, primary_button};
+pub use error_callout::ErrorCallout;
 pub use filter_builder::FilterBuilderPanel;
 pub use form_field::FormField;
+pub use gpui_kit::component::button::Button;
 pub use query_library::{QueryLibraryDialog, QueryLibraryTarget};
 pub use status_bar::StatusBar;
+pub(crate) use unsaved_guard::finish_app_quit;
 pub use unsaved_guard::{
     request_app_quit, request_disconnect_connection, request_preview_collection,
     request_remove_connection, request_unsaved_action,

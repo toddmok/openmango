@@ -1,7 +1,6 @@
-use gpui::*;
-use gpui_component::calendar::CalendarState;
-use gpui_component::input::InputState;
-use gpui_component::tree::TreeState;
+use gpui_kit::component::calendar::CalendarState;
+use gpui_kit::component::input::{EditorState, InputState};
+use gpui_kit::*;
 
 use mongodb::bson::{Bson, Document};
 use regex::{Regex, RegexBuilder};
@@ -16,13 +15,18 @@ use crate::bson::{
 use crate::components::filter_builder::FilterBuilderPanel;
 use crate::helpers::auto_pair::AutoPairState;
 use crate::perf::log_tabs_duration;
+use crate::state::relations::lookup::Intent;
 use crate::state::{
     AppCommands, AppEvent, AppState, CollectionSubview, SessionDocument, SessionKey, View,
 };
+use crate::views::documents::reference::ReferenceLink;
 
 use super::node_meta::NodeMeta;
 use super::tree::document_tree::bson_tree_value_color;
 use super::view_model::DocumentViewModel;
+
+/// Pending automatic aggregation run, keyed by (edit revision, preview target).
+pub(crate) type PendingAggregationRun = ((u64, Option<usize>), Task<()>);
 
 /// View for browsing documents in a collection
 pub struct CollectionView {
@@ -30,11 +34,28 @@ pub struct CollectionView {
     pub(crate) view_model: DocumentViewModel,
     pub(crate) documents_focus: FocusHandle,
     pub(crate) aggregation_focus: FocusHandle,
-    pub(crate) aggregation_stage_list_scroll: UniformListScrollHandle,
-    pub(crate) filter_state: Option<Entity<InputState>>,
-    pub(crate) sort_state: Option<Entity<InputState>>,
-    pub(crate) projection_state: Option<Entity<InputState>>,
-    pub(crate) schema_filter_state: Option<Entity<InputState>>,
+    pub(crate) aggregation_stage_list_scroll: ScrollHandle,
+    pub(crate) filter_state: Option<Entity<EditorState>>,
+    /// The last filter text checked, whether it compiles, and the `_id` it spells if any. The
+    /// filter row is drawn every frame; the text is parsed only when it changes.
+    pub(crate) filter_check: std::cell::RefCell<(String, bool, Option<mongodb::bson::Bson>)>,
+    pub(crate) filter_completions: Option<std::rc::Rc<super::query_editor::QueryEditorCompletions>>,
+    pub(crate) filter_completion_menu:
+        Option<Entity<crate::views::editor_completion::EditorCompletionMenu>>,
+    pub(crate) filter_expanded: bool,
+    pub(crate) sort_state: Option<Entity<EditorState>>,
+    pub(crate) projection_state: Option<Entity<EditorState>>,
+    pub(crate) json_document: Option<(
+        SessionKey,
+        DocumentKey,
+        crate::state::EditorSessionId,
+        Entity<crate::views::json_editor_detached::DetachedJsonEditorView>,
+    )>,
+    pub(crate) json_editor_cache: HashMap<
+        crate::state::EditorSessionId,
+        Entity<crate::views::json_editor_detached::DetachedJsonEditorView>,
+    >,
+    pub(crate) schema_filter_state: Option<Entity<EditorState>>,
     pub(crate) filter_auto_pair: AutoPairState,
     pub(crate) sort_auto_pair: AutoPairState,
     pub(crate) projection_auto_pair: AutoPairState,
@@ -48,6 +69,12 @@ pub struct CollectionView {
     pub(crate) calendar_second: Option<Entity<InputState>>,
     pub(crate) sort_error: bool,
     pub(crate) projection_error: bool,
+    /// The filter bar is describing a filter rather than holding one.
+    pub(crate) ask_mode: bool,
+    pub(crate) ask_ai_busy: bool,
+    pub(crate) ask_ai_error: Option<String>,
+    /// The filter that was in the bar before it became the ask bar.
+    pub(crate) ask_ai_filter: Option<String>,
     pub(crate) search_state: Option<Entity<InputState>>,
     pub(crate) search_visible: bool,
     pub(crate) search_matches: Vec<String>,
@@ -72,20 +99,32 @@ pub struct CollectionView {
     pub(crate) projection_subscription: Option<Subscription>,
     pub(crate) schema_filter_subscription: Option<Subscription>,
     pub(crate) search_subscription: Option<Subscription>,
-    pub(crate) aggregation_stage_body_state: Option<Entity<InputState>>,
-    pub(crate) aggregation_results_tree_state: Option<Entity<TreeState>>,
+    pub(crate) aggregation_stage_body_state: Option<Entity<EditorState>>,
     pub(crate) aggregation_results_scroll: UniformListScrollHandle,
-    pub(crate) aggregation_limit_state: Option<Entity<InputState>>,
+    pub(crate) schema_tree_scroll: UniformListScrollHandle,
+    /// The Explain modal's own focus target, so its Escape works the moment it opens.
+    pub(crate) explain_focus: FocusHandle,
+    /// Whether the modal was showing at the last draw, to focus it once on open and hand focus
+    /// back once on close.
+    pub(crate) explain_was_open: bool,
     pub(crate) aggregation_results_expanded_nodes: HashSet<String>,
-    pub(crate) aggregation_results_signature: Option<u64>,
+    pub(crate) aggregation_results_signature: Option<usize>,
     /// Cached SessionDocument list for the aggregation results tree, rebuilt
-    /// only when the result set changes (keyed by pipeline request id) instead
+    /// only when the result set changes (keyed by the results `Arc`) instead
     /// of deep-cloning every result document each frame.
     pub(crate) aggregation_results_documents: Option<Arc<Vec<SessionDocument>>>,
     pub(crate) syncing_query_inputs: bool,
-    pub(crate) aggregation_ignore_body_change: bool,
     pub(crate) aggregation_stage_body_subscription: Option<Subscription>,
-    pub(crate) aggregation_limit_subscription: Option<Subscription>,
+    pub(crate) aggregation_text_state: Option<Entity<EditorState>>,
+    pub(crate) aggregation_text_subscription: Option<Subscription>,
+    /// Why the Text mode pipeline can't be applied, if it can't.
+    pub(crate) aggregation_text_error: Option<String>,
+    /// Why Format couldn't format the selected stage; cleared by the next edit.
+    pub(crate) aggregation_format_error: Option<String>,
+    /// Pipeline revision each editor last showed or produced; a mismatch means resync.
+    pub(crate) aggregation_body_revision: Option<u64>,
+    pub(crate) aggregation_text_revision: Option<u64>,
+    pub(crate) aggregation_auto_run: Option<PendingAggregationRun>,
     pub(crate) filter_builder_panel: Option<Entity<FilterBuilderPanel>>,
     pub(crate) filter_builder_session: Option<SessionKey>,
     pub(crate) _subscriptions: Vec<Subscription>,
@@ -123,54 +162,65 @@ impl CollectionView {
             let is_escape = key == "escape";
             let is_enter = key == "enter" || key == "return";
 
-            if !is_escape && !is_enter && !cmd_or_ctrl {
+            if !is_escape
+                && !is_enter
+                && !cmd_or_ctrl
+                && !matches!(key.as_str(), "tab" | "up" | "down")
+            {
                 return;
             }
             view.update(cx, |this, cx| {
+                // Fork: Forge tabs keep a collection selected, so this interceptor must not act
+                // on keys meant for Forge (or any non-Documents view).
                 if !matches!(this.state.read(cx).current_view, View::Documents) {
+                    return;
+                }
+                if let Some(panel) = this.filter_builder_panel.clone()
+                    && panel.read(cx).focus_handle(cx).contains_focused(window, cx)
+                {
+                    if is_enter && cmd_or_ctrl {
+                        panel.update(cx, |panel, cx| panel.apply_filter(window, cx));
+                        cx.stop_propagation();
+                    }
+                    return;
+                }
+                let filter_focused = this
+                    .filter_state
+                    .as_ref()
+                    .is_some_and(|input| input.read(cx).focus_handle(cx).is_focused(window));
+                let option_focused = [&this.sort_state, &this.projection_state]
+                    .into_iter()
+                    .flatten()
+                    .any(|input| input.read(cx).focus_handle(cx).is_focused(window));
+                if filter_focused || option_focused {
+                    // The kit's editors are not searchable by default, and a non-searchable one
+                    // deliberately lets Cmd+F bubble to the app — which is how the document
+                    // search kept opening from inside the filter box. Turning searchable on
+                    // would only trade it for a find panel inside a one-line editor, so the key
+                    // stops here instead.
+                    if cmd_or_ctrl && key == "f" {
+                        cx.stop_propagation();
+                        return;
+                    }
+                    if filter_focused && this.handle_query_editor_key(&event.keystroke, window, cx)
+                    {
+                        cx.stop_propagation();
+                    }
+                    return;
+                }
+                if this.view_model.current_session().is_some_and(|key| {
+                    this.state.read(cx).session_view_mode(&key)
+                        == crate::state::DocumentViewMode::Json
+                        && this.state.read(cx).session_subview(&key)
+                            == Some(CollectionSubview::Documents)
+                }) {
                     return;
                 }
                 let mut handled = false;
 
-                let save_selected_document =
+                let save_documents =
                     |this: &mut CollectionView, window: &mut Window, cx: &mut Context<Self>| {
-                        let Some(session_key) = this.view_model.current_session() else {
-                            return false;
-                        };
-                        let (doc_key, doc) = {
-                            let state_ref = this.state.read(cx);
-                            let doc_key = state_ref.session_selected_doc(&session_key);
-                            let doc = doc_key
-                                .as_ref()
-                                .and_then(|doc_key| state_ref.session_draft(&session_key, doc_key));
-                            (doc_key, doc)
-                        };
-                        let (Some(doc_key), Some(doc)) = (doc_key, doc) else {
-                            return false;
-                        };
-                        let state = this.state.clone();
-                        let state_for_write = state.clone();
-                        crate::components::request_connection_write(
-                            state,
-                            crate::components::WriteRequest::new(
-                                session_key.connection_id,
-                                session_key.namespace(),
-                                "Save document changes",
-                                None,
-                            ),
-                            window,
-                            cx,
-                            move |_window, cx| {
-                                AppCommands::save_document(
-                                    state_for_write,
-                                    session_key,
-                                    doc_key,
-                                    doc,
-                                    cx,
-                                );
-                            },
-                        );
-                        true
+                        this.save_documents(window, cx)
                     };
                 let is_aggregation = this
                     .view_model
@@ -192,7 +242,7 @@ impl CollectionView {
                     {
                         let state = this.state.clone();
                         this.view_model.cancel_inline_edit(&state, cx);
-                        window.focus(&this.documents_focus);
+                        window.focus(&this.documents_focus, cx);
                         handled = true;
                     }
                     if !handled
@@ -201,25 +251,44 @@ impl CollectionView {
                     {
                         let focused = body_state.read(cx).focus_handle(cx).is_focused(window);
                         if focused {
-                            window.focus(&this.aggregation_focus);
+                            window.focus(&this.aggregation_focus, cx);
                             handled = true;
                         }
                     }
                 } else if is_enter {
                     let modifiers = event.keystroke.modifiers;
                     let cmd_or_ctrl = modifiers.secondary() || modifiers.control;
+                    if !cmd_or_ctrl
+                        && this.view_model.inline_state().is_some()
+                        && !this.documents_focus.is_focused(window)
+                        && !this.view_model.inline_input_focused(window, cx)
+                    {
+                        // Done and Cancel keep their native Enter action.
+                        return;
+                    }
                     if this.view_model.inline_state().is_some() {
                         this.view_model.commit_inline_edit(&this.state, cx);
                         let committed = this.view_model.inline_state().is_none();
                         if committed {
-                            window.focus(&this.documents_focus);
+                            window.focus(&this.documents_focus, cx);
                             if cmd_or_ctrl {
-                                save_selected_document(this, window, cx);
+                                save_documents(this, window, cx);
                             }
                         }
                         handled = true;
                     } else if cmd_or_ctrl {
-                        handled = save_selected_document(this, window, cx);
+                        handled = save_documents(this, window, cx);
+                    } else if let Some(table) = this.view_model.table_state().cloned()
+                        && table.read(cx).focus_handle(cx).contains_focused(window, cx)
+                    {
+                        // Enter opens the selected row, like double-click.
+                        if let Some(session_key) = this.view_model.current_session()
+                            && let Some(doc_key) =
+                                this.state.read(cx).session_selected_doc(&session_key)
+                        {
+                            this.open_document_json(session_key, doc_key, window, cx);
+                            handled = true;
+                        }
                     } else if this.documents_focus.is_focused(window) {
                         let Some(session_key) = this.view_model.current_session() else {
                             return;
@@ -228,17 +297,26 @@ impl CollectionView {
                             this.state.read(cx).session_selected_node_id(&session_key);
                         if let Some(node_id) = selected_node {
                             let node_meta = this.view_model.node_meta();
-                            if let Some(meta) = node_meta.get(&node_id)
-                                && meta.is_editable
-                            {
-                                this.view_model.begin_inline_edit(
-                                    node_id.clone(),
-                                    meta,
-                                    window,
-                                    &this.state,
-                                    cx,
-                                );
-                                handled = true;
+                            if let Some(meta) = node_meta.get(&node_id) {
+                                // Enter does what double-click does: edit a value, or open and
+                                // close a document, object, or array.
+                                if meta.is_editable {
+                                    this.view_model.begin_inline_edit(
+                                        node_id.clone(),
+                                        meta,
+                                        window,
+                                        &this.state,
+                                        cx,
+                                    );
+                                    handled = true;
+                                } else if meta.is_folder {
+                                    this.state.update(cx, |state, cx| {
+                                        state.toggle_expanded_node(&session_key, &node_id);
+                                        cx.notify();
+                                    });
+                                    this.view_model.rebuild_tree(&this.state, cx);
+                                    handled = true;
+                                }
                             }
                         }
                     }
@@ -318,6 +396,14 @@ impl CollectionView {
                     this.ensure_subview_data_loaded(&session_key, &state, cx);
                 }
             }
+            AppEvent::DateDisplayChanged => {
+                this.view_model.clear_tree_cache();
+                this.view_model.rebuild_tree(&state, cx);
+                this.view_model.invalidate_table();
+                // Search matches against the text the rows show.
+                this.update_search_results(cx);
+                cx.notify();
+            }
             AppEvent::DocumentsLoaded { session, .. } => {
                 if !this.view_model.is_current_session(session) {
                     return;
@@ -327,10 +413,19 @@ impl CollectionView {
                 this.view_model.invalidate_table();
                 this.view_model.sync_dirty_state(&state, cx);
                 this.update_search_results(cx);
-                // Force re-sync of filter/sort/projection inputs from session data.
-                // This handles external changes (e.g. AI "Open Collection" clearing filters).
-                this.input_session = None;
+                // The query inputs are deliberately left alone. They already follow the session
+                // on every render, writing only what actually differs; forcing the whole
+                // session-changed path here rewrote all three editors and shut the options row
+                // on every Find, which is what made the view blink.
                 cx.notify();
+            }
+            AppEvent::DocumentDraftChanged { session } => {
+                if this.view_model.is_current_session(session) {
+                    this.view_model.rebuild_tree(&state, cx);
+                    this.view_model.invalidate_table();
+                    this.update_search_results(cx);
+                    cx.notify();
+                }
             }
             AppEvent::DocumentSaved { session, document, .. } => {
                 if !this.view_model.is_current_session(session) {
@@ -375,9 +470,13 @@ impl CollectionView {
             state,
             view_model,
             documents_focus: cx.focus_handle(),
-            aggregation_focus: cx.focus_handle(),
-            aggregation_stage_list_scroll: UniformListScrollHandle::default(),
+            aggregation_focus: cx.focus_handle().tab_stop(true),
+            aggregation_stage_list_scroll: ScrollHandle::new(),
             filter_state: None,
+            filter_check: std::cell::RefCell::new((String::new(), true, None)),
+            filter_completions: None,
+            filter_completion_menu: None,
+            filter_expanded: false,
             sort_state: None,
             projection_state: None,
             schema_filter_state: None,
@@ -394,6 +493,10 @@ impl CollectionView {
             calendar_second: None,
             sort_error: false,
             projection_error: false,
+            ask_mode: false,
+            ask_ai_busy: false,
+            ask_ai_error: None,
+            ask_ai_filter: None,
             search_state: None,
             search_visible: false,
             search_matches: Vec::new(),
@@ -411,30 +514,42 @@ impl CollectionView {
             aggregation_stage_count: 0,
             aggregation_drag_over: None,
             aggregation_drag_source: None,
+            json_document: None,
+            json_editor_cache: HashMap::new(),
             filter_subscription: None,
             sort_subscription: None,
             projection_subscription: None,
             schema_filter_subscription: None,
             search_subscription: None,
             aggregation_stage_body_state: None,
-            aggregation_results_tree_state: None,
             aggregation_results_scroll: UniformListScrollHandle::new(),
-            aggregation_limit_state: None,
+            schema_tree_scroll: UniformListScrollHandle::new(),
+            explain_focus: cx.focus_handle(),
+            explain_was_open: false,
             aggregation_results_expanded_nodes: HashSet::new(),
             aggregation_results_signature: None,
             aggregation_results_documents: None,
             syncing_query_inputs: false,
-            aggregation_ignore_body_change: false,
             aggregation_stage_body_subscription: None,
-            aggregation_limit_subscription: None,
+            aggregation_text_state: None,
+            aggregation_text_subscription: None,
+            aggregation_text_error: None,
+            aggregation_format_error: None,
+            aggregation_body_revision: None,
+            aggregation_text_revision: None,
+            aggregation_auto_run: None,
             filter_builder_panel: None,
             filter_builder_session: None,
             _subscriptions: subscriptions,
         }
     }
 
-    pub(crate) fn focus_documents(&self, window: &mut Window) {
-        window.focus(&self.documents_focus);
+    pub(crate) fn focus_documents(&self, window: &mut Window, cx: &mut App) {
+        let aggregation = self.view_model.current_session().is_some_and(|key| {
+            self.state.read(cx).session_subview(&key) == Some(CollectionSubview::Aggregation)
+        });
+        let focus = if aggregation { &self.aggregation_focus } else { &self.documents_focus };
+        window.focus(focus, cx);
     }
 
     /// Ensure subview-specific data is loaded (indexes/stats) based on current subview.
@@ -595,7 +710,7 @@ impl CollectionView {
 
     pub(crate) fn close_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.search_visible = false;
-        window.focus(&self.documents_focus);
+        window.focus(&self.documents_focus, cx);
         if let Some(search_state) = self.search_state.clone() {
             search_state.update(cx, |state, cx| {
                 state.set_value(String::new(), window, cx);
@@ -722,6 +837,33 @@ impl CollectionView {
         let node_meta = self.view_model.node_meta();
         let meta = node_meta.get(&node_id).cloned()?;
         Some((session_key, meta))
+    }
+
+    /// Follow the reference on the selected row, if that row holds one.
+    ///
+    /// Silent when it does not: `space` and Cmd+B fire wherever the selection happens to be,
+    /// and a beep or a message for every non-reference row would be noise.
+    pub(crate) fn follow_selected_reference(&self, intent: Intent, cx: &mut App) {
+        let Some((session_key, meta)) = self.selected_property_context(cx) else {
+            return;
+        };
+        let Some(link) = ReferenceLink::for_node(&self.state, Some(&session_key), &meta) else {
+            return;
+        };
+        link.follow(intent, cx);
+    }
+
+    /// Ask what points at the document the selection sits in, whichever row of it is selected.
+    pub(crate) fn find_references_for_selection(&self, cx: &mut App) {
+        let Some((session_key, meta)) = self.selected_property_context(cx) else {
+            return;
+        };
+        crate::views::documents::tree::tree_menus::find_references_for(
+            &self.state,
+            &session_key,
+            &meta.doc_key,
+            cx,
+        );
     }
 
     fn select_tree_index(
@@ -985,6 +1127,7 @@ fn search_node_meta(
         is_folder: matches!(value, Bson::Document(_) | Bson::Array(_)),
         is_editable,
         is_dirty: original_value.map(|orig| orig != value).unwrap_or(true),
+        has_details: crate::bson::has_value_details(value),
         doc_key: doc_key.clone(),
         path: path.to_vec(),
         value: if is_editable { Some(value.clone()) } else { None },

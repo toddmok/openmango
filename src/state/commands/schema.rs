@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
-use gpui::{App, AppContext as _, Entity};
+use gpui_kit::{App, AppContext as _, Entity};
 use mongodb::bson::{Bson, Document};
 
 use crate::state::events::AppEvent;
@@ -29,12 +29,21 @@ impl AppCommands {
         let collection = session_key.collection.clone();
         let manager = state.read(cx).connection_manager();
 
-        state.update(cx, |state, cx| {
+        // One sample per session at a time. Two overlapping samples would race, and the slower,
+        // older one would overwrite the newer result.
+        let already_loading = state.update(cx, |state, cx| {
             let session = state.ensure_session(session_key.clone());
+            if session.data.schema_loading {
+                return true;
+            }
             session.data.schema_loading = true;
             session.data.schema_error = None;
             cx.notify();
+            false
         });
+        if already_loading {
+            return;
+        }
 
         let task = cx.background_spawn({
             let database = database.clone();
@@ -52,9 +61,9 @@ impl AppCommands {
 
         cx.spawn({
             let state = state.clone();
-            async move |cx: &mut gpui::AsyncApp| {
+            async move |cx: &mut gpui_kit::AsyncApp| {
                 let result: Result<SchemaAnalysis, crate::error::Error> = task.await;
-                let _ = cx.update(|cx| match result {
+                cx.update(|cx| match result {
                     Ok(analysis) => {
                         state.update(cx, |state, cx| {
                             if let Some(session) = state.session_mut(&session_key) {
@@ -80,9 +89,11 @@ impl AppCommands {
                                 session: session_key.clone(),
                                 error: error.clone(),
                             });
-                            state.set_status_message(Some(StatusMessage::error(format!(
-                                "Schema failed: {error}"
-                            ))));
+                            // The Schema view shows this error.
+                            state.record_error(crate::error::ErrorReport::from_message(
+                                "Couldn't analyze the schema",
+                                &error,
+                            ));
                             cx.notify();
                         });
                     }

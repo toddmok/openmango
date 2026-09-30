@@ -1,5 +1,5 @@
-use gpui::{Entity, Subscription};
-use gpui_component::input::InputState;
+use gpui_kit::component::input::InputState;
+use gpui_kit::{Entity, Subscription};
 use uuid::Uuid;
 
 use crate::state::AppState;
@@ -13,12 +13,17 @@ mod tabs;
 mod uri;
 mod view;
 
+#[cfg(test)]
+mod tests;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ManagerTab {
     General,
+    Authentication,
     Tls,
     Network,
     Advanced,
+    Access,
 }
 
 #[derive(Clone, Debug)]
@@ -27,6 +32,13 @@ enum TestStatus {
     Testing,
     Success,
     Error(String),
+    Saved,
+}
+
+struct PendingSave {
+    connection_id: Uuid,
+    fingerprint: String,
+    connect: bool,
 }
 
 struct ConnectionDraft {
@@ -52,6 +64,7 @@ struct ConnectionDraft {
     tls_ca_file_state: Entity<InputState>,
     tls_cert_key_file_state: Entity<InputState>,
     tls_cert_key_password_state: Entity<InputState>,
+    before_connect_state: Entity<InputState>,
     ssh_host_state: Entity<InputState>,
     ssh_port_state: Entity<InputState>,
     ssh_username_state: Entity<InputState>,
@@ -86,7 +99,9 @@ struct ConnectionDraft {
 
 pub struct ConnectionManager {
     state: Entity<AppState>,
+    connection_list: Entity<gpui_kit::component::list::ListState<connection_list::ConnectionList>>,
     selected_id: Option<Uuid>,
+    connecting_id: Option<Uuid>,
     draft: ConnectionDraft,
     testing_step: Option<String>,
     active_tab: ManagerTab,
@@ -94,8 +109,10 @@ pub struct ConnectionManager {
     new_connection_origin_id: Option<Uuid>,
     baseline_fingerprint: String,
     status: TestStatus,
-    last_tested_uri: Option<String>,
-    pending_test_uri: Option<String>,
+    last_tested_fingerprint: Option<String>,
+    pending_test_fingerprint: Option<String>,
+    test_generation: u64,
+    pending_save: Option<PendingSave>,
     parse_error: Option<String>,
     _subscriptions: Vec<Subscription>,
 }

@@ -8,18 +8,24 @@ use crate::state::app_state::CollectionTransferStatus;
 
 /// Events emitted by AppState for UI reactivity
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub enum AppEvent {
     // Connection lifecycle
     ConnectionAdded,
     ConnectionUpdated,
+    ConnectionSaveFinished {
+        connection_id: Uuid,
+        result: Result<(), String>,
+    },
     ConnectionRemoved,
 
     // Connection state changes
     Connecting(Uuid),
     Connected(Uuid),
     Disconnected(Uuid),
-    ConnectionFailed(String),
+    ConnectionFailed {
+        connection_id: Uuid,
+        error: String,
+    },
 
     // Data loaded
     DatabasesLoaded(Vec<String>),
@@ -27,7 +33,11 @@ pub enum AppEvent {
     CollectionsFailed(String),
     DocumentsLoaded {
         session: SessionKey,
+        /// Documents on the loaded page.
+        shown: usize,
+        /// Documents matching the query.
         total: u64,
+        elapsed: std::time::Duration,
     },
     DocumentsLoadFailed {
         session: SessionKey,
@@ -48,6 +58,9 @@ pub enum AppEvent {
     DocumentsInsertFailed {
         count: usize,
         error: String,
+    },
+    DocumentDraftChanged {
+        session: SessionKey,
     },
     DocumentSaved {
         session: SessionKey,
@@ -130,6 +143,9 @@ pub enum AppEvent {
     },
 
     // Transfer events
+    CompareChanged {
+        compare_id: Uuid,
+    },
     TransferPreviewLoaded {
         transfer_id: Uuid,
     },
@@ -177,6 +193,11 @@ pub enum AppEvent {
 
     // View navigation
     ViewChanged,
+
+    // Dates are now drawn in the other zone; rows that cache their text must rebuild it.
+    DateDisplayChanged,
+    /// "Show system collections" was switched; the sidebar lists or hides `system.*` rows.
+    SystemCollectionsVisibilityChanged,
 
     // Auto-update
     UpdateAvailable {

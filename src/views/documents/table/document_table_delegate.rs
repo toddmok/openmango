@@ -1,17 +1,26 @@
 use std::collections::{HashMap, HashSet};
 
-use gpui::prelude::FluentBuilder;
-use gpui::*;
-use gpui_component::table::{Column, ColumnSort, TableDelegate, TableState};
-use gpui_component::{ActiveTheme as _, Icon, IconName, Sizable as _};
+use gpui_kit::component::table::{Column, ColumnSort, TableDelegate, TableState};
+use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _};
+use gpui_kit::prelude::FluentBuilder;
+use gpui_kit::*;
 use mongodb::bson::{Bson, Document};
 
 use crate::bson::DocumentKey;
+use crate::state::relations::resolve::reference_at;
 use crate::state::{AppCommands, AppState, SessionDocument, SessionKey};
-use crate::theme::colors;
+use crate::theme::{colors, spacing};
 use crate::views::documents::CollectionView;
+use crate::views::documents::reference::{
+    IncomingLink, ReferenceLink, incoming_arrow, on_incoming_mouse_down, on_reference_mouse_down,
+    peek_arrow,
+};
 
 use super::cell_renderer;
+
+/// The hover group a cell forms, so its peek arrow appears with the cell rather than sitting in
+/// every ObjectId column permanently.
+const TABLE_CELL_GROUP: &str = "table-cell-group";
 use super::column_menu;
 use super::column_schema::discover_columns;
 use super::table_columns::TableColumns;
@@ -22,6 +31,7 @@ pub struct DocumentTableDelegate {
     drafts: HashMap<DocumentKey, Document>,
     selected_doc_keys: HashSet<DocumentKey>,
     anchor_row: Option<usize>,
+    context_column: Option<usize>,
     state: Entity<AppState>,
     view: Entity<CollectionView>,
     pub session_key: Option<SessionKey>,
@@ -40,6 +50,7 @@ impl DocumentTableDelegate {
             drafts: HashMap::new(),
             selected_doc_keys: HashSet::new(),
             anchor_row: None,
+            context_column: None,
             state,
             view,
             session_key,
@@ -123,6 +134,37 @@ impl DocumentTableDelegate {
         self.documents.get(row_ix).map(|item| item.key.clone())
     }
 
+    /// A link for the cell, when the value in it points somewhere.
+    ///
+    /// Table columns are top-level fields, so the column key is the whole field path — no array
+    /// markers to reconstruct.
+    fn reference_link(&self, row_ix: usize, col_ix: usize) -> Option<ReferenceLink> {
+        let session = self.session_key.clone()?;
+        let path = self.column_key(col_ix)?;
+        let reference = reference_at(&path, self.cell_value(row_ix, col_ix)?)?;
+        Some(ReferenceLink {
+            state: self.state.clone(),
+            session,
+            document: self.document_key(row_ix)?,
+            path,
+            reference,
+            derived: false,
+        })
+    }
+
+    /// The `_id` column: not a link out, but where "what points at this?" is asked from.
+    fn incoming_link(&self, row_ix: usize, col_ix: usize) -> Option<IncomingLink> {
+        if self.column_key(col_ix)? != "_id" {
+            return None;
+        }
+        // Table columns are top-level fields, so the column name is the whole path.
+        Some(IncomingLink {
+            state: self.state.clone(),
+            session: self.session_key.clone()?,
+            document: self.document_key(row_ix)?,
+        })
+    }
+
     fn resolved_doc(&self, row_ix: usize) -> Option<&Document> {
         let item = self.documents.get(row_ix)?;
         self.drafts.get(&item.key).or(Some(&item.doc))
@@ -151,8 +193,8 @@ impl TableDelegate for DocumentTableDelegate {
         self.documents.len()
     }
 
-    fn column(&self, col_ix: usize, _cx: &App) -> &Column {
-        self.table_cols.column_def(col_ix)
+    fn column(&self, col_ix: usize, _cx: &App) -> Column {
+        self.table_cols.column_def(col_ix).clone()
     }
 
     fn render_th(
@@ -167,13 +209,16 @@ impl TableDelegate for DocumentTableDelegate {
         let state = self.state.clone();
         let session_key = self.session_key.clone();
 
-        let pin_icon = if is_pinned { IconName::Pin } else { IconName::PinOff };
+        let pin_icon =
+            if is_pinned { crate::assets::AppIcon::Pin } else { crate::assets::AppIcon::PinOff };
         let pin_opacity: f32 = if is_pinned { 1.0 } else { 0.0 };
         let muted_bg = cx.theme().muted;
         let icon_color = if is_pinned { cx.theme().primary } else { cx.theme().muted_foreground };
 
         div()
-            .id(("th-pin", col_ix))
+            // Keyed by column, not position: pinning moves the column, and the button must not
+            // change identity under the pointer that is clicking it.
+            .id((ElementId::from("th-pin"), col_key.clone()))
             .size_full()
             .flex()
             .items_center()
@@ -182,15 +227,15 @@ impl TableDelegate for DocumentTableDelegate {
             .child(name)
             .child(
                 div()
-                    .id(("pin-btn", col_ix))
+                    .id("pin-btn")
                     .flex_shrink_0()
                     .cursor_pointer()
-                    .rounded_sm()
+                    .rounded(crate::theme::borders::radius_sm())
                     .p(px(1.0))
                     .opacity(pin_opacity)
-                    .hover(|s: gpui::StyleRefinement| s.opacity(1.0).bg(muted_bg))
+                    .hover(|s: gpui_kit::StyleRefinement| s.opacity(1.0).bg(muted_bg))
                     .when(!is_pinned, |this: Stateful<Div>| {
-                        this.group_hover("col-header-group", |s: gpui::StyleRefinement| {
+                        this.group_hover("col-header-group", |s: gpui_kit::StyleRefinement| {
                             s.opacity(0.5)
                         })
                     })
@@ -215,7 +260,7 @@ impl TableDelegate for DocumentTableDelegate {
     }
 
     fn loading(&self, _cx: &App) -> bool {
-        self.is_loading
+        self.is_loading && self.documents.is_empty()
     }
 
     fn render_tr(
@@ -230,7 +275,13 @@ impl TableDelegate for DocumentTableDelegate {
 
         let selected_bg = cx.theme().list_active;
 
-        let mut row = div().id(("row", row_ix));
+        let mut row = div().id(("row", row_ix)).capture_any_mouse_down(cx.listener(
+            |table, event: &MouseDownEvent, _, _| {
+                if event.button == MouseButton::Right {
+                    table.delegate_mut().context_column = None;
+                }
+            },
+        ));
 
         if is_dirty {
             row = row.bg(colors::bg_dirty(cx));
@@ -303,11 +354,39 @@ impl TableDelegate for DocumentTableDelegate {
         _window: &mut Window,
         cx: &mut Context<TableState<Self>>,
     ) -> impl IntoElement {
-        let Some(value) = self.cell_value(row_ix, col_ix) else {
-            return div().text_xs().text_color(cx.theme().muted_foreground).into_any_element();
-        };
+        let content = self
+            .cell_value(row_ix, col_ix)
+            .map(|value| cell_renderer::render_cell(value, row_ix, col_ix, cx));
+        let link = self.reference_link(row_ix, col_ix);
+        let incoming = self.incoming_link(row_ix, col_ix);
 
-        cell_renderer::render_cell(value, row_ix, col_ix, cx)
+        div()
+            .size_full()
+            .group(TABLE_CELL_GROUP)
+            .flex()
+            .items_center()
+            .gap(spacing::xs())
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |table, _, _, _| {
+                    table.delegate_mut().context_column = Some(col_ix);
+                }),
+            )
+            .when_some(link.clone(), |this, link| {
+                // Stops at Cmd+click, so the row's own click-to-select is untouched.
+                this.cursor_pointer()
+                    .hover(|style| style.underline())
+                    .on_mouse_down(MouseButton::Left, on_reference_mouse_down(link))
+            })
+            .when_some(incoming.clone(), |this, link| {
+                this.cursor_pointer()
+                    .hover(|style| style.underline())
+                    .on_mouse_down(MouseButton::Left, on_incoming_mouse_down(link))
+            })
+            .children(content)
+            .when_some(link, |this, link| this.child(peek_arrow(link, TABLE_CELL_GROUP, cx)))
+            .when_some(incoming, |this, link| this.child(incoming_arrow(link, TABLE_CELL_GROUP)))
+            .into_any_element()
     }
 
     fn render_empty(
@@ -315,25 +394,34 @@ impl TableDelegate for DocumentTableDelegate {
         _window: &mut Window,
         cx: &mut Context<TableState<Self>>,
     ) -> impl IntoElement {
+        let message = self
+            .session_key
+            .as_ref()
+            .and_then(|key| self.state.read(cx).session_data(key))
+            .map(|data| {
+                super::super::query::document_empty_message(
+                    data.loaded,
+                    data.query_error.is_some(),
+                    data.filter.is_some(),
+                )
+            })
+            .unwrap_or("No results yet");
         div()
             .size_full()
             .flex()
             .items_center()
             .justify_center()
-            .child(
-                div().text_sm().text_color(cx.theme().muted_foreground).child("No documents found"),
-            )
+            .child(div().text_sm().text_color(cx.theme().muted_foreground).child(message))
             .into_any_element()
     }
 
     fn context_menu(
         &mut self,
         row_ix: usize,
-        selected_col: Option<usize>,
-        menu: gpui_component::menu::PopupMenu,
+        menu: gpui_kit::component::menu::PopupMenu,
         _window: &mut Window,
         cx: &mut Context<TableState<Self>>,
-    ) -> gpui_component::menu::PopupMenu {
+    ) -> gpui_kit::component::menu::PopupMenu {
         let Some(item) = self.documents.get(row_ix) else {
             return menu;
         };
@@ -342,6 +430,25 @@ impl TableDelegate for DocumentTableDelegate {
         };
         let doc_key = item.key.clone();
         let is_dirty = self.is_row_dirty(row_ix);
+        self.state.update(cx, |state, cx| {
+            if !state
+                .session_view(&session_key)
+                .is_some_and(|view| view.selected_docs.contains(&doc_key))
+            {
+                state.select_single_doc(
+                    &session_key,
+                    doc_key.clone(),
+                    crate::bson::doc_root_id(&doc_key),
+                );
+            } else {
+                state.set_selected_node(
+                    &session_key,
+                    doc_key.clone(),
+                    crate::bson::doc_root_id(&doc_key),
+                );
+            }
+            cx.notify();
+        });
         let selected_count = {
             let state_ref = self.state.read(cx);
             state_ref.session_view(&session_key).map(|v| v.selected_docs.len().max(1)).unwrap_or(1)
@@ -362,7 +469,7 @@ impl TableDelegate for DocumentTableDelegate {
 
         column_menu::build_table_column_menu(
             menu,
-            selected_col,
+            self.context_column,
             &self.table_cols.columns,
             self.table_cols.pinned_columns(),
             column_menu::ColumnMenuKind::Document,

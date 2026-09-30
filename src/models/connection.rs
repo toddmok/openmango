@@ -112,6 +112,8 @@ pub struct ConnectionRuntimeMeta {
     pub ssh_tunnel_active: bool,
     pub ssh_local_endpoint: Option<String>,
     pub proxy_active: bool,
+    /// The program run before connecting, e.g. `kubectl`, while it's running.
+    pub before_connect: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -194,6 +196,10 @@ pub struct SavedConnection {
     pub proxy: Option<ProxyConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secret_id: Option<Uuid>,
+    /// Run in the login shell before connecting and stopped on disconnect, e.g. a
+    /// `kubectl port-forward` that opens the port the URI points at.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before_connect: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -201,6 +207,7 @@ pub struct ConnectionTransportIdentity {
     pub ssh: Option<SshConfig>,
     pub proxy: Option<ProxyConfig>,
     pub secret_id: Option<Uuid>,
+    pub before_connect: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -219,11 +226,6 @@ impl ConnectionWriteIdentity {
     pub fn matches(&self, connection: &SavedConnection) -> bool {
         self == &Self::from(connection)
     }
-
-    pub fn requires_production_confirmation(&self) -> bool {
-        self.environment == Some(ConnectionEnvironment::Production)
-            && self.confirm_production_writes
-    }
 }
 
 impl From<&SavedConnection> for ConnectionWriteIdentity {
@@ -241,6 +243,7 @@ impl From<&SavedConnection> for ConnectionWriteIdentity {
                 ssh: stripped.ssh,
                 proxy: stripped.proxy,
                 secret_id: stripped.secret_id,
+                before_connect: stripped.before_connect,
             }),
         }
     }
@@ -255,6 +258,14 @@ fn default_history_max_bytes() -> u64 {
 }
 
 impl SavedConnection {
+    /// Most recently connected first; never-connected entries follow by name.
+    pub fn cmp_recent_use(&self, other: &Self) -> std::cmp::Ordering {
+        other
+            .last_connected
+            .cmp(&self.last_connected)
+            .then_with(|| self.name.to_lowercase().cmp(&other.name.to_lowercase()))
+    }
+
     pub fn new(name: String, uri: String) -> Self {
         Self {
             id: Uuid::new_v4(),
@@ -274,6 +285,7 @@ impl SavedConnection {
             ssh: None,
             proxy: None,
             secret_id: None,
+            before_connect: None,
         }
     }
 
@@ -306,12 +318,77 @@ pub struct ActiveConnection {
     pub databases: Vec<String>,
     /// Collections per database (db_name -> collection_names)
     pub collections: HashMap<String, Vec<String>>,
+    /// Views and time-series collections per database (db_name -> name -> detail). A name
+    /// absent here is a plain collection, so readers of `collections` need not care.
+    pub collection_details: HashMap<String, HashMap<String, CollectionDetail>>,
     pub runtime_meta: ConnectionRuntimeMeta,
+}
+
+impl ActiveConnection {
+    pub fn collection_detail(&self, database: &str, collection: &str) -> Option<&CollectionDetail> {
+        self.collection_details.get(database)?.get(collection)
+    }
+}
+
+/// What a namespace is when it is not a plain collection.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CollectionDetail {
+    /// A read-only view: the collection it reads from and the pipeline that defines it.
+    View {
+        view_on: String,
+        pipeline: Vec<mongodb::bson::Document>,
+    },
+    Timeseries,
+}
+
+impl CollectionDetail {
+    pub fn from_spec(spec: &mongodb::results::CollectionSpecification) -> Option<Self> {
+        use mongodb::results::CollectionType;
+        match spec.collection_type {
+            CollectionType::View => Some(Self::View {
+                view_on: spec.options.view_on.clone().unwrap_or_default(),
+                pipeline: spec.options.pipeline.clone().unwrap_or_default(),
+            }),
+            CollectionType::Timeseries => Some(Self::Timeseries),
+            _ => None,
+        }
+    }
+
+    /// Names and details from one `listCollections` result, ready to store on the connection.
+    pub fn split_specs(
+        specs: &[mongodb::results::CollectionSpecification],
+    ) -> (Vec<String>, HashMap<String, CollectionDetail>) {
+        let names = specs.iter().map(|spec| spec.name.clone()).collect();
+        let details = specs
+            .iter()
+            .filter_map(|spec| Some((spec.name.clone(), Self::from_spec(spec)?)))
+            .collect();
+        (names, details)
+    }
+}
+
+/// Server-internal namespaces such as `system.views`. Only the exact `system.` prefix counts:
+/// a user collection named `system_audit` or `my.system.log` is not one.
+pub fn is_system_collection(name: &str) -> bool {
+    name.starts_with("system.")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recent_use_orders_latest_first_then_names() {
+        let mut beta = SavedConnection::new("beta".into(), "mongodb://b".into());
+        let alpha = SavedConnection::new("Alpha".into(), "mongodb://a".into());
+        let mut old = SavedConnection::new("old".into(), "mongodb://o".into());
+        beta.last_connected = Some(Utc::now());
+        old.last_connected = Some(Utc::now() - chrono::Duration::days(3));
+        let mut connections = [&alpha, &old, &beta];
+        connections.sort_by(|a, b| a.cmp_recent_use(b));
+        let names = connections.iter().map(|c| c.name.as_str()).collect::<Vec<_>>();
+        assert_eq!(names, ["beta", "old", "Alpha"]);
+    }
 
     #[test]
     fn environment_is_explicit_and_legacy_safe() {

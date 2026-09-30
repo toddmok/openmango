@@ -1,11 +1,12 @@
+use gpui_kit::component::button::ButtonVariants as _;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
-use gpui::*;
-use gpui_component::ActiveTheme as _;
-use gpui_component::WindowExt as _;
-use gpui_component::dialog::Dialog;
+use gpui_kit::component::ActiveTheme as _;
+use gpui_kit::component::WindowExt as _;
+use gpui_kit::component::dialog::Dialog;
+use gpui_kit::*;
 use uuid::Uuid;
 
 use crate::bson::parse_document_from_json;
@@ -27,7 +28,11 @@ type Continuation = Box<dyn FnOnce(&mut Window, &mut App)>;
 
 fn has_in_flight_editor_save(inventory: &UnsavedInventory) -> bool {
     inventory.changes.iter().any(|change| {
-        matches!(change, UnsavedChange::DetachedEditor(EditorSession { save_in_flight: true, .. }))
+        matches!(
+            change,
+            UnsavedChange::DetachedEditor(EditorSession { save_in_flight: true, .. })
+                | UnsavedChange::InlineDocument { save_in_flight: true, .. }
+        )
     })
 }
 
@@ -76,7 +81,8 @@ pub fn request_app_quit(state: Entity<AppState>, window: &mut Window, cx: &mut A
             cx,
             "Operations are still running",
             "Cancel running agent operations, wait for rollback or recovery state, then quit?",
-            "Cancel operations & quit",
+            // Not "Cancel …": the dialog's own Cancel sits beside it and means the opposite.
+            "Stop and quit",
             true,
             move |_window, cx| {
                 let broker = state.read(cx).action_broker();
@@ -85,7 +91,7 @@ pub fn request_app_quit(state: Entity<AppState>, window: &mut Window, cx: &mut A
                 }
                 let state = state.clone();
                 cx.spawn(async move |cx: &mut AsyncApp| loop {
-                    Timer::after(std::time::Duration::from_millis(200)).await;
+                    cx.background_executor().timer(std::time::Duration::from_millis(200)).await;
                     let finished = cx
                         .update(|cx| {
                             state
@@ -104,10 +110,9 @@ pub fn request_app_quit(state: Entity<AppState>, window: &mut Window, cx: &mut A
                                             | crate::actions::model::OperationStatus::CancelRequested
                                     )
                                 })
-                        })
-                        .unwrap_or(true);
+                        });
                     if finished {
-                        let _ = cx.update(|cx| finish_app_quit(state.clone(), cx));
+                        cx.update(|cx| finish_app_quit(state.clone(), cx));
                         break;
                     }
                 })
@@ -117,7 +122,8 @@ pub fn request_app_quit(state: Entity<AppState>, window: &mut Window, cx: &mut A
     });
 }
 
-fn finish_app_quit(state: Entity<AppState>, cx: &mut App) {
+/// Saves the workspace, closes every window, and quits: the same path as Cmd+Q.
+pub(crate) fn finish_app_quit(state: Entity<AppState>, cx: &mut App) {
     state.update(cx, |state, _| {
         state.update_workspace_from_state();
         state.flush_workspace_now();
@@ -298,7 +304,7 @@ fn open_unsaved_dialog(
         if !dialog_state.read(cx).focused_once {
             dialog_state.update(cx, |state, _| state.focused_once = true);
             let focus = cancel_focus.clone();
-            window.defer(cx, move |window, _| window.focus(&focus));
+            window.defer(cx, move |window, cx| window.focus(&focus, cx));
         }
 
         let cancel_state = state.clone();
@@ -569,7 +575,7 @@ fn prepare_saves(
             | UnsavedChange::InvalidInlineEdit { session_key } => session_key,
             UnsavedChange::DetachedEditor(session) => &session.session_key,
         };
-        if state.read(cx).connection_read_only(session_key.connection_id) {
+        if state.read(cx).session_read_only(session_key) {
             return Err(Error::Parse(format!(
                 "{} is read-only; discard or cancel instead.",
                 session_key.collection
@@ -658,7 +664,7 @@ fn execute_save(
             else {
                 unreachable!();
             };
-            let original_id = original_id.as_ref().ok_or_else(|| {
+            let original_id = original_id.as_deref().ok_or_else(|| {
                 Error::Parse("Could not resolve the edited document's _id.".to_string())
             })?;
             let baseline_document = baseline_document.as_ref().ok_or_else(|| {
@@ -725,6 +731,7 @@ fn apply_saved_change(
                 }
                 if unchanged {
                     session.view.drafts.remove(&doc_key);
+                    session.view.draft_baselines.remove(&doc_key);
                     session.view.dirty.remove(&doc_key);
                 }
             }

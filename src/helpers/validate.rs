@@ -202,7 +202,7 @@ fn strip_auth_mechanism_secret(value: &str) -> Option<String> {
     (!kept.is_empty()).then(|| percent_encode(&kept.join(",")))
 }
 
-fn percent_decode(value: &str) -> String {
+pub(crate) fn percent_decode(value: &str) -> String {
     let bytes = value.as_bytes();
     let mut decoded = Vec::with_capacity(bytes.len());
     let mut index = 0;
@@ -231,7 +231,7 @@ fn hex_value(value: u8) -> Option<u8> {
     }
 }
 
-fn percent_encode(value: &str) -> String {
+pub(crate) fn percent_encode(value: &str) -> String {
     use std::fmt::Write as _;
 
     let mut encoded = String::with_capacity(value.len());
@@ -295,6 +295,16 @@ pub fn extract_host_from_uri(uri: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The app offers AWS IAM and keeps its session token; both are dead weight if the driver
+    /// is built without `aws-auth`, because it then refuses the mechanism by name.
+    #[test]
+    fn the_driver_accepts_every_mechanism_the_connection_form_offers() {
+        use mongodb::options::AuthMechanism;
+        for name in ["SCRAM-SHA-256", "SCRAM-SHA-1", "MONGODB-X509", "PLAIN", "MONGODB-AWS"] {
+            assert!(name.parse::<AuthMechanism>().is_ok(), "driver rejects {name}");
+        }
+    }
 
     #[test]
     fn uri_secrets_round_trip_without_persisting_credentials() {

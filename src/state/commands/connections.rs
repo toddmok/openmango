@@ -1,5 +1,5 @@
 use chrono::Utc;
-use gpui::{App, AppContext as _, Entity};
+use gpui_kit::{App, AppContext as _, Entity};
 use uuid::Uuid;
 
 use crate::models::ActiveConnection;
@@ -8,13 +8,22 @@ use crate::state::{AppEvent, AppState, StatusMessage, View};
 use super::AppCommands;
 
 impl AppCommands {
-    /// Connect to a saved connection by ID.
+    /// Connect to a saved connection by ID and show it.
     pub fn connect(state: Entity<AppState>, connection_id: Uuid, cx: &mut App) {
+        Self::connect_with(state, connection_id, true, cx);
+    }
+
+    /// Connect without moving the main view, for pickers inside another tab.
+    pub fn connect_in_background(state: Entity<AppState>, connection_id: Uuid, cx: &mut App) {
+        Self::connect_with(state, connection_id, false, cx);
+    }
+
+    fn connect_with(state: Entity<AppState>, connection_id: Uuid, show: bool, cx: &mut App) {
         if !state.read(cx).connection_secrets_ready() {
             state.update(cx, |state, cx| {
                 let message = "Connection credentials are still loading or require recovery.";
                 state.set_status_message(Some(StatusMessage::error(message)));
-                cx.emit(AppEvent::ConnectionFailed(message.to_string()));
+                cx.emit(AppEvent::ConnectionFailed { connection_id, error: message.to_string() });
                 cx.notify();
             });
             return;
@@ -28,11 +37,22 @@ impl AppCommands {
         };
 
         let Some(saved) = saved else {
-            state.update(cx, |_, cx| {
-                cx.emit(AppEvent::ConnectionFailed("Connection not found".to_string()));
+            state.update(cx, |state, cx| {
+                let event = AppEvent::ConnectionFailed {
+                    connection_id,
+                    error: "This connection no longer exists. It may have been removed."
+                        .to_string(),
+                };
+                state.update_status_from_event(&event);
+                cx.emit(event);
+                cx.notify();
             });
             return;
         };
+
+        if state.read(cx).is_connected(connection_id) {
+            Self::disconnect(state.clone(), connection_id, cx);
+        }
 
         // Emit connecting event
         state.update(cx, |state, cx| {
@@ -58,13 +78,13 @@ impl AppCommands {
         // Handle result on main thread
         cx.spawn({
             let state = state.clone();
-            async move |cx: &mut gpui::AsyncApp| {
+            async move |cx: &mut gpui_kit::AsyncApp| {
                 let result: Result<
                     (mongodb::Client, Vec<String>, crate::models::ConnectionRuntimeMeta),
                     crate::error::Error,
                 > = task.await;
 
-                let _ = cx.update(|cx| match result {
+                cx.update(|cx| match result {
                     Ok((client, databases, runtime_meta)) => {
                         state.update(cx, |state, cx| {
                             let mut saved = saved.clone();
@@ -76,11 +96,16 @@ impl AppCommands {
                                     client: client.clone(),
                                     databases: databases.clone(),
                                     collections: std::collections::HashMap::new(),
+                                    collection_details: Default::default(),
                                     runtime_meta,
                                 },
                             );
-                            state.update_connection(saved.clone(), cx);
-                            state.select_connection(Some(connection_id), cx);
+                            if let Some(at) = saved.last_connected {
+                                state.set_connection_last_connected(connection_id, at);
+                            }
+                            if show {
+                                state.select_connection(Some(connection_id), cx);
+                            }
                             state.update_workspace_from_state();
                             let connected = AppEvent::Connected(connection_id);
                             state.update_status_from_event(&connected);
@@ -100,11 +125,33 @@ impl AppCommands {
                                 cx,
                             );
                         }
+                        let manager = state.read(cx).connection_manager();
+                        if let Some(exit) = manager.take_before_connect_exit(connection_id) {
+                            let state = state.clone();
+                            cx.spawn(async move |cx: &mut gpui_kit::AsyncApp| {
+                                // Closed on purpose: nothing is sent, and this ends quietly.
+                                let Ok(error) = exit.await else {
+                                    return;
+                                };
+                                cx.update(|cx| {
+                                    Self::disconnect(state.clone(), connection_id, cx);
+                                    state.update(cx, |state, cx| {
+                                        let event =
+                                            AppEvent::ConnectionFailed { connection_id, error };
+                                        state.update_status_from_event(&event);
+                                        cx.emit(event);
+                                        cx.notify();
+                                    });
+                                });
+                            })
+                            .detach();
+                        }
                     }
                     Err(e) => {
                         log::error!("Failed to connect: {}", e);
                         state.update(cx, |state, cx| {
-                            let event = AppEvent::ConnectionFailed(e.to_string());
+                            let event =
+                                AppEvent::ConnectionFailed { connection_id, error: e.to_string() };
                             state.update_status_from_event(&event);
                             cx.emit(event);
                         });
@@ -153,9 +200,9 @@ impl AppCommands {
 
         cx.spawn({
             let state = state.clone();
-            async move |cx: &mut gpui::AsyncApp| {
+            async move |cx: &mut gpui_kit::AsyncApp| {
                 let result: Result<Vec<String>, crate::error::Error> = task.await;
-                let _ = cx.update(|cx| match result {
+                cx.update(|cx| match result {
                     Ok(databases) => {
                         state.update(cx, |state, cx| {
                             let removed = {

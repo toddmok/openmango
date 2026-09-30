@@ -7,6 +7,7 @@ use std::path::PathBuf;
 
 use crate::models::connection::SavedConnection;
 use crate::state::QueryLibrary;
+use crate::state::relations::RelationModel;
 use crate::state::settings::AppSettings;
 use crate::state::workspace::WorkspaceState;
 
@@ -20,6 +21,8 @@ const APP_NAME: &str = "openmango";
 #[derive(Clone)]
 pub struct ConfigManager {
     config_dir: PathBuf,
+    #[cfg(test)]
+    _test_directory: Option<std::sync::Arc<tempfile::TempDir>>,
 }
 
 impl ConfigManager {
@@ -32,7 +35,11 @@ impl ConfigManager {
             fs::create_dir_all(&config_dir).context("Failed to create config directory")?;
         }
 
-        Ok(Self { config_dir })
+        Ok(Self {
+            config_dir,
+            #[cfg(test)]
+            _test_directory: None,
+        })
     }
 
     /// Get the platform-specific config directory
@@ -44,8 +51,30 @@ impl ConfigManager {
         self.config_dir.join("agent")
     }
 
+    /// Where the assistant keeps conversations between runs.
+    pub fn ai_memory_path(&self) -> PathBuf {
+        self.config_dir.join("ai-memory.sqlite3")
+    }
+
+    /// Takes the lock that makes this process the one that starts scheduled runs, or `None` when
+    /// another OpenMango process holds it.
+    pub fn take_scheduler_lock(
+        &self,
+    ) -> std::io::Result<Option<crate::tasks::lock::SchedulerLock>> {
+        crate::tasks::lock::SchedulerLock::try_take(&self.config_dir)
+    }
+
+    /// Task runs, encrypted: their logs can quote server errors that contain document values.
+    pub fn task_runs_path(&self) -> PathBuf {
+        self.config_dir.join("task-runs.sqlite3")
+    }
+
     pub(crate) fn history_path(&self) -> PathBuf {
         self.config_dir.join("history").join("history.sqlite3")
+    }
+
+    pub(crate) fn compare_restore_dir(&self) -> PathBuf {
+        self.config_dir.join("compare-undo")
     }
 
     /// Get path to a specific config file
@@ -90,6 +119,8 @@ impl ConfigManager {
     const CONNECTIONS_FILE: &'static str = "connections.json";
     const QUERY_LIBRARY_FILE: &'static str = "query_library.json";
     const WORKSPACE_FILE: &'static str = "workspace.json";
+    const RELATIONS_FILE: &'static str = "relations.json";
+    const TASKS_FILE: &'static str = "tasks.json";
 
     /// Load saved connections from disk
     pub fn load_connections(&self) -> Result<Vec<SavedConnection>> {
@@ -109,6 +140,14 @@ impl ConfigManager {
     // =========================================================================
     // Query Library
     // =========================================================================
+
+    pub fn load_tasks(&self) -> Result<Vec<crate::tasks::model::Task>> {
+        Ok(self.load_json(Self::TASKS_FILE)?.unwrap_or_default())
+    }
+
+    pub fn save_tasks(&self, tasks: &[crate::tasks::model::Task]) -> Result<()> {
+        self.save_json(Self::TASKS_FILE, &tasks)
+    }
 
     pub fn load_query_library(&self) -> Result<QueryLibrary> {
         Ok(self.load_json(Self::QUERY_LIBRARY_FILE)?.unwrap_or_default())
@@ -136,6 +175,20 @@ impl ConfigManager {
     }
 
     // =========================================================================
+    // Relations
+    // =========================================================================
+
+    /// Load the relation graph. A malformed file is reported rather than replaced, the same as
+    /// connections: a hand-edited model is worth more than an empty one.
+    pub fn load_relations(&self) -> Result<RelationModel> {
+        Ok(self.load_json(Self::RELATIONS_FILE)?.unwrap_or_default())
+    }
+
+    pub fn save_relations(&self, model: &RelationModel) -> Result<()> {
+        self.save_json(Self::RELATIONS_FILE, model)
+    }
+
+    // =========================================================================
     // Settings
     // =========================================================================
 
@@ -160,6 +213,15 @@ impl ConfigManager {
 
 impl Default for ConfigManager {
     fn default() -> Self {
+        #[cfg(test)]
+        {
+            // Unit tests must not restore or modify the developer's saved workspace.
+            // Keep the directory alive for config clones held by deferred saves too.
+            let directory =
+                std::sync::Arc::new(tempfile::tempdir().expect("test config directory"));
+            Self { config_dir: directory.path().to_owned(), _test_directory: Some(directory) }
+        }
+        #[cfg(not(test))]
         Self::new().expect("Failed to initialize ConfigManager")
     }
 }
@@ -183,8 +245,8 @@ mod tests {
     use super::*;
 
     impl ConfigManager {
-        fn with_config_dir(config_dir: PathBuf) -> Self {
-            Self { config_dir }
+        pub(crate) fn with_config_dir(config_dir: PathBuf) -> Self {
+            Self { config_dir, _test_directory: None }
         }
     }
 
@@ -326,5 +388,27 @@ mod tests {
         assert!(loaded[0].confirm_production_writes);
         assert!(loaded[0].agent_writable);
         assert!(loaded[0].history_enabled);
+    }
+
+    #[test]
+    fn relations_round_trip_through_the_file_and_start_empty() {
+        let temp_dir = TempDir::new().expect("failed to create temp dir");
+        let manager = ConfigManager::with_config_dir(temp_dir.path().to_path_buf());
+
+        // Nothing on disk is an empty model, not an error: most databases have no file yet.
+        assert!(manager.load_relations().unwrap().relations.is_empty());
+
+        let mut graph = crate::state::relations::RelationGraph::new();
+        graph.upsert(crate::state::relations::Relation::asserted(
+            crate::state::relations::FieldRef::new("shop", "orders", "items[].productId"),
+            crate::state::relations::FieldRef::id_of("shop", "products"),
+            crate::state::relations::Origin::User,
+        ));
+        manager.save_relations(&graph.to_model()).unwrap();
+
+        let reloaded = manager.load_relations().unwrap();
+        assert_eq!(reloaded.relations.len(), 1);
+        assert_eq!(reloaded.relations[0].source.path, "items[].productId");
+        assert_eq!(reloaded.relations[0].target.collection, "products");
     }
 }

@@ -21,9 +21,9 @@ fn test_default_settings() {
     let settings = AppSettings::default();
 
     // Appearance defaults
-    assert_eq!(settings.appearance.theme, AppTheme::VercelDark);
+    assert_eq!(settings.appearance.theme, AppTheme::MangoDark);
+    assert!(settings.appearance.follow_system);
     assert!(settings.appearance.show_status_bar);
-    assert!(!settings.appearance.vibrancy);
     assert!(settings.appearance.islands.different_tool_window_background);
     assert_eq!(settings.appearance.islands.tab_style, IslandsTabStyle::Islands);
     assert_eq!(settings.appearance.islands.corner_softness, IslandsCornerSoftness::Medium);
@@ -129,6 +129,7 @@ fn test_workspace_tab_forge_roundtrip() {
         collection: String::new(),
         kind: WorkspaceTabKind::Forge,
         transfer: None,
+        compare: None,
         filter_raw: String::new(),
         filter_compiled_raw: String::new(),
         sort_raw: String::new(),
@@ -139,8 +140,6 @@ fn test_workspace_tab_forge_roundtrip() {
         forge_content: "db.getCollection(\"users\").find({})".to_string(),
         ai_panel_open: false,
         ai_draft_input: String::new(),
-        ai_entries: Vec::new(),
-        ai_messages: Vec::new(),
         table_column_widths: HashMap::new(),
         table_column_order: Vec::new(),
         table_pinned_columns: HashSet::new(),

@@ -1,14 +1,16 @@
+use gpui_kit::component::button::ButtonVariants as _;
+use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 use std::sync::Arc;
 
-use gpui::*;
-use gpui_component::ActiveTheme as _;
-use gpui_component::Sizable as _;
-use gpui_component::input::{Input, InputEvent, InputState};
-use gpui_component::scroll::ScrollableElement;
-use gpui_component::spinner::Spinner;
-use gpui_component::table::{Table, TableState};
-use gpui_component::{Icon, IconName};
+use gpui_kit::component::ActiveTheme as _;
+use gpui_kit::component::Sizable as _;
+use gpui_kit::component::input::{Input, InputEvent, InputState};
+use gpui_kit::component::scroll::ScrollableElement;
+use gpui_kit::component::spinner::Spinner;
+use gpui_kit::component::table::{DataTable, TableState};
+use gpui_kit::component::{Icon, IconName};
+use gpui_kit::*;
 use mongodb::bson::Document;
 
 use crate::components::Button;
@@ -22,11 +24,9 @@ use crate::views::results::{
 use super::super::ForgeView;
 use super::super::controller::ForgeController;
 use super::super::types::{ForgeOutputTab, ResultOrigin, ResultPage};
-use super::pipeline::ResultKind;
-use super::pipeline::classify_result;
 use crate::bson::DocumentKey;
 use crate::state::SessionDocument;
-use std::hash::{Hash, Hasher};
+use uuid::Uuid;
 
 fn results_signature(documents: &[SessionDocument]) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -82,16 +82,16 @@ impl ForgeView {
         cx: &mut Context<Self>,
     ) -> Option<Entity<TableState<ResultTableDelegate>>> {
         let page = self.state.output.result_pages.get(self.state.output.result_page_index)?.clone();
-        let documents = self.current_result_documents()?;
-        let signature = results_signature(&documents);
+        let signature = results_signature(&page.documents);
         let editable = self.current_result_is_editable(cx);
         let table = self.ensure_result_table_state(window, cx);
         if self.state.output.result_table_page_id != Some(page.id)
             || self.state.output.result_table_signature != Some(signature)
         {
+            let docs = page.documents.iter().map(|document| document.doc.clone()).collect();
             table.update(cx, |table, cx| {
                 table.delegate_mut().refresh_data(
-                    page.docs,
+                    docs,
                     editable,
                     page.origin.database,
                     page.origin.collection.unwrap_or_default(),
@@ -150,18 +150,7 @@ impl ForgeView {
 
     pub fn current_result_documents(&self) -> Option<Arc<Vec<SessionDocument>>> {
         let page = self.state.output.result_pages.get(self.state.output.result_page_index)?;
-        let documents: Arc<Vec<SessionDocument>> = Arc::new(
-            page.docs
-                .iter()
-                .cloned()
-                .enumerate()
-                .map(|(idx, doc)| SessionDocument {
-                    key: DocumentKey::from_document(&doc, idx),
-                    doc,
-                })
-                .collect(),
-        );
-        Some(documents)
+        Some(page.documents.clone())
     }
 
     pub fn render_results_body(
@@ -172,90 +161,113 @@ impl ForgeView {
         let mut body =
             div().flex().flex_col().flex_1().min_w(px(0.0)).min_h(px(0.0)).overflow_hidden();
 
-        if let Some(err) = &self.state.runtime.mongosh_error {
+        let error = match (&self.state.runtime.mongosh_error, &self.state.output.last_error) {
+            (Some(err), _) => {
+                Some(crate::error::ErrorReport::from_message("Forge couldn't start", err))
+            }
+            (None, Some(err)) => {
+                Some(crate::error::ErrorReport::from_message("The script failed", err))
+            }
+            (None, None) => None,
+        };
+        if let Some(report) = error {
             body = body.child(
                 div()
                     .px(spacing::sm())
                     .py(spacing::xs())
-                    .text_sm()
-                    .text_color(cx.theme().danger_foreground)
-                    .child(format!("Forge runtime error: {err}")),
-            );
-        } else if let Some(err) = &self.state.output.last_error {
-            body = body.child(
-                div()
-                    .px(spacing::sm())
-                    .py(spacing::xs())
-                    .text_sm()
-                    .text_color(cx.theme().danger_foreground)
-                    .child(err.clone()),
+                    .child(crate::components::ErrorCallout::new("forge-error", report)),
             );
         }
 
-        if self.state.output.result_view_mode == ResultViewMode::Tree {
-            let search_state = self.ensure_results_search_state(window, cx);
-            let current_search = search_state.read(cx).value().to_string();
-            if current_search != self.state.output.results_search_query {
-                search_state.update(cx, |state, cx| {
-                    state.set_value(self.state.output.results_search_query.clone(), window, cx);
-                });
-            }
-            let search_input = Input::new(&search_state)
-                .appearance(true)
-                .bordered(true)
-                .focus_bordered(true)
-                .w(px(220.0));
-            let view_entity = cx.entity();
-            let documents_for_buttons = self.current_result_documents();
-            let mut search_row = div()
-                .flex()
-                .items_center()
-                .justify_end()
-                .gap(spacing::xs())
-                .px(spacing::sm())
-                .py(spacing::xs());
-            if let Some(documents) = documents_for_buttons {
-                search_row = search_row
-                    .child(
-                        Button::new("forge-expand-all")
-                            .ghost()
-                            .compact()
-                            .icon(Icon::new(IconName::ChevronDown).xsmall())
-                            .tooltip("Expand all")
-                            .on_click({
-                                let view_entity = view_entity.clone();
-                                let documents = documents.clone();
-                                move |_: &ClickEvent, _window: &mut Window, cx: &mut App| {
-                                    let nodes = collect_all_expandable_nodes(&documents);
-                                    view_entity.update(cx, |view, cx| {
-                                        view.state.output.result_expanded_nodes = nodes;
-                                        cx.notify();
-                                    });
-                                }
-                            }),
-                    )
-                    .child(
-                        Button::new("forge-collapse-all")
-                            .ghost()
-                            .compact()
-                            .icon(Icon::new(IconName::ChevronUp).xsmall())
-                            .tooltip("Collapse all")
-                            .on_click({
-                                let view_entity = view_entity.clone();
-                                move |_: &ClickEvent, _window: &mut Window, cx: &mut App| {
-                                    view_entity.update(cx, |view, cx| {
-                                        view.state.output.result_expanded_nodes.clear();
-                                        cx.notify();
-                                    });
-                                }
-                            }),
-                    );
-            }
-            body = body.child(search_row.child(search_input));
+        let search_state = self.ensure_results_search_state(window, cx);
+        let current_search = search_state.read(cx).value().to_string();
+        if current_search != self.state.output.results_search_query {
+            search_state.update(cx, |state, cx| {
+                state.set_value(self.state.output.results_search_query.clone(), window, cx);
+            });
+        }
+        let search_input = Input::new(&search_state)
+            .appearance(true)
+            .bordered(true)
+            .focus_bordered(true)
+            .w(px(220.0));
+        let view_entity = cx.entity();
+        let page_id = self
+            .state
+            .output
+            .result_pages
+            .get(self.state.output.result_page_index)
+            .map(|page| page.id);
+        let documents_for_buttons = self.current_result_documents();
+        let has_documents = documents_for_buttons.is_some();
+        let mut search_row = div()
+            .flex()
+            .items_center()
+            .justify_end()
+            .gap(spacing::xs())
+            .px(spacing::sm())
+            .py(spacing::xs());
+        if let Some(documents) = documents_for_buttons {
+            search_row = search_row
+                .child(
+                    Button::new("forge-expand-all")
+                        .ghost()
+                        .xsmall()
+                        .icon(Icon::new(IconName::ChevronDown).xsmall())
+                        .tooltip("Expand all")
+                        .on_click({
+                            let view_entity = view_entity.clone();
+                            let documents = documents.clone();
+                            move |_: &ClickEvent, _window: &mut Window, cx: &mut App| {
+                                let nodes = collect_all_expandable_nodes(&documents);
+                                view_entity.update(cx, |view, cx| {
+                                    if let Some(page) = view
+                                        .state
+                                        .output
+                                        .result_pages
+                                        .iter_mut()
+                                        .find(|page| Some(page.id) == page_id)
+                                    {
+                                        page.expanded_nodes = nodes;
+                                    }
+                                    cx.notify();
+                                });
+                            }
+                        }),
+                )
+                .child(
+                    Button::new("forge-collapse-all")
+                        .ghost()
+                        .xsmall()
+                        .icon(Icon::new(IconName::ChevronUp).xsmall())
+                        .tooltip("Collapse all")
+                        .on_click({
+                            let view_entity = view_entity.clone();
+                            move |_: &ClickEvent, _window: &mut Window, cx: &mut App| {
+                                view_entity.update(cx, |view, cx| {
+                                    if let Some(page) = view
+                                        .state
+                                        .output
+                                        .result_pages
+                                        .iter_mut()
+                                        .find(|page| Some(page.id) == page_id)
+                                    {
+                                        page.expanded_nodes.clear();
+                                    }
+                                    cx.notify();
+                                });
+                            }
+                        }),
+                );
+        }
+        search_row = search_row.child(search_input);
+        // The search box filters the tree only; the table view has its own column sort.
+        if has_documents && self.state.output.result_view_mode == ResultViewMode::Tree {
+            body = body.child(search_row);
         }
 
         if let Some(reason) = self.current_result_editability_reason(cx)
-            && !self.state.output.result_pages.is_empty()
+            && has_documents
         {
             body = body.child(
                 div()
@@ -275,19 +287,20 @@ impl ForgeView {
                             .flex_1()
                             .min_h(px(0.0))
                             .overflow_hidden()
-                            .child(Table::new(&table).bordered(false)),
+                            .child(DataTable::new(&table).stripe(true).bordered(false)),
                     );
                 }
                 return body;
             }
             let editable = self.current_result_is_editable(cx);
+            let page = &self.state.output.result_pages[self.state.output.result_page_index];
             let props = ResultViewProps {
                 documents,
-                expanded_nodes: Arc::new(self.state.output.result_expanded_nodes.clone()),
+                expanded_nodes: Arc::new(page.expanded_nodes.clone()),
                 search_query: self.state.output.results_search_query.clone(),
-                scroll_handle: self.state.output.result_scroll.clone(),
+                scroll_handle: page.scroll.clone(),
                 empty_state: ResultEmptyState::NoDocuments,
-                view_mode: self.state.output.result_view_mode,
+                view_mode: ResultViewMode::Tree,
                 editable,
                 inline_editor: self
                     .state
@@ -299,10 +312,15 @@ impl ForgeView {
             let view_entity = cx.entity();
             let on_toggle = Arc::new(move |node_id: String, cx: &mut App| {
                 view_entity.update(cx, |view, cx| {
-                    if view.state.output.result_expanded_nodes.contains(&node_id) {
-                        view.state.output.result_expanded_nodes.remove(&node_id);
-                    } else {
-                        view.state.output.result_expanded_nodes.insert(node_id.clone());
+                    if let Some(page) = view
+                        .state
+                        .output
+                        .result_pages
+                        .iter_mut()
+                        .find(|page| Some(page.id) == page_id)
+                        && !page.expanded_nodes.remove(&node_id)
+                    {
+                        page.expanded_nodes.insert(node_id);
                     }
                     cx.notify();
                 });
@@ -331,7 +349,7 @@ impl ForgeView {
                     .gap(spacing::sm())
                     .child(Spinner::new().small())
                     .child(
-                        div().text_sm().text_color(cx.theme().muted_foreground).child("Running..."),
+                        div().text_sm().text_color(cx.theme().muted_foreground).child("Running…"),
                     ),
             );
         } else {
@@ -360,45 +378,29 @@ impl ForgeView {
 }
 
 impl ForgeController {
-    fn update_result_signature(view: &mut ForgeView, docs: &[Document]) {
-        let documents: Vec<SessionDocument> = docs
-            .iter()
-            .cloned()
-            .enumerate()
-            .map(|(idx, doc)| SessionDocument { key: DocumentKey::from_document(&doc, idx), doc })
-            .collect();
-        let signature = results_signature(&documents);
-        if view.state.output.result_signature != Some(signature) {
-            view.state.output.result_signature = Some(signature);
-            view.state.output.result_expanded_nodes.clear();
-        }
-    }
-
-    pub fn clear_result_pages(view: &mut ForgeView, keep_pinned: bool) {
+    fn reset_result_workbench(view: &mut ForgeView) {
         view.state.output.result_inline_edit = None;
         view.state.output.result_inline_subscription = None;
         view.state.output.result_table_page_id = None;
         view.state.output.result_table_signature = None;
+    }
+
+    pub fn clear_result_pages(view: &mut ForgeView, keep_pinned: bool) {
+        Self::reset_result_workbench(view);
+        let selected = view
+            .state
+            .output
+            .result_pages
+            .get(view.state.output.result_page_index)
+            .map(|page| page.id);
         if keep_pinned {
             view.state.output.result_pages.retain(|page| page.pinned);
         } else {
             view.state.output.result_pages.clear();
         }
-
-        if view.state.output.result_pages.is_empty() {
-            view.state.output.result_page_index = 0;
-            Self::clear_results(view);
-        } else {
-            view.state.output.result_page_index = view
-                .state
-                .output
-                .result_page_index
-                .min(view.state.output.result_pages.len().saturating_sub(1));
-            let docs =
-                view.state.output.result_pages[view.state.output.result_page_index].docs.clone();
-            Self::update_result_signature(view, &docs);
-        }
-
+        view.state.output.result_page_index = selected
+            .and_then(|id| view.state.output.result_pages.iter().position(|page| page.id == id))
+            .unwrap_or(0);
         Self::sync_output_tab(view);
     }
 
@@ -408,76 +410,112 @@ impl ForgeController {
         docs: Vec<Document>,
         origin: ResultOrigin,
     ) {
+        Self::add_result_page(view, label, docs, None, origin);
+    }
+
+    pub fn push_printed_result_page(
+        view: &mut ForgeView,
+        run_id: u64,
+        label: String,
+        docs: Vec<Document>,
+        origin: ResultOrigin,
+    ) {
+        if let Some(page) = view
+            .state
+            .output
+            .result_pages
+            .iter_mut()
+            .find(|page| page.print_run == Some(run_id) && page.label == label)
+        {
+            let documents = Arc::make_mut(&mut page.documents);
+            let offset = documents.len();
+            documents.extend(docs.into_iter().enumerate().map(|(index, doc)| SessionDocument {
+                // Repeated print snapshots can share an _id but are distinct output rows.
+                key: DocumentKey::from_document(&Document::new(), offset + index),
+                doc,
+            }));
+            return;
+        }
+        Self::add_result_page(view, label, docs, Some(run_id), origin);
+    }
+
+    fn add_result_page(
+        view: &mut ForgeView,
+        label: String,
+        docs: Vec<Document>,
+        print_run: Option<u64>,
+        origin: ResultOrigin,
+    ) {
+        let has_evaluation = view
+            .state
+            .output
+            .result_pages
+            .iter()
+            .any(|page| page.print_run.is_none() && !page.pinned);
+        let documents = Arc::new(
+            docs.into_iter()
+                .enumerate()
+                .map(|(index, doc)| SessionDocument {
+                    key: if print_run.is_some() {
+                        DocumentKey::from_document(&Document::new(), index)
+                    } else {
+                        DocumentKey::from_document(&doc, index)
+                    },
+                    doc,
+                })
+                .collect(),
+        );
         view.state.output.result_pages.push(ResultPage {
-            id: uuid::Uuid::new_v4(),
+            id: Uuid::new_v4(),
             label,
-            docs: docs.clone(),
+            documents,
             pinned: false,
+            print_run,
+            expanded_nodes: Default::default(),
+            scroll: UniformListScrollHandle::new(),
             origin,
         });
-        view.state.output.result_page_index =
-            view.state.output.result_pages.len().saturating_sub(1);
-        Self::update_result_signature(view, &docs);
+        if view.state.output.auto_select_results && (print_run.is_none() || !has_evaluation) {
+            view.state.output.result_page_index = view.state.output.result_pages.len() - 1;
+        }
         view.state.output.last_result = None;
         Self::sync_output_tab(view);
     }
 
     pub fn select_result_page(view: &mut ForgeView, index: usize) {
-        if index >= view.state.output.result_pages.len() {
-            return;
+        if index < view.state.output.result_pages.len() {
+            view.state.output.result_page_index = index;
+            view.state.output.result_inline_edit = None;
+            view.state.output.result_inline_subscription = None;
         }
-        view.state.output.result_page_index = index;
-        view.state.output.result_inline_edit = None;
-        view.state.output.result_inline_subscription = None;
-        let docs = view.state.output.result_pages[index].docs.clone();
-        Self::update_result_signature(view, &docs);
-        view.state.output.result_scroll.scroll_to_item(0, ScrollStrategy::Top);
     }
 
     pub fn toggle_result_pinned(view: &mut ForgeView, index: usize) {
+        view.state.output.auto_select_results = false;
         if let Some(page) = view.state.output.result_pages.get_mut(index) {
             page.pinned = !page.pinned;
         }
     }
 
     pub fn close_result_page(view: &mut ForgeView, index: usize) {
+        view.state.output.auto_select_results = false;
         if index >= view.state.output.result_pages.len() {
             return;
         }
         let was_active = index == view.state.output.result_page_index;
         view.state.output.result_pages.remove(index);
-
+        if was_active {
+            Self::reset_result_workbench(view);
+        }
         if view.state.output.result_pages.is_empty() {
             view.state.output.result_page_index = 0;
-            Self::clear_results(view);
-            if view.state.output.last_result.is_some()
-                || view.state.output.last_error.is_some()
-                || view.state.runtime.mongosh_error.is_some()
-            {
-                view.state.output.output_tab = ForgeOutputTab::Results;
-            } else {
-                view.state.output.output_tab = ForgeOutputTab::Raw;
-            }
-        } else {
-            if was_active {
-                view.state.output.result_page_index =
-                    index.min(view.state.output.result_pages.len().saturating_sub(1));
-            } else if index < view.state.output.result_page_index {
-                view.state.output.result_page_index =
-                    view.state.output.result_page_index.saturating_sub(1);
-            }
-            let docs =
-                view.state.output.result_pages[view.state.output.result_page_index].docs.clone();
-            Self::update_result_signature(view, &docs);
+        } else if was_active {
+            view.state.output.result_page_index =
+                index.min(view.state.output.result_pages.len() - 1);
+        } else if index < view.state.output.result_page_index {
+            view.state.output.result_page_index -= 1;
         }
         Self::sync_output_tab(view);
-    }
-
-    pub fn clear_results(view: &mut ForgeView) {
-        view.state.output.result_signature = None;
-        view.state.output.result_expanded_nodes.clear();
-        view.state.output.result_table_page_id = None;
-        view.state.output.result_table_signature = None;
     }
 
     pub fn update_run_print_label(view: &mut ForgeView, run_id: u64, label: String) {
@@ -505,32 +543,23 @@ impl ForgeController {
             .filter(|label| !label.trim().is_empty())
     }
 
-    pub fn default_result_label(view: &ForgeView) -> String {
-        format!("Result {}", view.state.output.result_pages.len() + 1)
-    }
-
     pub fn has_results(view: &ForgeView) -> bool {
         !view.state.output.result_pages.is_empty()
             || view.state.output.last_result.is_some()
             || view.state.output.last_error.is_some()
+            || view.state.runtime.mongosh_error.is_some()
     }
 
     pub fn sync_output_tab(view: &mut ForgeView) {
-        if let Some(result) = &view.state.output.last_result
-            && classify_result(&serde_json::Value::String(result.clone())) == ResultKind::None
-        {
-            view.state.output.last_result = None;
-        }
-        // Only auto-switch for positive results (documents/text), not errors alone
-        let has_displayable_results =
+        let has_displayable =
             !view.state.output.result_pages.is_empty() || view.state.output.last_result.is_some();
-        if has_displayable_results {
-            if view.state.output.output_tab == ForgeOutputTab::Raw {
-                view.state.output.output_tab = ForgeOutputTab::Results;
-            }
+        if has_displayable
+            && !view.state.runtime.is_running
+            && view.state.output.auto_select_results
+        {
+            view.state.output.output_tab = ForgeOutputTab::Results;
         } else if !Self::has_results(view) {
             view.state.output.output_tab = ForgeOutputTab::Raw;
         }
-        // When only errors exist: leave tab where it is (don't force-switch either way)
     }
 }

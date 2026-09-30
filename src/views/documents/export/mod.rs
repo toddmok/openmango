@@ -8,7 +8,7 @@ pub use file_export::FileExportFormat;
 pub use formats::{render_csv_with_headers, render_to_clipboard, render_tsv_with_headers};
 pub use snapshot::{ExportScope, ViewExportSnapshot};
 
-use gpui_component::{Icon, IconName};
+use gpui_kit::component::{Icon, IconName};
 use serde::{Deserialize, Serialize};
 
 /// Clipboard copy format — persisted as global preference.
@@ -16,6 +16,9 @@ use serde::{Deserialize, Serialize};
 pub enum CopyFormat {
     #[default]
     Json,
+    /// Plain values with no type wrappers: what "normal JSON" means to everything that is
+    /// not MongoDB. One way only; ids and dates come back as strings.
+    PlainJson,
     JsonLines,
     Csv,
     Markdown,
@@ -25,7 +28,8 @@ pub enum CopyFormat {
 impl CopyFormat {
     pub fn label(&self) -> &'static str {
         match self {
-            Self::Json => "JSON",
+            Self::Json => "Extended JSON",
+            Self::PlainJson => "Plain JSON",
             Self::JsonLines => "JSONL",
             Self::Csv => "CSV",
             Self::Markdown => "Markdown",
@@ -35,7 +39,9 @@ impl CopyFormat {
 
     pub fn icon(&self) -> Icon {
         match self {
-            Self::Json | Self::JsonLines => Icon::new(IconName::Braces),
+            Self::Json | Self::PlainJson | Self::JsonLines => {
+                Icon::new(crate::assets::AppIcon::Braces)
+            }
             Self::Csv => Icon::new(IconName::File).path("icons/file-spreadsheet.svg"),
             Self::Markdown => Icon::new(IconName::File).path("icons/file-text.svg"),
             Self::Tsv => Icon::new(IconName::File).path("icons/table-2.svg"),
@@ -45,6 +51,7 @@ impl CopyFormat {
     pub fn all() -> &'static [CopyFormat] {
         &[
             CopyFormat::Json,
+            CopyFormat::PlainJson,
             CopyFormat::JsonLines,
             CopyFormat::Csv,
             CopyFormat::Markdown,
@@ -53,12 +60,13 @@ impl CopyFormat {
     }
 
     pub fn tree_formats() -> &'static [CopyFormat] {
-        &[CopyFormat::Json, CopyFormat::JsonLines]
+        &[CopyFormat::Json, CopyFormat::PlainJson, CopyFormat::JsonLines]
     }
 
     pub fn table_formats() -> &'static [CopyFormat] {
         &[
             CopyFormat::Json,
+            CopyFormat::PlainJson,
             CopyFormat::JsonLines,
             CopyFormat::Csv,
             CopyFormat::Markdown,

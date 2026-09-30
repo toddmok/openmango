@@ -1,4 +1,4 @@
-use gpui::{App, AppContext as _, Entity};
+use gpui_kit::{App, AppContext as _, Entity};
 use mongodb::bson::Document;
 
 use crate::state::{AppCommands, AppEvent, AppState, SessionKey};
@@ -10,7 +10,7 @@ impl AppCommands {
         documents: Vec<Document>,
         cx: &mut App,
     ) {
-        if !Self::ensure_writable(&state, Some(session_key.connection_id), cx) {
+        if !Self::ensure_collection_writable(&state, &session_key, cx) {
             return;
         }
         let count = documents.len();
@@ -26,9 +26,9 @@ impl AppCommands {
         cx.spawn({
             let state = state.clone();
             let session_key = session_key.clone();
-            async move |cx: &mut gpui::AsyncApp| {
+            async move |cx: &mut gpui_kit::AsyncApp| {
                 let result: Result<usize, crate::error::Error> = task.await;
-                let _ = cx.update(|cx| match result {
+                cx.update(|cx| match result {
                     Ok(inserted) => {
                         state.update(cx, |state, cx| {
                             let event = AppEvent::DocumentsInserted { count: inserted };
@@ -58,7 +58,7 @@ impl AppCommands {
         update: Document,
         cx: &mut App,
     ) {
-        if !Self::ensure_writable(&state, Some(session_key.connection_id), cx) {
+        if !Self::ensure_collection_writable(&state, &session_key, cx) {
             return;
         }
         let Some(client) = Self::client_for_session(&state, &session_key, cx) else {
@@ -73,10 +73,10 @@ impl AppCommands {
         cx.spawn({
             let state = state.clone();
             let session_key = session_key.clone();
-            async move |cx: &mut gpui::AsyncApp| {
+            async move |cx: &mut gpui_kit::AsyncApp| {
                 let result: Result<mongodb::results::UpdateResult, crate::error::Error> =
                     task.await;
-                let _ = cx.update(|cx| match result {
+                cx.update(|cx| match result {
                     Ok(result) => {
                         state.update(cx, |state, cx| {
                             state.clear_all_drafts(&session_key);
@@ -114,7 +114,7 @@ impl AppCommands {
         cancellation: crate::connection::types::CancellationToken,
         cx: &mut App,
     ) {
-        if !Self::ensure_writable(&state, Some(session_key.connection_id), cx) {
+        if !Self::ensure_collection_writable(&state, &session_key, cx) {
             return;
         }
         let Some(client) = Self::client_for_session(&state, &session_key, cx) else {
@@ -136,12 +136,12 @@ impl AppCommands {
         cx.spawn({
             let state = state.clone();
             let session_key = session_key.clone();
-            async move |cx: &mut gpui::AsyncApp| {
+            async move |cx: &mut gpui_kit::AsyncApp| {
                 let result: Result<
                     crate::connection::types::BulkReplaceResult,
                     crate::error::Error,
                 > = task.await;
-                let _ = cx.update(|cx| match result {
+                cx.update(|cx| match result {
                     Ok(result) => {
                         state.update(cx, |state, cx| {
                             state.clear_all_drafts(&session_key);
@@ -177,7 +177,7 @@ impl AppCommands {
         filter: Document,
         cx: &mut App,
     ) {
-        if !Self::ensure_writable(&state, Some(session_key.connection_id), cx) {
+        if !Self::ensure_collection_writable(&state, &session_key, cx) {
             return;
         }
         let Some(client) = Self::client_for_session(&state, &session_key, cx) else {
@@ -192,9 +192,9 @@ impl AppCommands {
         cx.spawn({
             let state = state.clone();
             let session_key = session_key.clone();
-            async move |cx: &mut gpui::AsyncApp| {
+            async move |cx: &mut gpui_kit::AsyncApp| {
                 let result: Result<u64, crate::error::Error> = task.await;
-                let _ = cx.update(|cx| match result {
+                cx.update(|cx| match result {
                     Ok(deleted) => {
                         state.update(cx, |state, cx| {
                             let event = AppEvent::DocumentsDeleted {

@@ -1,32 +1,41 @@
-use gpui::*;
+use gpui_kit::*;
 
+use crate::components::ConnectionIdentity;
 use crate::components::ConnectionManager as ConnectionManagerView;
-use crate::state::{AppEvent, AppState, StatusLevel, View};
+use crate::state::{AppEvent, AppState, View};
 use crate::views::{
     AgentActivityView, AiView, ChangelogView, CollectionView, DatabaseView, ForgeView,
-    SettingsView, TransferView,
+    ReferencesView, RelationsView, SettingsView, TransferView,
 };
 
 mod empty;
 mod shell;
 mod tabs;
 
-use empty::render_empty_state;
+#[cfg(test)]
+mod connection_manager_tests;
+
+use empty::{render_empty_state, render_welcome};
 use shell::render_shell;
-use tabs::{OpenTabsBar, TabsHost, render_tabs_host};
+pub(crate) use tabs::OpenTabsBar;
+use tabs::{TabsHost, render_tabs_host};
 
 /// Content area component that shows collection view or welcome screen
 pub struct ContentArea {
     state: Entity<AppState>,
-    tabs_bar: Entity<OpenTabsBar>,
     collection_view: Option<Entity<CollectionView>>,
     database_view: Option<Entity<DatabaseView>>,
     ai_view: Option<Entity<AiView>>,
     transfer_view: Option<Entity<TransferView>>,
     forge_view: Option<Entity<ForgeView>>,
+    compare_view: Option<Entity<crate::views::CompareView>>,
+    references_view: Option<Entity<ReferencesView>>,
+    relations_view: Option<Entity<RelationsView>>,
     agent_activity_view: Option<Entity<AgentActivityView>>,
+    tasks_view: Option<Entity<crate::views::TasksView>>,
     connection_manager_view: Option<Entity<ConnectionManagerView>>,
     connection_manager_request_generation: u64,
+    welcome_connecting: Option<uuid::Uuid>,
     settings_view: Option<Entity<SettingsView>>,
     changelog_view: Option<Entity<ChangelogView>>,
     last_inputs: ContentAreaInputs,
@@ -41,8 +50,11 @@ struct ContentAreaInputs {
     has_tabs: bool,
     current_view: View,
     connection_manager_request_generation: u64,
-    error_text: Option<String>,
+    recent_connections: Vec<ConnectionIdentity>,
 }
+
+/// How many saved connections the welcome screen offers.
+const WELCOME_RECENT_LIMIT: usize = 5;
 
 impl ContentAreaInputs {
     fn from_state(state: &AppState) -> Self {
@@ -53,9 +65,17 @@ impl ContentAreaInputs {
             has_tabs: !state.open_tabs().is_empty() || state.preview_tab().is_some(),
             current_view: state.current_view,
             connection_manager_request_generation: state.connection_manager_request().generation,
-            error_text: state.status_message().and_then(|message| {
-                if matches!(message.level, StatusLevel::Error) { Some(message.text) } else { None }
-            }),
+            recent_connections: if state.has_active_connections() {
+                Vec::new()
+            } else {
+                let mut connections = state.connections.iter().collect::<Vec<_>>();
+                connections.sort_by(|a, b| a.cmp_recent_use(b));
+                connections
+                    .into_iter()
+                    .take(WELCOME_RECENT_LIMIT)
+                    .map(ConnectionIdentity::from)
+                    .collect()
+            },
         }
     }
 }
@@ -86,6 +106,7 @@ impl ContentArea {
                     should_create_ai,
                     should_create_transfer,
                     should_create_forge,
+                    should_create_references,
                     should_create_agent_activity,
                     should_create_settings,
                     should_create_changelog,
@@ -101,6 +122,7 @@ impl ContentArea {
                         false,
                         matches!(state_ref.current_view, View::Transfer),
                         matches!(state_ref.current_view, View::Forge),
+                        matches!(state_ref.current_view, View::References),
                         matches!(state_ref.current_view, View::AgentActivity),
                         matches!(state_ref.current_view, View::Settings),
                         matches!(state_ref.current_view, View::Changelog),
@@ -123,6 +145,10 @@ impl ContentArea {
                 if should_create_forge && this.forge_view.is_none() {
                     this.forge_view = Some(cx.new(|cx| ForgeView::new(state.clone(), cx)));
                 }
+                if should_create_references && this.references_view.is_none() {
+                    this.references_view =
+                        Some(cx.new(|cx| ReferencesView::new(state.clone(), cx)));
+                }
                 if should_create_agent_activity && this.agent_activity_view.is_none() {
                     this.agent_activity_view =
                         Some(cx.new(|cx| AgentActivityView::new(state.clone(), cx)));
@@ -138,6 +164,25 @@ impl ContentArea {
                 cx.notify();
             }
             _ => {}
+        }));
+
+        // The welcome screen marks the connection it is opening.
+        subscriptions.push(cx.subscribe(&state, |this, _, event, cx| {
+            let next = match event {
+                AppEvent::Connecting(connection_id) => Some(*connection_id),
+                AppEvent::Connected(connection_id)
+                | AppEvent::Disconnected(connection_id)
+                | AppEvent::ConnectionFailed { connection_id, .. }
+                    if this.welcome_connecting == Some(*connection_id) =>
+                {
+                    None
+                }
+                _ => return,
+            };
+            if this.welcome_connecting != next {
+                this.welcome_connecting = next;
+                cx.notify();
+            }
         }));
 
         // Check if we should create collection view initially
@@ -171,6 +216,11 @@ impl ContentArea {
         } else {
             None
         };
+        let references_view = if matches!(state.read(cx).current_view, View::References) {
+            Some(cx.new(|cx| ReferencesView::new(state.clone(), cx)))
+        } else {
+            None
+        };
         let agent_activity_view = if matches!(state.read(cx).current_view, View::AgentActivity) {
             Some(cx.new(|cx| AgentActivityView::new(state.clone(), cx)))
         } else {
@@ -186,19 +236,21 @@ impl ContentArea {
         } else {
             None
         };
-        let tabs_bar = cx.new(|cx| OpenTabsBar::new(state.clone(), cx));
-
         Self {
             state,
-            tabs_bar,
             collection_view,
             database_view,
             ai_view,
             transfer_view,
             forge_view,
+            references_view,
+            relations_view: None,
+            compare_view: None,
             agent_activity_view,
+            tasks_view: None,
             connection_manager_view: None,
             connection_manager_request_generation: 0,
+            welcome_connecting: None,
             settings_view,
             changelog_view,
             last_inputs,
@@ -206,19 +258,16 @@ impl ContentArea {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn ensure_views(
-        &mut self,
-        should_collection: bool,
-        should_database: bool,
-        should_ai: bool,
-        should_transfer: bool,
-        should_forge: bool,
-        should_agent_activity: bool,
-        should_settings: bool,
-        should_changelog: bool,
-        cx: &mut Context<Self>,
-    ) {
+    fn ensure_views(&mut self, view: View, cx: &mut Context<Self>) {
+        let should_collection = view == View::Documents;
+        let should_database =
+            view == View::Database && self.state.read(cx).selected_database().is_some();
+        let should_ai = false;
+        let should_transfer = view == View::Transfer;
+        let should_forge = view == View::Forge;
+        let should_agent_activity = view == View::AgentActivity;
+        let should_settings = view == View::Settings;
+        let should_changelog = view == View::Changelog;
         if should_collection && self.collection_view.is_none() {
             self.collection_view = Some(cx.new(|cx| CollectionView::new(self.state.clone(), cx)));
         }
@@ -236,9 +285,27 @@ impl ContentArea {
         if should_forge && self.forge_view.is_none() {
             self.forge_view = Some(cx.new(|cx| ForgeView::new(self.state.clone(), cx)));
         }
+        if view == View::Compare && self.compare_view.is_none() {
+            self.compare_view =
+                Some(cx.new(|cx| crate::views::CompareView::new(self.state.clone(), cx)));
+        }
+        if matches!(self.state.read(cx).current_view, View::References)
+            && self.references_view.is_none()
+        {
+            self.references_view = Some(cx.new(|cx| ReferencesView::new(self.state.clone(), cx)));
+        }
+        if matches!(self.state.read(cx).current_view, View::Relations)
+            && self.relations_view.is_none()
+        {
+            self.relations_view = Some(cx.new(|cx| RelationsView::new(self.state.clone(), cx)));
+        }
         if should_agent_activity && self.agent_activity_view.is_none() {
             self.agent_activity_view =
                 Some(cx.new(|cx| AgentActivityView::new(self.state.clone(), cx)));
+        }
+        if view == View::Tasks && self.tasks_view.is_none() {
+            self.tasks_view =
+                Some(cx.new(|cx| crate::views::TasksView::new(self.state.clone(), cx)));
         }
         if should_settings && self.settings_view.is_none() {
             self.settings_view = Some(cx.new(|cx| SettingsView::new(self.state.clone(), cx)));
@@ -256,18 +323,23 @@ impl ContentArea {
             return;
         }
 
-        if let Some(view) = self.connection_manager_view.clone() {
-            view.update(cx, |view, cx| {
-                view.apply_open_request(request.selected_id, request.creating_new, window, cx);
-            });
+        let view = if let Some(view) = self.connection_manager_view.clone() {
+            view
         } else {
             let state = self.state.clone();
-            self.connection_manager_view = Some(cx.new(|cx| {
-                let mut view = ConnectionManagerView::new(state, None, window, cx);
-                view.apply_open_request(request.selected_id, request.creating_new, window, cx);
-                view
-            }));
-        }
+            let view = cx.new(|cx| ConnectionManagerView::new(state, None, window, cx));
+            self.connection_manager_view = Some(view.clone());
+            view
+        };
+        // Opening can read/update the manager or show a discard dialog. Its
+        // entity must be fully created and free of an existing update lease.
+        ConnectionManagerView::apply_open_request(
+            view,
+            request.selected_id,
+            request.creating_new,
+            window,
+            cx,
+        );
 
         self.connection_manager_request_generation = request.generation;
     }
@@ -277,6 +349,21 @@ impl ContentArea {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
+        if self.state.read(cx).current_view == View::Compare {
+            self.ensure_views(View::Compare, cx);
+            if let Some(view) = &self.compare_view {
+                view.update(cx, |view, cx| view.focus(window, cx));
+            }
+            return true;
+        }
+        if self.state.read(cx).current_view == View::Tasks {
+            self.ensure_views(View::Tasks, cx);
+            if let Some(view) = &self.tasks_view {
+                let handle = view.read(cx).focus_handle().clone();
+                window.focus(&handle, cx);
+            }
+            return true;
+        }
         let should_focus_collection = {
             let state_ref = self.state.read(cx);
             matches!(state_ref.current_view, View::Documents)
@@ -289,7 +376,7 @@ impl ContentArea {
                     Some(cx.new(|cx| CollectionView::new(self.state.clone(), cx)));
             }
             if let Some(view) = self.collection_view.clone() {
-                view.update(cx, |view, _cx| view.focus_documents(window));
+                view.update(cx, |view, cx| view.focus_documents(window, cx));
                 return true;
             }
         }
@@ -332,165 +419,98 @@ impl Render for ContentArea {
             has_tabs,
             current_view,
             connection_manager_request_generation: _,
-            error_text,
+            recent_connections,
         } = inputs;
 
-        let should_collection_view = matches!(current_view, View::Documents);
-        let should_database_view = matches!(current_view, View::Database) && selected_db.is_some();
-        let should_ai_view = false;
-        let should_transfer_view = matches!(current_view, View::Transfer);
-        let should_forge_view = matches!(current_view, View::Forge);
-        let should_agent_activity_view = matches!(current_view, View::AgentActivity);
         let should_connection_manager_view = matches!(current_view, View::Connections);
-        let should_settings_view = matches!(current_view, View::Settings);
-        let should_changelog_view = matches!(current_view, View::Changelog);
 
         if should_connection_manager_view {
             self.sync_connection_manager_view(window, cx);
         }
 
         if has_tabs {
-            self.ensure_views(
-                should_collection_view,
-                should_database_view,
-                should_ai_view,
-                should_transfer_view,
-                should_forge_view,
-                should_agent_activity_view,
-                should_settings_view,
-                should_changelog_view,
-                cx,
-            );
+            self.ensure_views(current_view, cx);
             let host = TabsHost {
-                state: self.state.clone(),
-                tabs_bar: self.tabs_bar.clone(),
                 current_view,
                 has_collection,
                 collection_view: self.collection_view.as_ref(),
                 database_view: self.database_view.as_ref(),
                 transfer_view: self.transfer_view.as_ref(),
                 forge_view: self.forge_view.as_ref(),
+                compare_view: self.compare_view.as_ref(),
+                references_view: self.references_view.as_ref(),
+                relations_view: self.relations_view.as_ref(),
                 agent_activity_view: self.agent_activity_view.as_ref(),
+                tasks_view: self.tasks_view.as_ref(),
                 connection_manager_view: self.connection_manager_view.as_ref(),
                 settings_view: self.settings_view.as_ref(),
                 changelog_view: self.changelog_view.as_ref(),
             };
             let content = render_tabs_host(host, cx);
-            return render_shell(error_text, self.state.clone(), content, false, cx);
+            return render_shell(self.state.clone(), content, false, cx);
         }
 
         if matches!(current_view, View::Settings) {
-            self.ensure_views(
-                false,
-                false,
-                false,
-                false,
-                false,
-                false,
-                should_settings_view,
-                false,
-                cx,
-            );
+            self.ensure_views(current_view, cx);
             if let Some(view) = &self.settings_view {
-                return render_shell(error_text, self.state.clone(), view.clone(), false, cx);
+                return render_shell(self.state.clone(), view.clone(), false, cx);
             }
         }
 
         if matches!(current_view, View::Changelog) {
-            self.ensure_views(
-                false,
-                false,
-                false,
-                false,
-                false,
-                false,
-                false,
-                should_changelog_view,
-                cx,
-            );
+            self.ensure_views(current_view, cx);
             if let Some(view) = &self.changelog_view {
-                return render_shell(error_text, self.state.clone(), view.clone(), false, cx);
+                return render_shell(self.state.clone(), view.clone(), false, cx);
             }
         }
 
         if matches!(current_view, View::Database) {
-            self.ensure_views(
-                false,
-                should_database_view,
-                false,
-                false,
-                false,
-                false,
-                false,
-                false,
-                cx,
-            );
+            self.ensure_views(current_view, cx);
             if let Some(view) = &self.database_view {
-                return render_shell(error_text, self.state.clone(), view.clone(), false, cx);
+                return render_shell(self.state.clone(), view.clone(), false, cx);
             }
         }
 
         if matches!(current_view, View::Transfer) {
-            self.ensure_views(
-                false,
-                false,
-                false,
-                should_transfer_view,
-                false,
-                false,
-                false,
-                false,
-                cx,
-            );
+            self.ensure_views(current_view, cx);
             if let Some(view) = &self.transfer_view {
-                return render_shell(error_text, self.state.clone(), view.clone(), false, cx);
+                return render_shell(self.state.clone(), view.clone(), false, cx);
             }
         }
 
         if matches!(current_view, View::Forge) {
-            self.ensure_views(
-                false,
-                false,
-                false,
-                false,
-                should_forge_view,
-                false,
-                false,
-                false,
-                cx,
-            );
+            self.ensure_views(current_view, cx);
             if let Some(view) = &self.forge_view {
-                return render_shell(error_text, self.state.clone(), view.clone(), false, cx);
+                return render_shell(self.state.clone(), view.clone(), false, cx);
             }
         }
 
         if has_collection {
-            self.ensure_views(
-                should_collection_view,
-                false,
-                false,
-                false,
-                false,
-                false,
-                false,
-                false,
-                cx,
-            );
+            self.ensure_views(current_view, cx);
             if let Some(view) = &self.collection_view {
-                return render_shell(error_text, self.state.clone(), view.clone(), false, cx);
+                return render_shell(self.state.clone(), view.clone(), false, cx);
             }
         }
 
-        let hint = if !has_connection {
-            "Add a connection to get started".to_string()
-        } else if selected_db.is_none() {
+        if !has_connection {
+            let welcome = render_welcome(
+                self.state.clone(),
+                recent_connections,
+                self.welcome_connecting,
+                window,
+                cx,
+            );
+            return render_shell(self.state.clone(), welcome, true, cx);
+        }
+
+        let hint = if selected_db.is_none() {
             "Select a database in the sidebar".to_string()
         } else {
             "Select a collection to view documents".to_string()
         };
 
         let empty = render_empty_state(hint, cx);
-        render_shell(error_text, self.state.clone(), empty, true, cx)
+        render_shell(self.state.clone(), empty, true, cx)
     }
 }
 

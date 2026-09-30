@@ -7,7 +7,7 @@ mod import;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 
-use gpui::{App, AppContext as _, Entity};
+use gpui_kit::{App, AppContext as _, Entity};
 use uuid::Uuid;
 
 use crate::connection::csv_utils::detect_problematic_fields;
@@ -100,7 +100,8 @@ pub(super) enum TransferProgressMessage {
     /// Transfer was cancelled after terminating an external BSON tool.
     Cancelled { termination_succeeded: bool },
     /// Transfer failed with error
-    Failed { error: String },
+    /// `transient`: trying again later can succeed, such as after a dropped connection.
+    Failed { error: String, transient: bool },
 }
 
 /// Simple progress messages for collection-level operations (not database-scope).
@@ -111,7 +112,7 @@ pub(super) enum CollectionProgressMessage {
     /// Operation completed with final count
     Completed(u64),
     /// Operation failed with the number of documents completed before failure.
-    Failed { error: String, processed: u64 },
+    Failed { error: String, processed: u64, transient: bool },
 }
 
 pub(super) fn transfer_message_matches_generation(
@@ -196,9 +197,9 @@ impl AppCommands {
 
         cx.spawn({
             let state = state.clone();
-            async move |cx: &mut gpui::AsyncApp| {
+            async move |cx: &mut gpui_kit::AsyncApp| {
                 let result = task.await;
-                let _ = cx.update(|cx| {
+                cx.update(|cx| {
                     state.update(cx, |state, cx| {
                         if let Some(tab) = state.transfer_tab_mut(transfer_id) {
                             tab.preview.loading = false;
@@ -247,6 +248,12 @@ impl AppCommands {
             let Some(tab) = state_ref.transfer_tab(transfer_id) else {
                 return;
             };
+            // Every start comes through here. The Run button is disabled while a transfer runs,
+            // but a second click can land before that frame is drawn, and with drop-before-import
+            // a second run is a second drop.
+            if tab.runtime.is_running {
+                return;
+            }
             (validate_transfer(tab), crate::state::resolved_export_destination(tab))
         };
 
@@ -265,7 +272,7 @@ impl AppCommands {
                 if let Some(tab) = state.transfer_tab_mut(transfer_id) {
                     tab.runtime.error_message = Some(message.to_string());
                 }
-                state.set_status_message(Some(StatusMessage::error(message)));
+                state.record_error(crate::error::ErrorReport::from_text(message));
                 cx.notify();
             });
             return;
@@ -281,7 +288,7 @@ impl AppCommands {
                 if let Some(tab) = state.transfer_tab_mut(transfer_id) {
                     tab.runtime.error_message = Some(message.clone());
                 }
-                state.set_status_message(Some(StatusMessage::error(message)));
+                state.record_error(crate::error::ErrorReport::from_text(&message));
                 cx.notify();
             });
             return;
@@ -358,6 +365,40 @@ impl AppCommands {
         }
     }
 
+    /// The client a transfer uses: a task run's own connection when it has one, otherwise the
+    /// sidebar's.
+    pub(super) fn transfer_client(
+        state: &Entity<AppState>,
+        transfer_id: Uuid,
+        connection_id: Uuid,
+        cx: &mut App,
+    ) -> Option<mongodb::Client> {
+        let own = state
+            .read(cx)
+            .transfer_tab(transfer_id)
+            .and_then(|tab| tab.runtime.clients.get(&connection_id))
+            .map(|own| own.client.clone());
+        own.or_else(|| Self::active_client(state, connection_id, cx))
+    }
+
+    /// The address the BSON tools use, over a task run's own connection when it has one.
+    pub(super) fn transfer_tool_uri(
+        state: &Entity<AppState>,
+        transfer_id: Uuid,
+        connection_id: Uuid,
+        cx: &mut App,
+    ) -> crate::error::Result<String> {
+        let app = state.read(cx);
+        let own = app
+            .transfer_tab(transfer_id)
+            .and_then(|tab| tab.runtime.clients.get(&connection_id))
+            .and_then(|own| own.tool_uri.clone());
+        match own {
+            Some(uri) => Ok(uri),
+            None => app.active_connection_tool_uri(connection_id),
+        }
+    }
+
     /// Cancel a running transfer operation.
     pub fn cancel_transfer(state: Entity<AppState>, transfer_id: Uuid, cx: &mut App) {
         state.update(cx, |state, cx| {
@@ -396,137 +437,6 @@ impl AppCommands {
     }
 
     // Legacy functions for backward compatibility
-
-    #[allow(dead_code)]
-    pub fn export_collection_json(
-        state: Entity<AppState>,
-        session_key: SessionKey,
-        format: JsonTransferFormat,
-        path: PathBuf,
-        cx: &mut App,
-    ) {
-        let Some(client) = Self::client_for_session(&state, &session_key, cx) else {
-            return;
-        };
-
-        let (database, collection) = (session_key.database.clone(), session_key.collection.clone());
-
-        let manager = state.read(cx).connection_manager();
-
-        state.update(cx, |state, cx| {
-            state.set_status_message(Some(StatusMessage::info("Exporting collection...")));
-            cx.notify();
-        });
-
-        let task =
-            cx.background_spawn({
-                let path = path.clone();
-                async move {
-                    manager.export_collection_json(&client, &database, &collection, format, &path)
-                }
-            });
-
-        cx.spawn({
-            let state = state.clone();
-            let session_key = session_key.clone();
-            async move |cx: &mut gpui::AsyncApp| {
-                let result: Result<u64, crate::error::Error> = task.await;
-                let _ = cx.update(|cx| match result {
-                    Ok(count) => {
-                        state.update(cx, |state, cx| {
-                            let message = format!(
-                                "Exported {} document{}",
-                                count,
-                                if count == 1 { "" } else { "s" }
-                            );
-                            state.set_status_message(Some(StatusMessage::info(message)));
-                            cx.emit(AppEvent::DocumentsLoaded {
-                                session: session_key.clone(),
-                                total: count,
-                            });
-                            cx.notify();
-                        });
-                    }
-                    Err(err) => {
-                        state.update(cx, |state, cx| {
-                            state.set_status_message(Some(StatusMessage::error(format!(
-                                "Export failed: {err}",
-                            ))));
-                            cx.notify();
-                        });
-                    }
-                });
-            }
-        })
-        .detach();
-    }
-
-    #[allow(dead_code)]
-    pub fn import_collection_json(
-        state: Entity<AppState>,
-        session_key: SessionKey,
-        format: JsonTransferFormat,
-        path: PathBuf,
-        cx: &mut App,
-    ) {
-        if !Self::ensure_writable(&state, Some(session_key.connection_id), cx) {
-            return;
-        }
-        let Some(client) = Self::client_for_session(&state, &session_key, cx) else {
-            return;
-        };
-
-        let (database, collection) = (session_key.database.clone(), session_key.collection.clone());
-
-        let manager = state.read(cx).connection_manager();
-
-        state.update(cx, |state, cx| {
-            state.set_status_message(Some(StatusMessage::info("Importing collection...")));
-            cx.notify();
-        });
-
-        let task = cx.background_spawn({
-            let path = path.clone();
-            async move {
-                manager.import_collection_json(&client, &database, &collection, format, &path, 1000)
-            }
-        });
-
-        cx.spawn({
-            let state = state.clone();
-            let session_key = session_key.clone();
-            async move |cx: &mut gpui::AsyncApp| {
-                let result: Result<u64, crate::error::Error> = task.await;
-                let _ = cx.update(|cx| match result {
-                    Ok(count) => {
-                        state.update(cx, |state, cx| {
-                            let message = format!(
-                                "Imported {} document{}",
-                                count,
-                                if count == 1 { "" } else { "s" }
-                            );
-                            state.set_status_message(Some(StatusMessage::info(message)));
-                            cx.notify();
-                        });
-                        AppCommands::load_documents_for_session(
-                            state.clone(),
-                            session_key.clone(),
-                            cx,
-                        );
-                    }
-                    Err(err) => {
-                        state.update(cx, |state, cx| {
-                            state.set_status_message(Some(StatusMessage::error(format!(
-                                "Import failed: {err}",
-                            ))));
-                            cx.notify();
-                        });
-                    }
-                });
-            }
-        })
-        .detach();
-    }
 }
 
 /// Detect transfer format from file path extension.
@@ -550,7 +460,58 @@ pub(super) fn detect_format_from_path(path: &str) -> Option<TransferFormat> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
+
+    use gpui_kit::{AppContext as _, TestAppContext};
+
     use super::transfer_message_matches_generation;
+    use crate::state::{AppCommands, AppState, ConfigManager, TabKey};
+
+    /// A second Run that lands before the button is drawn disabled must not start a second
+    /// transfer: with drop-before-import that would be a second drop.
+    #[gpui_kit::test]
+    fn a_running_transfer_cannot_be_started_again(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let state = cx.new(|_| {
+            AppState::with_config(
+                Arc::new(crate::connection::ConnectionManager::new()),
+                ConfigManager::with_config_dir(dir.path().into()),
+            )
+        });
+        let transfer_id = state.update(cx, |state, cx| {
+            state.open_transfer_tab(cx);
+            let id = state
+                .open_tabs()
+                .iter()
+                .find_map(|tab| match tab {
+                    TabKey::Transfer(key) => Some(key.id),
+                    _ => None,
+                })
+                .expect("a transfer tab");
+            state.transfer_tab_mut(id).unwrap().runtime.is_running = true;
+            id
+        });
+        // What a start would touch: the generation, and, since this bare tab is not runnable,
+        // the validation error it would report.
+        let observed = |cx: &mut TestAppContext| {
+            state.read_with(cx, |state, _| {
+                let runtime = &state.transfer_tab(transfer_id).unwrap().runtime;
+                (
+                    runtime.transfer_generation.load(Ordering::SeqCst),
+                    runtime.has_started,
+                    runtime.error_message.clone(),
+                )
+            })
+        };
+        let before = observed(cx);
+        assert_eq!(before.2, None);
+
+        cx.update(|cx| AppCommands::execute_transfer(state.clone(), transfer_id, cx));
+        cx.run_until_parked();
+
+        assert_eq!(observed(cx), before, "a running transfer was started again");
+    }
 
     #[test]
     fn stale_completion_is_rejected_after_cancellation_or_restart() {

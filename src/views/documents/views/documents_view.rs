@@ -1,9 +1,13 @@
-use gpui::*;
-use gpui_component::ActiveTheme as _;
-use gpui_component::input::Input;
-use gpui_component::spinner::Spinner;
-use gpui_component::tree::tree;
-use gpui_component::{Icon, IconName, Sizable as _};
+use gpui_kit::base::Tree;
+use gpui_kit::component::ActiveTheme as _;
+use gpui_kit::component::Disableable as _;
+use gpui_kit::component::button::ButtonVariants as _;
+use gpui_kit::component::input::Input;
+use gpui_kit::component::scroll::ScrollableElement as _;
+use gpui_kit::component::spinner::Spinner;
+use gpui_kit::component::{Icon, IconName, Sizable as _};
+use gpui_kit::prelude::FluentBuilder as _;
+use gpui_kit::*;
 
 use crate::bson::DocumentKey;
 use crate::components::Button;
@@ -36,6 +40,32 @@ impl CollectionView {
             .as_ref()
             .map(|sk| self.state.read(cx).session_view_mode(sk))
             .unwrap_or_default();
+        if view_mode == DocumentViewMode::Json
+            && let Some(key) = session_key.as_ref()
+        {
+            let content = self.render_json_document(key, window, cx);
+            return div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_h(px(0.0))
+                .min_w(px(0.0))
+                .child(content)
+                .child(Self::render_pagination(
+                    display_page,
+                    total_pages,
+                    per_page,
+                    range_start,
+                    range_end,
+                    total,
+                    is_loading,
+                    session_key,
+                    self.state.clone(),
+                    cx.entity(),
+                    cx,
+                ))
+                .into_any_element();
+        }
         if view_mode == DocumentViewMode::Table {
             return self.render_table_subview(
                 total,
@@ -69,9 +99,12 @@ impl CollectionView {
         let editing_node_id = self.view_model.editing_node_id();
         let tree_state = self.view_model.tree_state();
         let inline_state = self.view_model.inline_state();
+        let inline_error = self.view_model.inline_edit_error(cx);
+        let tree_scroll = tree_state.read(cx).scroll_handle().clone();
         let deselect_state = self.state.clone();
         let deselect_session = session_key.clone();
         let deselect_tree = self.view_model.tree_state();
+        let deselect_view = view.clone();
         let documents_view = div()
             .flex()
             .flex_1()
@@ -80,6 +113,7 @@ impl CollectionView {
             .overflow_hidden()
             .track_focus(&self.documents_focus)
             .on_mouse_down(MouseButton::Left, move |_event, _window, cx| {
+                if !deselect_view.update(cx, |this, cx| this.finish_document_edit(cx)) { return; }
                 let Some(sk) = deselect_session.clone() else {
                     return;
                 };
@@ -157,7 +191,7 @@ impl CollectionView {
                                             .child(
                                                 Button::new("expand-all")
                                                     .ghost()
-                                                    .compact()
+                                                    .xsmall()
                                                     .icon(Icon::new(IconName::ChevronDown).xsmall())
                                                     .tooltip("Expand all")
                                                     .on_click({
@@ -210,7 +244,7 @@ impl CollectionView {
                                             .child(
                                                 Button::new("collapse-all")
                                                     .ghost()
-                                                    .compact()
+                                                    .xsmall()
                                                     .icon(Icon::new(IconName::ChevronUp).xsmall())
                                                     .tooltip("Collapse all")
                                                     .on_click({
@@ -295,7 +329,7 @@ impl CollectionView {
                             ))
                             .child(search_toggle_button(
                                 "search-word",
-                                Icon::new(IconName::WholeWord).xsmall(),
+                                Icon::new(crate::assets::AppIcon::WholeWord).xsmall(),
                                 word_active,
                                 "Whole Word",
                                 active_bg,
@@ -313,7 +347,7 @@ impl CollectionView {
                             ))
                             .child(search_toggle_button(
                                 "search-regex",
-                                Icon::new(IconName::Regex).xsmall(),
+                                Icon::new(crate::assets::AppIcon::Regex).xsmall(),
                                 regex_active,
                                 "Regex",
                                 active_bg,
@@ -331,7 +365,7 @@ impl CollectionView {
                             ))
                             .child(search_toggle_button(
                                 "search-values",
-                                Icon::new(IconName::Braces).xsmall(),
+                                Icon::new(crate::assets::AppIcon::Braces).xsmall(),
                                 values_active,
                                 "Values Only",
                                 active_bg,
@@ -350,7 +384,7 @@ impl CollectionView {
                             .child(
                                 Button::new("search-prev")
                                     .ghost()
-                                    .compact()
+                                    .xsmall()
                                     .icon(Icon::new(IconName::ChevronLeft).xsmall())
                                     .tooltip("Previous match")
                                     .disabled(match_total == 0)
@@ -367,7 +401,7 @@ impl CollectionView {
                             .child(
                                 Button::new("search-next")
                                     .ghost()
-                                    .compact()
+                                    .xsmall()
                                     .icon(Icon::new(IconName::ChevronRight).xsmall())
                                     .tooltip("Next match")
                                     .disabled(match_total == 0)
@@ -390,7 +424,7 @@ impl CollectionView {
                             .child(
                                 Button::new("search-close")
                                     .ghost()
-                                    .compact()
+                                    .xsmall()
                                     .icon(Icon::new(IconName::Close).xsmall())
                                     .tooltip("Close search")
                                     .on_click({
@@ -413,7 +447,7 @@ impl CollectionView {
                             .min_w(px(0.0))
                             .min_h(px(0.0))
                             .overflow_hidden()
-                            .child(if is_loading {
+                            .child(if is_loading && document_count == 0 {
                                 div()
                                     .flex()
                                     .flex_1()
@@ -425,7 +459,7 @@ impl CollectionView {
                                         div()
                                             .text_sm()
                                             .text_color(cx.theme().muted_foreground)
-                                            .child("Loading documents..."),
+                                            .child("Loading documents…"),
                                     )
                                     .into_any_element()
                             } else if document_count == 0 {
@@ -438,15 +472,20 @@ impl CollectionView {
                                         div()
                                             .text_sm()
                                             .text_color(cx.theme().muted_foreground)
-                                            .child("No documents found"),
+                                            .child(session_key.as_ref().and_then(|key| self.state.read(cx).session_data(key))
+                                                .map(|data| super::super::query::document_empty_message(data.loaded, data.query_error.is_some(), data.filter.is_some()))
+                                                .unwrap_or("No results yet")),
                                     )
                                     .into_any_element()
                             } else {
-                                tree(&tree_state, {
+                                // Kit's styled Tree always reapplies selection. Compose its base
+                                // tree with Kit ListItems so editing can use just the input frame.
+                                div().id("document-tree").relative().size_full().child(Tree::new(&tree_state).item({
                                     let view = view.clone();
                                     let node_meta = node_meta.clone();
                                     let editing_node_id = editing_node_id.clone();
                                     let inline_state = inline_state.clone();
+                                    let inline_error = inline_error.clone();
                                     let tree_state = tree_state.clone();
                                     let state_clone = self.state.clone();
                                     let session_key = session_key.clone();
@@ -461,14 +500,15 @@ impl CollectionView {
                                     let current_match_id = current_match_id.clone();
                                     let documents_focus = self.documents_focus.clone();
 
-                                    move |ix, entry, selected, _window, cx| {
+                                    move |ix, entry, entry_state, _window, cx| {
                                         render_tree_row(
                                             ix,
                                             entry,
-                                            selected,
+                                            entry_state.is_selected(),
                                             &node_meta,
                                             &editing_node_id,
                                             &inline_state,
+                                            inline_error.as_deref(),
                                             view.clone(),
                                             tree_state.clone(),
                                             state_clone.clone(),
@@ -480,9 +520,10 @@ impl CollectionView {
                                             drag_enabled,
                                             documents_focus.clone(),
                                             cx,
-                                        )
+                                        ).into_any_element()
                                     }
-                                })
+                                }).list_style(StyleRefinement::default().flex_grow_1().size_full()).size_full())
+                                .vertical_scrollbar(&tree_scroll)
                                 .into_any_element()
                             }),
                     ),
@@ -496,6 +537,12 @@ impl CollectionView {
             .min_w(px(0.0))
             .min_h(px(0.0))
             .child(documents_view)
+            .when(editing_node_id.is_some(), |panel| panel.child(
+                div().px(spacing::lg()).py(spacing::xs()).text_xs()
+                    .text_color(if inline_error.is_some() { cx.theme().danger } else { cx.theme().muted_foreground })
+                    .child(inline_error.map(|error| format!("Invalid value: {error}. Escape cancels this edit."))
+                        .unwrap_or_else(|| "Enter to keep change · Escape to cancel · Save the document to write".into()))
+            ))
             .child(Self::render_pagination(
                 display_page,
                 total_pages,
@@ -527,9 +574,9 @@ fn search_toggle_button(
 ) -> Button {
     let icon = if active { icon.text_color(active_fg) } else { icon.text_color(inactive_fg) };
     let mut btn =
-        Button::new(id).compact().icon(icon).tooltip(tooltip_text).on_click(on_click).ghost();
+        Button::new(id).xsmall().icon(icon).tooltip(tooltip_text).on_click(on_click).ghost();
     if active {
-        btn = btn.active_style(active_bg);
+        btn = btn.bg(active_bg);
     }
     btn
 }

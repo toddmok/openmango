@@ -1,8 +1,8 @@
 use std::rc::Rc;
 use std::sync::Arc;
 
-use gpui::UniformListScrollHandle;
-use gpui_component::input::InputState;
+use gpui_kit::UniformListScrollHandle;
+use gpui_kit::component::input::InputState;
 
 use crate::bson::PathSegment;
 use crate::state::SessionDocument;
@@ -14,7 +14,6 @@ pub enum ResultViewMode {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[allow(dead_code)]
 pub enum ResultEmptyState {
     NoDocuments,
     NoMatches,
@@ -22,7 +21,6 @@ pub enum ResultEmptyState {
 }
 
 #[derive(Clone)]
-#[allow(dead_code)]
 pub struct ResultViewProps {
     pub documents: Arc<Vec<SessionDocument>>,
     pub expanded_nodes: Arc<std::collections::HashSet<String>>,
@@ -34,14 +32,15 @@ pub struct ResultViewProps {
     pub inline_editor: Option<ResultInlineEditorView>,
 }
 
-pub type ToggleNodeCallback = Arc<dyn Fn(String, &mut gpui::App) + Send + Sync>;
-pub type EditValueCallback = Rc<dyn Fn(usize, Vec<PathSegment>, &mut gpui::Window, &mut gpui::App)>;
+pub type ToggleNodeCallback = Arc<dyn Fn(String, &mut gpui_kit::App) + Send + Sync>;
+pub type EditValueCallback =
+    Rc<dyn Fn(usize, Vec<PathSegment>, &mut gpui_kit::Window, &mut gpui_kit::App)>;
 pub type ToggleBoolCallback =
-    Rc<dyn Fn(usize, Vec<PathSegment>, bool, &mut gpui::Window, &mut gpui::App)>;
+    Rc<dyn Fn(usize, Vec<PathSegment>, bool, &mut gpui_kit::Window, &mut gpui_kit::App)>;
 
 #[derive(Clone)]
 pub struct ResultInlineEditorView {
     pub doc_index: usize,
     pub path: Vec<PathSegment>,
-    pub input: gpui::Entity<InputState>,
+    pub input: gpui_kit::Entity<InputState>,
 }

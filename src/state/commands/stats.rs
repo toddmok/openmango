@@ -1,4 +1,4 @@
-use gpui::{App, AppContext as _, Entity};
+use gpui_kit::{App, AppContext as _, Entity};
 use mongodb::bson::Document;
 
 use crate::state::{AppState, CollectionStats, SessionKey, StatusMessage};
@@ -8,6 +8,10 @@ use super::AppCommands;
 impl AppCommands {
     /// Load collection stats for a session.
     pub fn load_collection_stats(state: Entity<AppState>, session_key: SessionKey, cx: &mut App) {
+        // A view has no storage or indexes of its own, and the server refuses to report either.
+        if state.read(cx).view_source(&session_key).is_some() {
+            return;
+        }
         let Some(client) = Self::client_for_session(&state, &session_key, cx) else {
             return;
         };
@@ -30,9 +34,9 @@ impl AppCommands {
 
         cx.spawn({
             let state = state.clone();
-            async move |cx: &mut gpui::AsyncApp| {
+            async move |cx: &mut gpui_kit::AsyncApp| {
                 let result: Result<Document, crate::error::Error> = task.await;
-                let _ = cx.update(|cx| match result {
+                cx.update(|cx| match result {
                     Ok(stats_doc) => {
                         let stats = CollectionStats::from_document(&stats_doc);
                         state.update(cx, |state, cx| {
@@ -50,9 +54,11 @@ impl AppCommands {
                                 session.data.stats_loading = false;
                                 session.data.stats_error = Some(e.to_string());
                             }
-                            state.set_status_message(Some(StatusMessage::error(format!(
-                                "Stats failed: {e}"
-                            ))));
+                            // The stats panel shows this error.
+                            state.record_error(crate::error::ErrorReport::from_error(
+                                "Couldn't load stats",
+                                &e,
+                            ));
                             cx.notify();
                         });
                     }

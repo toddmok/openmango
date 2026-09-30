@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use gpui::{Bounds, WindowBounds, point, px, size};
+use gpui_kit::{Bounds, WindowBounds, point, px, size};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -16,6 +16,7 @@ pub enum WorkspaceTabKind {
     Ai,
     Transfer,
     Forge,
+    Compare,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -33,15 +34,16 @@ pub struct WorkspaceState {
     /// Draft input text in the AI panel.
     #[serde(default)]
     pub ai_draft_input: String,
-    /// Persisted AI chat entries.
+    /// Names the conversation in the assistant's store. What was said lives there, encrypted;
+    /// this file is plain text on disk and holds no part of it.
     #[serde(default)]
-    pub ai_entries: Vec<AiChatEntry>,
+    pub ai_conversation_id: Option<Uuid>,
     /// Persisted width of AI side panel (px), restored on reopen/restart.
     #[serde(default)]
     pub ai_panel_width: Option<f32>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct WorkspaceTab {
     pub database: String,
     pub collection: String,
@@ -49,6 +51,8 @@ pub struct WorkspaceTab {
     pub kind: WorkspaceTabKind,
     #[serde(default)]
     pub transfer: Option<TransferTabState>,
+    #[serde(default)]
+    pub compare: Option<crate::state::compare::CompareConfig>,
     #[serde(default)]
     pub filter_raw: String,
     #[serde(default)]
@@ -69,12 +73,6 @@ pub struct WorkspaceTab {
     pub ai_panel_open: bool,
     #[serde(default)]
     pub ai_draft_input: String,
-    /// Unified timeline entries.
-    #[serde(default)]
-    pub ai_entries: Vec<AiChatEntry>,
-    /// Legacy: kept for backwards-compatible deserialization of old workspaces.
-    #[serde(default)]
-    pub ai_messages: Vec<ChatMessage>,
     #[serde(default)]
     pub table_column_widths: HashMap<String, f32>,
     #[serde(default)]
@@ -83,21 +81,6 @@ pub struct WorkspaceTab {
     pub table_pinned_columns: HashSet<String>,
     #[serde(default)]
     pub table_hidden_columns: HashSet<String>,
-}
-
-impl WorkspaceTab {
-    /// Returns the unified timeline entries, migrating from legacy fields if needed.
-    pub fn resolved_ai_entries(&self) -> Vec<AiChatEntry> {
-        if !self.ai_entries.is_empty() {
-            return self.ai_entries.clone();
-        }
-        // Legacy: convert old separate messages.
-        let mut result = Vec::new();
-        for msg in &self.ai_messages {
-            result.push(AiChatEntry::LegacyMessage(msg.clone()));
-        }
-        result
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -197,8 +180,6 @@ mod tests {
         assert!(tab.forge_content.is_empty());
         assert!(!tab.ai_panel_open);
         assert!(tab.ai_draft_input.is_empty());
-        assert!(tab.ai_entries.is_empty());
-        assert!(tab.ai_messages.is_empty());
     }
 
     #[test]
@@ -208,6 +189,7 @@ mod tests {
             collection: String::new(),
             kind: WorkspaceTabKind::Forge,
             transfer: None,
+            compare: None,
             filter_raw: String::new(),
             filter_compiled_raw: String::new(),
             sort_raw: String::new(),
@@ -218,8 +200,6 @@ mod tests {
             forge_content: "db.getCollection(\"users\").find({})".to_string(),
             ai_panel_open: false,
             ai_draft_input: String::new(),
-            ai_entries: Vec::new(),
-            ai_messages: Vec::new(),
             table_column_widths: HashMap::new(),
             table_column_order: Vec::new(),
             table_pinned_columns: HashSet::new(),

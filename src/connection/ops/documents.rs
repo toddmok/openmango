@@ -92,7 +92,7 @@ pub async fn find_documents_page_async(
     };
 
     let total = tokio::select! {
-        _ = cancelled() => return Err(crate::error::Error::Parse("Query cancelled".to_string())),
+        _ = cancelled() => return Err(crate::error::Error::Cancelled("Query cancelled".to_string())),
         result = coll.count_documents(filter.clone()).max_time(max_time) => result?,
     };
     let options = mongodb::options::FindOptions::builder()
@@ -103,11 +103,11 @@ pub async fn find_documents_page_async(
         .max_time(max_time)
         .build();
     let cursor = tokio::select! {
-        _ = cancelled() => return Err(crate::error::Error::Parse("Query cancelled".to_string())),
+        _ = cancelled() => return Err(crate::error::Error::Cancelled("Query cancelled".to_string())),
         result = coll.find(filter).with_options(options) => result?,
     };
     let documents = tokio::select! {
-        _ = cancelled() => return Err(crate::error::Error::Parse("Query cancelled".to_string())),
+        _ = cancelled() => return Err(crate::error::Error::Cancelled("Query cancelled".to_string())),
         result = cursor.try_collect() => result?,
     };
     Ok((documents, total))
@@ -150,8 +150,9 @@ pub async fn replace_document_if_current_async(
     if result.matched_count == 1 {
         Ok(())
     } else {
-        Err(crate::error::Error::Parse(
-            "Document changed on the server; reload before saving.".to_string(),
+        Err(crate::error::Error::Conflict(
+            "The document changed on the server since you opened it. Reload it, then save again."
+                .to_string(),
         ))
     }
 }
@@ -447,33 +448,6 @@ impl ConnectionManager {
             expected,
             replacement,
         ))
-    }
-
-    /// Return whether an exact-current-state replacement matched its document.
-    pub fn replace_document_if_current_matches(
-        &self,
-        client: &Client,
-        database: &str,
-        collection: &str,
-        id: &mongodb::bson::Bson,
-        expected: &Document,
-        replacement: Document,
-    ) -> Result<bool> {
-        let client = client.clone();
-        let database = database.to_string();
-        let collection = collection.to_string();
-        let id = id.clone();
-        let expected = expected.clone();
-        let filter = doc! {
-            "_id": id,
-            "$expr": { "$eq": ["$$ROOT", { "$literal": expected }] },
-        };
-
-        self.runtime.block_on(async {
-            let coll = client.database(&database).collection::<Document>(&collection);
-            let result = coll.replace_one(filter, replacement).await?;
-            Ok(result.matched_count == 1)
-        })
     }
 
     /// Find a single document by _id (runs in Tokio runtime)

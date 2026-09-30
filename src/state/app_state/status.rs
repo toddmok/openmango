@@ -1,6 +1,8 @@
 //! Status message updates derived from events.
 
+use crate::error::{ErrorKind, ErrorReport};
 use crate::state::StatusMessage;
+use crate::state::app_state::ErrorAction;
 use crate::state::app_state::{
     CollectionProgress, CollectionTransferStatus, DatabaseTransferProgress,
 };
@@ -11,19 +13,30 @@ use super::AppState;
 impl AppState {
     pub(crate) fn update_status_from_event(&mut self, event: &AppEvent) {
         match event {
-            AppEvent::Connecting(_) => {
-                self.set_status_message(Some(StatusMessage::info("Connecting...")));
+            AppEvent::Connecting(connection_id) => {
+                self.set_connection_failure(*connection_id, None);
+                self.set_status_message(Some(StatusMessage::info("Connecting…")));
             }
-            AppEvent::Connected(_) => {
+            AppEvent::Connected(connection_id) => {
+                self.set_connection_failure(*connection_id, None);
                 self.set_status_message(Some(StatusMessage::info("Connected")));
             }
             AppEvent::Disconnected(_) => {
                 self.set_status_message(Some(StatusMessage::info("Disconnected")));
             }
-            AppEvent::ConnectionFailed(error) => {
-                self.set_status_message(Some(StatusMessage::error(format!(
-                    "Connection failed: {error}"
-                ))));
+            AppEvent::ConnectionFailed { connection_id, error } => {
+                let name = self
+                    .connections
+                    .iter()
+                    .find(|connection| connection.id == *connection_id)
+                    .map(|connection| connection.name.clone());
+                let title = match name {
+                    Some(name) => format!("Couldn't connect to {name}"),
+                    None => "Couldn't connect".to_string(),
+                };
+                let report = ErrorReport::from_message(title, error).kind(ErrorKind::Connection);
+                self.set_connection_failure(*connection_id, Some(report.message.clone()));
+                self.report_error_with_action(report, ErrorAction::Reconnect(*connection_id));
             }
             AppEvent::ConnectionUpdated => {
                 self.set_status_message(Some(StatusMessage::info("Connection updated")));
@@ -44,27 +57,28 @@ impl AppState {
                 ))));
             }
             AppEvent::CollectionsFailed(error) => {
-                self.set_status_message(Some(StatusMessage::error(format!(
-                    "Collections failed: {error}"
-                ))));
+                self.report_error(ErrorReport::from_message("Couldn't load collections", error));
             }
-            AppEvent::DocumentsLoaded { total, .. } => {
-                self.set_status_message(Some(StatusMessage::info(format!(
-                    "Loaded {total} documents"
+            AppEvent::DocumentsLoaded { shown, total, elapsed, .. } => {
+                self.set_status_message(Some(StatusMessage::info(documents_loaded_message(
+                    *shown, *total, *elapsed,
                 ))));
             }
             AppEvent::DocumentsLoadFailed { error, .. } => {
-                self.set_status_message(Some(StatusMessage::error(format!(
-                    "Query failed: {error}"
-                ))));
+                // The query panel shows this error.
+                self.record_error(ErrorReport::from_message("Couldn't run the query", error));
             }
             AppEvent::DocumentInserted { .. } => {
                 self.set_status_message(Some(StatusMessage::info("Document inserted")));
             }
-            AppEvent::DocumentInsertFailed { error, .. } => {
-                self.set_status_message(Some(StatusMessage::error(format!(
-                    "Insert failed: {error}"
-                ))));
+            AppEvent::DocumentInsertFailed { error, editor, .. } => {
+                let report = ErrorReport::from_message("Couldn't insert the document", error);
+                // A JSON editor window shows its own save and insert errors.
+                if editor.is_some() {
+                    self.record_error(report);
+                } else {
+                    self.report_error(report);
+                }
             }
             AppEvent::DocumentSaved { .. } => {
                 self.set_status_message(Some(StatusMessage::info("Document saved")));
@@ -76,23 +90,25 @@ impl AppState {
                 ))));
             }
             AppEvent::DocumentsInsertFailed { count, error } => {
-                self.set_status_message(Some(StatusMessage::error(format!(
-                    "Failed to insert {} document(s): {}",
-                    count, error
-                ))));
+                let title = format!(
+                    "Couldn't insert {count} {}",
+                    if *count == 1 { "document" } else { "documents" }
+                );
+                self.report_error(ErrorReport::from_message(title, error));
             }
-            AppEvent::DocumentSaveFailed { error, .. } => {
-                self.set_status_message(Some(StatusMessage::error(format!(
-                    "Save failed: {error}"
-                ))));
+            AppEvent::DocumentSaveFailed { error, editor, .. } => {
+                let report = ErrorReport::from_message("Couldn't save the document", error);
+                if editor.is_some() {
+                    self.record_error(report);
+                } else {
+                    self.report_error(report);
+                }
             }
             AppEvent::DocumentDeleted { .. } => {
                 self.set_status_message(Some(StatusMessage::info("Document deleted")));
             }
             AppEvent::DocumentDeleteFailed { error, .. } => {
-                self.set_status_message(Some(StatusMessage::error(format!(
-                    "Delete failed: {error}"
-                ))));
+                self.report_error(ErrorReport::from_message("Couldn't delete the document", error));
             }
             AppEvent::IndexesLoaded { count, .. } => {
                 self.set_status_message(Some(StatusMessage::info(format!(
@@ -100,17 +116,14 @@ impl AppState {
                 ))));
             }
             AppEvent::IndexesLoadFailed { error, .. } => {
-                self.set_status_message(Some(StatusMessage::error(format!(
-                    "Indexes failed: {error}"
-                ))));
+                // The Indexes view shows this error.
+                self.record_error(ErrorReport::from_message("Couldn't load indexes", error));
             }
             AppEvent::IndexDropped { name, .. } => {
                 self.set_status_message(Some(StatusMessage::info(format!("Index {name} dropped"))));
             }
             AppEvent::IndexDropFailed { error, .. } => {
-                self.set_status_message(Some(StatusMessage::error(format!(
-                    "Drop index failed: {error}"
-                ))));
+                self.report_error(ErrorReport::from_message("Couldn't drop the index", error));
             }
             AppEvent::IndexCreated { name, .. } => {
                 if let Some(name) = name {
@@ -122,9 +135,8 @@ impl AppState {
                 }
             }
             AppEvent::IndexCreateFailed { error, .. } => {
-                self.set_status_message(Some(StatusMessage::error(format!(
-                    "Create index failed: {error}"
-                ))));
+                // The index dialog shows this error.
+                self.record_error(ErrorReport::from_message("Couldn't create the index", error));
             }
             AppEvent::DocumentsUpdated { matched, modified, .. } => {
                 let message = if *matched == 0 {
@@ -137,9 +149,8 @@ impl AppState {
                 self.set_status_message(Some(StatusMessage::info(message)));
             }
             AppEvent::DocumentsUpdateFailed { error, .. } => {
-                self.set_status_message(Some(StatusMessage::error(format!(
-                    "Update failed: {error}"
-                ))));
+                // The update dialog shows this error.
+                self.record_error(ErrorReport::from_message("Couldn't update documents", error));
             }
             AppEvent::DocumentsDeleted { session, deleted } => {
                 let _ = session;
@@ -155,9 +166,7 @@ impl AppState {
             }
             AppEvent::DocumentsDeleteFailed { session, error } => {
                 let _ = session;
-                self.set_status_message(Some(StatusMessage::error(format!(
-                    "Delete failed: {error}"
-                ))));
+                self.report_error(ErrorReport::from_message("Couldn't delete documents", error));
             }
             AppEvent::AggregationCompleted { session, count, preview, limited } => {
                 let _ = session;
@@ -170,14 +179,13 @@ impl AppState {
             }
             AppEvent::AggregationFailed { session, error } => {
                 let _ = session;
-                self.set_status_message(Some(StatusMessage::error(format!(
-                    "Aggregation failed: {error}"
-                ))));
+                // The aggregation results panel shows this error.
+                self.record_error(ErrorReport::from_message("Couldn't run the pipeline", error));
             }
             AppEvent::ExplainStarted { session, scope } => {
                 let _ = session;
                 self.set_status_message(Some(StatusMessage::info(format!(
-                    "Running {} explain...",
+                    "Running {} explain…",
                     scope.label()
                 ))));
             }
@@ -190,10 +198,12 @@ impl AppState {
             }
             AppEvent::ExplainFailed { session, scope, error } => {
                 let _ = session;
-                self.set_status_message(Some(StatusMessage::error(format!(
-                    "{} explain failed: {error}",
-                    scope.label()
-                ))));
+                // The explain dialog shows this error.
+                let title = match scope {
+                    crate::state::ExplainScope::Find => "Couldn't explain the query",
+                    crate::state::ExplainScope::Aggregation => "Couldn't explain the pipeline",
+                };
+                self.record_error(ErrorReport::from_message(title, error));
             }
             AppEvent::DatabaseTransferStarted { transfer_id, collections } => {
                 // Initialize database progress tracking
@@ -253,9 +263,8 @@ impl AppState {
                 self.set_status_message(Some(StatusMessage::info("Schema analysis complete")));
             }
             AppEvent::SchemaFailed { error, .. } => {
-                self.set_status_message(Some(StatusMessage::error(format!(
-                    "Schema analysis failed: {error}"
-                ))));
+                // The Schema view shows this error.
+                self.record_error(ErrorReport::from_message("Couldn't analyze the schema", error));
             }
             AppEvent::UpdateAvailable { version } => {
                 self.set_status_message(Some(StatusMessage::info(format!(
@@ -264,5 +273,35 @@ impl AppState {
             }
             _ => {}
         }
+    }
+}
+
+/// "Loaded 50 of 1,234 documents in 42 ms": the page, the query's matches, and the round trip.
+fn documents_loaded_message(shown: usize, total: u64, elapsed: std::time::Duration) -> String {
+    use crate::helpers::format_number;
+    let noun = if total == 1 { "document" } else { "documents" };
+    let count = if shown as u64 == total {
+        format!("{} {noun}", format_number(total))
+    } else {
+        format!("{} of {} {noun}", format_number(shown as u64), format_number(total))
+    };
+    format!("Loaded {count} in {} ms", format_number(elapsed.as_millis() as u64))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::documents_loaded_message;
+
+    #[test]
+    fn documents_loaded_message_names_page_matches_and_time() {
+        let ms = Duration::from_millis;
+        assert_eq!(
+            documents_loaded_message(50, 1234, ms(42)),
+            "Loaded 50 of 1,234 documents in 42 ms"
+        );
+        assert_eq!(documents_loaded_message(1, 1, ms(1500)), "Loaded 1 document in 1,500 ms");
+        assert_eq!(documents_loaded_message(0, 0, ms(3)), "Loaded 0 documents in 3 ms");
     }
 }

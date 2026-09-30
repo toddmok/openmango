@@ -4,9 +4,157 @@ All notable changes to OpenMango will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+Each release opens with `### Highlights`: at most five `- **Title.** One sentence.` items. The app's What's New shows them first and folds every other group behind a count.
+
 ## [Unreleased]
 
+## [0.4.1] - 2026-09-30
+
+### Highlights
+- **Run a command before connecting.** Start `kubectl port-forward`, or whatever opens the port, with the connection, and have it stopped when you disconnect.
+- **Linux on older systems.** The AppImage starts on Ubuntu 22.04, Debian 12 and anything newer.
+
 ### Added
+- A connection can run a command before connecting and stop it on disconnect, such as `kubectl port-forward`: Network tab, Before connecting. It runs in your login shell, so PATH and kube config are your terminal's. Connecting waits until the URI's port accepts connections, and says plainly what went wrong when it doesn't: the port already in use, the command not found, or what the command itself said. If the command stops later, the connection closes with the reason and offers Reconnect
+
+### Fixed
+- The Linux AppImage starts on systems with glibc 2.35 or newer, such as Ubuntu 22.04 and Debian 12. 0.4.0's was built on Ubuntu 24.04 and refused to start on anything older, with "version GLIBC_2.39 not found"
+
+## [0.4.0] - 2026-09-29
+
+### Highlights
+- **Compare and sync.** Compare two collections or two whole databases, see exactly what differs, and sync the changes you choose, with undo.
+- **Tasks.** Save a transfer or a comparison as a task and run it on a schedule, even while OpenMango is closed, with safety limits, retries, and a notification when something goes wrong.
+- **Relations.** OpenMango learns how your collections reference each other: follow an id, see what points at a document, and view it all on one canvas.
+- **AI that knows your data.** Describe the documents you want and the filter is written from the collection's own fields, and the assistant remembers your conversations and shows what each answer cost.
+- **Views, dates and UUIDs.** Save an aggregation as a view, show dates in your local time, and read UUIDs as UUIDs.
+
+### Added
+- Compare collections from the collection menu or command palette: choose match fields, filter both sides, inspect missing and changed documents, distinguish number-type and field-order differences, and find duplicate keys. Comparisons can be cancelled, results remain readable when a connection closes, and setup is restored across restarts
+- Selective collection sync with explicit target selection, row/category checkboxes, write review, native bulk operations, stale-document guards, cancellation between batches, and encrypted session undo. Sync and undo require MongoDB 8.0+ on the write target; older servers remain supported for comparison and as read-only sources. Undo expires when the tab closes or a new comparison starts
+- Compare 2 Documents in the document menu: select two documents in a collection and see them field by field in the same view the collection comparison uses, with unsaved edits compared as shown
+- The comparison's count of documents skipped for lacking the match key opens those documents on either side, filtered exactly as the scan skipped them
+- Compare's connection pickers list every saved connection. Picking a closed one opens it without leaving the tab, shows progress and any error under the picker, and a restored comparison offers Connect for connections that are closed
+- Compare two databases: "Compare with…" on a database, or "Compare databases…" in the command palette, pairs every collection by name and compares their documents one collection at a time, smallest first. Each collection says whether it is identical, which documents differ and by how many, or why it was not compared. Identical collections are hidden by default, any collection can be skipped or rechecked, large ones can be left out in Settings, and any collection opens in its own comparison to sync. Indexes that exist on one side only are listed, and a collection that exists on one side only opens in Transfer to copy it across
+- Database sync: after comparing two databases, sync into either side with Add missing, Add and update or Mirror. Each collection the mode can write is ticked with its counts, a collection the target lacks is created with its indexes, and one Undo covers the whole run. Collections only on the target, views, time-series and minor differences are never touched
+- Compare and sync actions have icons, including "Compare with…" in the sidebar menus
+- Ignore array order in compare Settings: arrays holding the same items in another order count as a minor difference, shown as one "item order" row in the document diff
+- Copy a single field in the compare document diff: hover a changed field and press the arrow, or right-click it, to copy that value to the other side, or remove it there if this side lacks it. It writes at once (Production connections still confirm), only if the target is unchanged since it was shown, and Undo copies reverts every copy since the comparison. _id and match fields are never copied alone
+- MCP compare tools: `openmango_compare_collections` and `openmango_compare_databases` run the Compare tab's read-only comparison for agents, with counts, the first differences and index differences. Clients that support the MCP tasks extension get a task they can poll and cancel, running up to 10 minutes; others get an answer within 30 seconds, partial if the scan did not finish
+- Tasks: save any Transfer (export, import, copy) or Compare as a task with Save as task, then run it again from the Tasks tab (sidebar, or "Tasks" in the command palette) with Run now. Save as task asks what each run does: compare only, or compare and sync, which way and how, for two databases or two collections. A database sync task covers every collection the source has, except the ones you unticked; a two-collection sync matches documents by _id and writes only what the comparison's filter matches. The task's details say what each run does in the same words. Run now opens the connections a task needs, asks before a task writes, and runs through the same code as the tab it came from. Each run is recorded with its result, its counts per collection and a log, in an encrypted history of the last 100 runs per task. Edit opens a task in its tool, where Save task updates it, and asks first when that would change whether or how it syncs
+- Task safety: Run now works out what a sync, or a transfer that clears or drops its target, would insert, replace and delete before asking, and Preview does it without writing. A run stops before writing when it would delete or replace more than 10% of a collection, more than three times what the task usually changes, or empty a collection from an empty source; the question says why, and Run anyway goes ahead. A task's Mirror deletes last, and not at all when something before it failed. Undo this run puts back what a task's last sync changed
+- Task recovery: every task run uses connections of its own, so it never disturbs the sidebar's. In a comparison, sync or undo, a dropped connection, a timeout or a primary stepping down is retried per collection after a growing, randomized wait, with a fresh connection, up to five times in fifteen minutes, and each retry is logged in the run; a run that can't reach its server when it starts waits the same way. An export starts over, and so does an import or copy that clears or drops its target first. An import or copy that adds to what the target already has isn't run again, since that could write documents twice; the run log says so. Errors that won't pass, such as a missing permission, fail at once. A step with no progress for ten minutes is retried, and a run still going after 24 hours stops
+- Task schedules: Schedule… in a task's details runs it by itself: every so many minutes or hours, daily or on weekdays, weekly on chosen days, or monthly, at a local time, with a calendar of the days it runs and the next three runs shown as you edit. A run missed while the computer slept or OpenMango was closed runs once, as a Catch-up, unless the next one is close. Runs go one at a time, and a task still running when it comes due again is skipped. Scheduled runs never ask: the safety limit stops them before writing, with Run anyway… in the run's details. A task that writes is approved for its connections as they are, so a changed connection, or saving the task to write another way, stops its scheduled runs until you approve it again (connecting, or saving a connection unchanged, doesn't count), and writing to a Production or protected connection on a schedule has to be allowed first. Scheduled exports name each file by its run and can keep only the newest 30. Pause keeps a schedule without running it
+- Tasks can run while OpenMango is closed: turn on "Run even when OpenMango is closed" in Schedule…. OpenMango then adds a system entry that looks for due tasks about every 15 minutes while you're signed in, runs them without a window and records them in the task's history, so a run can start up to 15 minutes late: on macOS 13 and later a launch agent listed under Login Items, on Windows a Task Scheduler task, "Run due tasks" in the OpenMango folder, and on Linux, from the AppImage, the systemd user timer openmango-tasks.timer. The entry is removed when no task needs it any more, or when OpenMango is uninstalled on Windows. A start missed while the computer slept or was off happens as soon as it can. While OpenMango is open it runs its tasks itself, and the two never run the same task twice. On Linux a run doesn't start while the keyring is locked, since reading the passwords would ask to unlock it with nobody there; the tasks stay due
+- Task problems and notifications: a scheduled task needs attention when its last run failed, the safety limit stopped it, a connection it uses changed or was deleted, signing in failed, or it should run while OpenMango is closed and the system entry is switched off. A failure that can pass, such as a server that can't be reached, needs attention only at the third in a row. The task's details say why, next to the button that fixes it, the Tasks list can show only the tasks that need attention, and the sidebar's Tasks button counts them. A failed scheduled run raises one notification per outage, with Open task, and the first run that works again says so; Schedule… can also notify when each scheduled run starts and ends. When you aren't looking at OpenMango, and for runs while it's closed, the news also comes as a system notification on macOS, Windows and Linux, and clicking it opens the task; on macOS that starts OpenMango if it's closed. macOS asks for permission the first time. A failed sign-in pauses the schedule until the connection is edited or it is resumed, so a wrong password isn't tried again and again
+- Ask AI in the documents filter: the sparkle turns the filter bar into a bar you describe the filter to, Find becomes Generate, and what you typed comes back as the filter in the same box, written from the collection's own field names, types and — for fields that hold a handful of values — examples of those values. A description that asks for an order or for particular fields fills Sort and Projection too and opens the options row to show them. Nothing runs until you press Find, Escape gives back the filter you had, and undo takes it back after that. Cmd/Ctrl+I switches the bar either way without reaching for the mouse
+- Connection switcher on the sidebar's Connections header and on Cmd/Ctrl+Shift+K, listing open connections first and saved ones by most recent use
+- Recent connections on the welcome screen, one click each, with progress shown on the one being opened
+- Multiple cursors in Forge and the query editors: Alt-click adds a cursor and Shift-Alt-drag selects a column
+- Backspace between an empty bracket or quote pair removes both, and single quotes close automatically in code editors
+- The command palette also opens with Cmd/Ctrl+Shift+P, lists recently used commands first, finds commands by related words such as "dump" for Export Data, and narrows the search to databases and collections when it starts with `#` or to connections with `@`
+- Mango Dark and Mango Light themes in the openmango.app colors, listed first in each group, with every text color meeting WCAG AA contrast on the surfaces it appears on
+- Match system appearance in Settings and in the command palette's theme list switches between Mango Dark and Mango Light with the system's dark or light mode; choosing a theme turns it off
+- AI models come from a models.dev catalogue: Fast, Balanced and Powerful presets per provider, a searchable picker that shows each model's context size and price, and a Refresh that fetches the latest list; a snapshot ships with the app so the picker is right offline
+- OpenRouter as an AI provider, offering its whole searchable catalogue of tool-calling models instead of presets
+- The assistant remembers a conversation between runs, and can search earlier conversations when you refer to work you did before. Conversations are kept in an encrypted database with a key from the system keychain, and nothing else on disk holds them: not the workspace file, not the log. Tool results, which hold your data, are never written down at all. Conversations are deleted after 30 days, and Settings can turn the memory off or delete everything it has kept
+- Every answer shows what it cost in tokens and in money at the model's list price, and can be copied; an answer that failed can be tried again. The chat header keeps the running total for the whole conversation
+- Tool calls in the chat carry an icon for the tool that ran, and a collapsed group shows which tools it used
+- New chat and a list of conversations in the chat header, the open one marked: starting over keeps what came before, and any of the last 20 conversations can be reopened where it left off. Each one is named by the model from its first exchange, says when it was, how many questions were asked and what it spent, and can be deleted from the list
+- Clear chat has a shortcut of its own while the chat has focus, and the chat's buttons show the keys that trigger them
+- Follow a reference: Cmd/Ctrl+click an ObjectId, or press Cmd/Ctrl+B or F12 on its row, and the tab moves to the document it points at, with a real filter you can edit. Where it points is confirmed against the server before anything moves, remembered for next time, and an id that leads nowhere says so instead of opening an empty collection. The arrow beside an id, or Space, shows the document in place without leaving; a DBRef goes where it names
+- Tabs go back and forward like a browser's: Cmd/Ctrl+[ returns to the view you followed a reference from, with its page, scroll, selection and filter as you left them and without asking the server again, and a trail under the collection name shows the way you came. Cmd/Ctrl+Shift+click follows into a new tab, and a tab with unsaved edits is never navigated away from
+- Open in new tab in the sidebar's collection menu and on Cmd/Ctrl+Shift+Enter, so one collection can be open twice with two different filters
+- Find references: Cmd/Ctrl+click a document's `_id`, or press Shift+F12, to see every document that points at it, grouped by the field that does. Each group can be opened as an ordinary filter, a row opens that document, and on a production or protected connection a field with no index waits for you to run it
+- Infer relations, in a database's tab and in a collection's menu: reads a sample of each collection one at a time, finds the fields that hold ids, and confirms where they point with index-only lookups, including references a collection makes to itself. It reports what it read, what it could not read and which fields matched nothing, can be stopped between collections, and what it learns is kept per database name, so it carries from a local copy to production
+- Relations tab, from Open canvas in a database's tab: every collection as a card listing the fields that reference something, laid out in layers with each line routed between the cards. Point at a field to light its one line and the collection at the other end, or at a collection to light everything joined to it; click holds it, Escape lets go, and double-click opens the collection. Drag or scroll to pan, pinch or Cmd/Ctrl+scroll to zoom, and copy the whole graph as Mermaid or DBML
+- A chip beside the collection name says whether its database has been read for relations, and either starts that or opens the canvas on this collection, counting what is new since you last looked
+- Adding an aggregation stage offers Join a related collection, which writes the `$lookup` from a known relation and the `$unwind` when the join arrives at one document; From relation on a `$lookup` stage fills in its four fields
+- Ids in aggregation results can be followed with Cmd/Ctrl+click, in the tree and the table, and an array of ids has Open all in its menu
+- The assistant and MCP clients can ask what references what (`get_relations`) and how two collections join (`join_path`), and get the `$lookup` stages back. Over MCP the graph is given only for a database the shared connection has
+- Dates can be shown in your local time: Show dates in, under Settings, a chip in the status bar that says `UTC` or your offset, and a command in the palette all switch it. A local date always carries its offset, such as `2024-01-31T13:30:00+04:00`, and everything copied or exported stays UTC whatever the setting
+- A UUID shows as a UUID and other binary as its size, with the subtype in the type column, instead of a dump of bytes. A legacy UUID shows as stored, and says so
+- Hovering a date or a binary value lists its other forms: UTC, local, how long ago and the epoch for a date; subtype, size and Base64 for binary, and the Java and C# byte orders for a legacy UUID
+- Copy value as, on a date or binary field: `ISODate("…")`, UTC, local or epoch milliseconds for a date, and `UUID("…")`, the plain string, Base64 or Hex for a UUID
+- Plain JSON under Copy as, where ObjectIds, dates and UUIDs are ordinary strings, for pasting somewhere that doesn't speak Extended JSON
+- AWS IAM sign-in works: `MONGODB-AWS` was refused by the driver before. The authentication mechanism is picked from a list (Automatic, SCRAM, X.509, LDAP, AWS IAM) that explains what each one expects, and a mechanism typed into the URI that isn't on the list is kept
+- The Indexes tab shows how often the server has used each index and since when, and marks one that nothing has used as Unused. The column is left out where the server won't report usage
+- Views are told apart from collections: an eye icon in the sidebar, and in the tab a VIEW tag, a link to the collection it reads, and a READ-ONLY tag that says why. A time-series collection gets an icon of its own
+- Save as view on the aggregation screen makes a view from the pipeline, offering a name read off what the pipeline does, such as `orders_open_by_country`, in the source collection's naming style, and taking an optional collation
+- Edit view definition, in the sidebar menu and the view's header, opens the view's pipeline in the aggregation builder as the server holds it now. The builder says the view is up to date until a stage really changes, then offers Update view, which keeps the view's collation
+- Duplicate view and Drop view in the sidebar menu; dropping says that the documents in the source collection are untouched
+- Show system collections under Settings lists `system.*` collections in the sidebar, muted and last. They are hidden by default now that creating a view adds `system.views`; a collection that merely has "system" in its name is never hidden
+- Escape cancels a drag, and the pipeline stage list, the filter builder and the tab bar scroll when a drag nears their edge
+
+### Changed
+- Compare's sync panel is one compact row: Sync to Left or Right, the write mode as a segmented control, Cancel and Review. A line below names the side read from and the side written to, with their connection and database, and says what the mode does; Mirror's deletes are called out there. The summary names what the sync writes, or why there's nothing to write, and Review no longer counts zero collections
+- What's New leads with a release's highlights, keeps every other change one click away behind a count, and renders code and lists properly. After an update it opens only when the highlights changed, so a nightly build with the same highlights no longer opens it again
+- Filters are written with spaces inside their braces, `{ _id: ObjectId("…") }`, everywhere one is shown, copied or saved
+- Stop ends a tool call that has already started instead of waiting for it to finish, and the rows it interrupted say so rather than spinning
+- When a request fails, the chat says what to do about it: which key to check, which model to pick, or that it is a rate limit that will clear
+- New installs match the system appearance with the Mango themes; a theme you already picked stays as it is
+- The sidebar lists only open connections, shows a spinner in place of the icon while one connects, keeps the connection color on the icon, and reveals row actions on hover or selection
+- Document values are plain text everywhere with one set of rules: numbers, `true`/`false`, ObjectId hex, dates such as `2024-01-31` or RFC 3339 timestamps, `null`, and mongosh forms like `ISODate("…")` or `NumberLong(42)`, replacing the switches and number steppers in inline tree editing, the edit value dialog, and the filter builder
+- Enter opens the selected document, expanding it in the tree or opening it as JSON from the table, like double-click
+- Workspace tabs from a colored connection share an underline in that color
+- The edit value dialog submits with Cmd/Ctrl+Enter, and its Array type accepts mongosh syntax like Document does
+- The Indexes tab shows keys as field and direction pairs and properties such as Unique, TTL, or Partial as tags, without disabled actions on the built-in `_id_` index
+- The Create Index and Edit Index dialogs label every field, name key types, explain unavailable options where they apply, submit with Cmd/Ctrl+Enter, and describe how replacing an index works before you confirm
+- The command palette shows shortcuts as keycaps, scrolls its whole list with a scrollbar, follows the mouse with one highlight, checks the current theme, names the open submenu with a back button (Backspace also goes back), and clears the search on the first Escape
+- The assistant works a question through step by step instead of being told to stop after a few tool calls, keeps what its tools found across follow-up questions, and retries a request the provider rate-limited
+- Save and Discard for unsaved document edits sit in the collection header with their keyboard shortcuts shown, and act on every unsaved document in the tab rather than only the selected ones
+- After a query the status bar says how many documents were loaded, out of how many matched, and how long it took
+- The Find button shows a spinner in place of its icon instead of pushing the row aside, and busy buttons keep their size
+- A long run of tool calls shows only its last few while it works, with the rest one click away, instead of pushing the answer off the screen
+- The status bar and the chat are built on gpui-kit's own components, so the chat scrolls, follows new messages and renders markdown the way the rest of the app does
+- Headings in an answer are bigger than the text they introduce, field names in a sentence carry the same blue the document tree gives them, code blocks have room around them, and the answer no longer changes size the moment it finishes streaming
+- The existing JSON copy format is named Extended JSON, now that Plain JSON sits beside it
+- What you drag is the thing you grabbed, lifted off in place and held where you took hold of it: a key or value in its own color, a stage or condition by its grip, a tab as a tab. The hand closes while you drag, and the blue chips beside the pointer are gone
+- In the tree, a drag starts on the key or value text rather than anywhere in its column
+- Inserting, editing, deleting and bulk-updating documents in a view, and changing its indexes, are refused in the app with the name of the collection to change instead, rather than by a server error. Import is off for a view, and Rename is not offered
+- A view's Indexes tab says it uses its source's indexes and links to them, and its Stats row says a view stores nothing of its own
+
+### Removed
+- The Vibrancy setting: windows are always opaque, so text keeps the same contrast whatever sits behind the window, and theme changes no longer ask for a restart
+
+### Fixed
+- Cmd/Ctrl+Enter in an aggregation stage runs the pipeline without also adding a line to the stage
+- Closing a preview tab releases its session; it was kept alive until the app quit
+- Cmd/Ctrl+F while typing in a query editor no longer opens the document search over the results
+- The filter bar keeps a line for its message whether or not it has one, so a query that finishes in milliseconds no longer flashes "Searching collection…" and shifts the documents under it
+- JSON, Insert and Refresh no longer grey out for the length of a query, which made the toolbar blink on every reload while Tree and Table stayed put
+- Running a query no longer rewrites the filter, sort and projection inputs or closes the options row, which made the view blink on every Find
+- The @collection list in the chat answers to the arrow keys, and Enter takes the highlighted collection instead of sending the half-typed name as a message
+- Switching themes now reaches the layer that draws the chat's markdown, so a dark theme no longer renders answers with light tables and washed-out text
+- Installing an update on macOS opened a second copy of OpenMango instead of replacing the running one
+- The Indexes tab rendered every index side by side on a single line
+- Error messages on the Indexes tab and in the index, edit value, and bulk update dialogs were drawn in a color that matched the background in most themes
+- Number steppers in the filter builder and the index TTL field did nothing, and both are now plain inputs
+- The command palette sat off-center and overflowed small windows, took Enter and arrow keys from other windows while open, and let Tab move focus behind it
+- Shortcut hints in the command palette and sidebar tooltips showed the Ctrl variant on macOS
+- Double-clicking a value in the document tree to edit it shifted the text and the rows below
+- The Schema tab's field filter showed its text low, clipped, and indented behind an empty gutter; it now matches the documents filter
+- Replacing documents with `many` now stops at the 100 it promises, instead of rewriting every document that matched the filter
+- Inserting more than 100 documents is refused rather than quietly exceeding the limit the assistant was told about
+- A field's value no longer shifts by a couple of pixels when it is marked as edited or selected, and a document's key no longer moves when it gets unsaved changes
+- Two calls to the same tool in one answer keep their own results
+- On a read-only connection the assistant is no longer told about write tools it does not have
+- Stopping an answer says it stopped, instead of reporting a tool call limit
+- The chat's text box starts the caret at the edge of the box, and grows as you type
+- The model picker opens on the model you are using, and Settings says when the model list could not be loaded instead of showing "Ready"
+- A group of tool calls can be collapsed while the assistant is still working, and no longer blinks open and shut between calls
+- Dragging a date or boolean field's key into the filter builder made a condition that compared text against the field and matched nothing
+- Dragging a UUID or other binary value into the filter builder filters on the value instead of on its JSON as text
+- On a narrow window the collection header's buttons were drawn over the collection name. They now move below it, and the chips beside the name wrap
+- The edit value dialog prefilled binary and decimal values with debug text instead of the Extended JSON it asks for
+
+## [0.3.0] - 2026-09-14
+
+### Added
+- Windows support: per-user installers for x64 and ARM64 with Start menu integration and an uninstaller, signed in-app updates, no console windows for the app or its bundled tools, and credentials stored in Windows Credential Manager
+- Linux support: AppImage builds for x86_64 and aarch64 with a desktop-entry install action, signed in-app updates, and a combined title bar matching the macOS window chrome
+- Searchable native connection list, visible disconnected connections with row actions, and separate Save and Save & Connect actions
+- Copy ID action for documents, including ID-only copying of a selected collapsed document
 - Open a highlighted collection in Forge with Cmd/Ctrl+Shift+F, or choose Open Forge as the collection double-click action in Settings; queries start with `find({})`, ready to run ([#12](https://github.com/ggagosh/openmango/issues/12))
 - Authenticated local MCP agent access with per-connection sharing and write controls, bounded read tools, direct document insert/update/replace/delete, and metadata-only History restore tools
 - Native approval and Agent Activity workflows for Arcula database backups, syncs, and verified-backup reverts, including progress, cancellation, target fingerprints, and recovery interlocks
@@ -23,7 +171,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Settings now show the log location and can export a redacted support bundle with runtime diagnostics
 - AI privacy controls for selected-document and automatic sample sharing, both disabled by default
 - Keyboard-operable app buttons with focus rings and Enter, Return, and Space activation
-- Accessibility QA documentation and focus restoration for searches and confirmation dialogs
+- Focus returns to where you were after closing searches and confirmation dialogs
 - Table view for documents — browse collections in a spreadsheet-style grid with sortable, resizable, and pinnable columns
 - Per-page selector in the pagination bar — choose between 10, 25, 50, or 100 documents per page
 - Islands tab style — choose between Islands, Segmented, or Underline tab appearance in Settings
@@ -37,10 +185,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Reload a database to refresh its collection list from the server without reconnecting
 
 ### Fixed
+- macOS updates no longer reject valid app signatures with "invalid requirement specification"
+- Prevent a crash when opening New Connection or switching saved connections; retain drafts and active sessions when connection persistence fails
+- Keep pasted URI options and encoded credentials in sync with the editor, and ignore connection test results after the tested settings change
+- Workspace tabs now stay within the title bar, follow the active tab when overflowing, and accept shortcuts immediately after launch
+- Query editors retain focus and place the caret correctly on left-click, including collapsed and scrolled inputs
+- Forge completions preserve existing arguments and apply the inserted text and caret position together
+- Forge console output follows new results without stealing focus, pauses while reading older output, and preserves the distinction between printed `undefined` and `null`
+- Long-running Forge queries and idle shell sessions are no longer interrupted by the sidecar's former inactivity timeout
+- Filter Builder shortcuts stay within the builder, invalid drafts are blocked before execution, and collapsing a group preserves its inputs and query
 - Opening Forge now targets the highlighted collection, reuses matching find-all queries, and preserves existing query drafts
 - Running Forge queries or selected statements with keyboard shortcuts no longer causes a nested view-update crash
 - Transfer cancellation now blocks reruns and mode changes until the active operation has stopped, preventing stale completion races
-- macOS development runs use a stable Apple Development signature so Keychain access remains trusted across rebuilds
 - Workspace restore no longer crashes by re-entering the sidebar while a connection event is being handled
 - Workspace restore now waits for saved connection credentials to finish loading from Keychain before reconnecting
 - Import and copy Clear/Drop operations now stage changes before atomic promotion, and Replace preserves failed originals while reporting partial progress
@@ -56,7 +212,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Query refresh now cancels actual client/server work rather than relying only on stale request IDs
 - Numbered-tab, content-focus, document, and aggregation shortcuts no longer conflict; palette and menu shortcuts come from registered actions
 - Palette Refresh now follows the same context-sensitive path as Cmd/Ctrl+R, AI opening focuses its input, and Forge preserves the selected collection
-- Unit-test CI now runs the library tests instead of the zero-test binary target
 - Search in JSON editors now wraps correctly in both directions — pressing Enter cycles forward through all matches, Shift+Enter cycles backward
 - Detached editor windows now inherit the vibrancy setting from the main window instead of always appearing opaque
 - Closing the main window now also closes all detached editor windows
@@ -77,16 +232,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Applied fast filters now keep the text you typed instead of rewriting it into MongoDB JSON
 
 ### Changed
+- Smaller downloads: the app bundles plain JetBrains Mono instead of its Nerd Font build (text looks the same), and syntax highlighting includes only JavaScript and JSON, so AI answer code blocks in other languages show without colors
+- Migrated the desktop UI to published GPUI Kit 0.6 components and removed the vendored toolkit patches
+- Forge retains editor and result-view state across tabs and uses fuzzy completions with consistent native editing shortcuts
+- Filter Builder now uses consistent native controls, collapsible borderless groups, and scoped keyboard handling with validation before execution
+- Corner radii now follow one shared application scale across all built-in color themes
 - Settings now use a searchable full-content tab with General, Transfer, AI Assistant, Agents & MCP, and Keybindings pages
 - Connection management now uses a full-content singleton tab with explicit new-connection drafts, cancellation, draft-discard protection, and consistent New Connection entry points
 - History now observes MongoDB changes passively and never pre-reads, authorizes, approves, or blocks originating writes
 - Transfer now uses one compact Export, Import, and Copy workflow with progressive options and consistent aggregate progress across collection, database, JSON/CSV, and BSON operations
-- Updates now require published SHA-256 assets, verify the downloaded archive and macOS code signature, respect the automatic-update preference, and install only after Restart to Update
+- Updates now require published SHA-256 assets, verify the downloaded archive and macOS code signature, respect the automatic-update preference, and install only after you choose Restart and install
 - Update-check failures remain visible with Retry instead of silently returning to idle
 - AI enablement now discloses the workspace metadata sent to the selected provider, and complete system prompts are no longer written to debug logs
 - Transfer jobs that continue after errors retain failure counts, per-collection details, and processed-document totals
-- Release workflows now publish per-archive SHA-256 checksum assets
-- Filter bar redesigned — filter stays primary with parsed readback chips, while sort and projection live in the Options panel
+- Every download now has a published SHA-256 checksum
+- Document query editors now provide field/value completion, typed ID queries, multiline drafts, and undoable formatting on submission, with sort and projection in Options
 - AI chat panel moved out of the documents view into its own dedicated space
 - Close buttons on tabs now only appear on hover (except the active tab)
 - Tab bar styling updated with padding and theme-aware background
@@ -99,6 +259,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Update archives and final app bundles are verified before replacing the installed application
 
 ### Performance
+- Forge sidecar startup uses precompiled bytecode, and console/result updates avoid rebuilding unchanged output
 - History uses one deployment-wide change stream per connection to avoid exhausting MongoDB connection pools, while large restores process independent documents concurrently and preserve same-document ordering
 - Document tree (JSON view) expands and scrolls much faster on large or deeply nested documents — removed a quadratic dirty-check and the redundant full-tree clones that ran on every interaction
 - Documents table is much smoother — it now re-renders only when the data or selection actually changes instead of rebuilding every visible cell every frame
@@ -106,6 +267,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Sidebar search is much faster — results are cached and recomputed only when the query or the connection/database/collection list changes
 - Per-collection caches are now freed when a tab closes, so memory no longer grows as you browse through many collections
 - Copying a large multi-document selection no longer briefly freezes the UI
+
+## [0.2.1] - 2026-03-05
+
+### Fixed
+- Release builds no longer include a debug-only Keychain override that failed the release lint check
 
 ## [0.2.0] - 2026-03-05
 

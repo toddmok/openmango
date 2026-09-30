@@ -1,15 +1,16 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use gpui::*;
-use gpui_component::WindowExt as _;
-use gpui_component::input::InputState;
+use gpui_kit::component::ActiveTheme as _;
+use gpui_kit::component::WindowExt as _;
+use gpui_kit::component::input::InputState;
+use gpui_kit::*;
 use uuid::Uuid;
 
+use crate::components::node_commands::{confirm_delete_node, copy_node_name};
 use crate::components::{
-    ConnectionManager, WriteConfirmation, open_confirm_dialog, request_connection_write,
-    request_disconnect_connection, request_preview_collection, request_remove_connection,
+    ConnectionManager, request_disconnect_connection, request_preview_collection,
     request_unsaved_action,
 };
 use crate::keyboard::FocusContent;
@@ -24,16 +25,27 @@ use super::search::{SidebarSearchCandidate, SidebarSearchResult, search_results}
 use super::sidebar_model::{SidebarModel, TYPEAHEAD_RESET_DELAY};
 
 mod keys;
+#[cfg(test)]
+mod tests;
 mod view;
 
 // =============================================================================
 // Sidebar Component
 // =============================================================================
 
-const SIDEBAR_DEFAULT_WIDTH: Pixels = px(260.0);
-const SIDEBAR_MIN_WIDTH: Pixels = px(180.0);
+const SIDEBAR_DEFAULT_WIDTH: Pixels = px(280.0);
+/// Narrower than this, the header's Connections switcher and its four buttons no longer fit on
+/// one line.
+const SIDEBAR_MIN_WIDTH: Pixels = px(280.0);
 const SIDEBAR_MAX_WIDTH: Pixels = px(500.0);
 const KEYBOARD_PREVIEW_DELAY: Duration = Duration::from_millis(140);
+/// Every tree row is exactly this tall. The pinned rows and paging do their arithmetic with
+/// it; the scroll handle only reports the viewport and content sizes, never a row's. In rems,
+/// so a row grows with its label when the base font does (24px at the default 16px).
+const ROW_HEIGHT: Rems = rems(1.5);
+// ponytail: the results list is not virtualized, so it shows the best matches only. Swap it
+// for a uniform_list if people need to page through more.
+const SEARCH_RESULTS_LIMIT: usize = 50;
 
 /// Memoizes sidebar fuzzy-search results so the full candidate scan + fuzzy
 /// match doesn't re-run on every incidental sidebar re-render. Invalidated when
@@ -54,7 +66,12 @@ pub(crate) struct Sidebar {
     scroll_handle: UniformListScrollHandle,
     width: Pixels,
     collapsed: bool,
-    sticky_connection_index: Option<usize>,
+    search_scroll_handle: ScrollHandle,
+    /// The view node last revealed, so a repeated `ViewChanged` for the same view does not
+    /// reopen what the user has since collapsed.
+    last_revealed: Option<TreeNodeId>,
+    /// A reveal waiting for its row to load.
+    pending_reveal: Option<TreeNodeId>,
     typeahead_clear_task: Option<Task<()>>,
     typeahead_generation: u64,
     keyboard_preview_task: Option<Task<()>>,
@@ -92,6 +109,7 @@ impl Sidebar {
             match event {
                 AppEvent::ConnectionAdded
                 | AppEvent::ConnectionUpdated
+                | AppEvent::ConnectionSaveFinished { .. }
                 | AppEvent::ConnectionRemoved
                 | AppEvent::DatabasesLoaded(_) => {
                     this.refresh_tree(cx);
@@ -100,13 +118,16 @@ impl Sidebar {
                     this.model.loading_databases.clear();
                     this.refresh_tree(cx);
                 }
+                AppEvent::SystemCollectionsVisibilityChanged => this.rebuild_entries(cx),
                 AppEvent::CollectionsFailed(_) => {
                     this.model.loading_databases.clear();
                     cx.notify();
                 }
                 AppEvent::Connecting(connection_id) => {
                     this.model.connecting_connection = Some(*connection_id);
-                    cx.notify();
+                    this.model.expanded_nodes.insert(TreeNodeId::connection(*connection_id));
+                    this.persist_expanded_nodes(cx);
+                    this.refresh_tree(cx);
                 }
                 AppEvent::Connected(connection_id) => {
                     if this.model.connecting_connection == Some(*connection_id) {
@@ -145,18 +166,22 @@ impl Sidebar {
                     this.model.clear_selection();
                     this.refresh_tree(cx);
                 }
-                AppEvent::ConnectionFailed(_) => {
-                    this.model.connecting_connection = None;
+                AppEvent::ConnectionFailed { connection_id, .. } => {
+                    if this.model.connecting_connection == Some(*connection_id) {
+                        this.model.connecting_connection = None;
+                    }
                     this.model.loading_databases.clear();
                     this.model.clear_selection();
-                    cx.notify();
+                    this.refresh_tree(cx);
                 }
                 AppEvent::DocumentsLoaded { .. }
+                | AppEvent::CompareChanged { .. }
                 | AppEvent::DocumentsLoadFailed { .. }
                 | AppEvent::DocumentInserted { .. }
                 | AppEvent::DocumentInsertFailed { .. }
                 | AppEvent::DocumentsInserted { .. }
                 | AppEvent::DocumentsInsertFailed { .. }
+                | AppEvent::DocumentDraftChanged { .. }
                 | AppEvent::DocumentSaved { .. }
                 | AppEvent::DocumentSaveFailed { .. }
                 | AppEvent::DocumentDeleted { .. }
@@ -185,6 +210,7 @@ impl Sidebar {
                 | AppEvent::CollectionProgressUpdate { .. }
                 | AppEvent::SchemaAnalyzed { .. }
                 | AppEvent::SchemaFailed { .. }
+                | AppEvent::DateDisplayChanged
                 | AppEvent::UpdateAvailable { .. } => {}
                 AppEvent::AgentActivityChanged => {
                     cx.notify();
@@ -205,7 +231,7 @@ impl Sidebar {
 
         subscriptions.push(cx.on_window_closed({
             let state = state.clone();
-            move |cx| {
+            move |cx, _| {
                 state.update(cx, |state, cx| {
                     state.workspace_restore_pending = false;
                     state.update_workspace_from_state();
@@ -258,28 +284,7 @@ impl Sidebar {
                 this.delete_typeahead_char(cx);
                 return;
             }
-            if key == "up" || key == "arrowup" {
-                this.move_sidebar_selection(-1, cx);
-                return;
-            }
-            if key == "down" || key == "arrowdown" {
-                this.move_sidebar_selection(1, cx);
-                return;
-            }
-            if key == "home" {
-                this.select_sidebar_first(cx);
-                return;
-            }
-            if key == "end" {
-                this.select_sidebar_last(cx);
-                return;
-            }
-            if key == "pageup" {
-                this.move_sidebar_page(-1, cx);
-                return;
-            }
-            if key == "pagedown" {
-                this.move_sidebar_page(1, cx);
+            if this.handle_nav_key(&key, ks.modifiers, cx) {
                 return;
             }
             this.handle_typeahead_keystroke(ks, cx);
@@ -293,7 +298,9 @@ impl Sidebar {
             scroll_handle: UniformListScrollHandle::default(),
             width: SIDEBAR_DEFAULT_WIDTH,
             collapsed: false,
-            sticky_connection_index: None,
+            search_scroll_handle: ScrollHandle::new(),
+            last_revealed: None,
+            pending_reveal: None,
             typeahead_clear_task: None,
             typeahead_generation: 0,
             keyboard_preview_task: None,
@@ -330,37 +337,137 @@ impl Sidebar {
         self.collapsed = !self.collapsed;
     }
 
+    fn view_node(&self, cx: &App) -> Option<TreeNodeId> {
+        let state = self.state.read(cx);
+        SidebarModel::node_for_view(
+            state.selected_connection_id(),
+            state.selected_database_name(),
+            state.selected_collection_name(),
+        )
+    }
+
+    /// Rebuilds the rows from the cached snapshot: all an expansion change needs. It neither
+    /// scrolls nor touches what is expanded, so the list stays put under the pointer.
+    fn rebuild_entries(&mut self, cx: &mut Context<Self>) {
+        let show_system = self.state.read(cx).settings.appearance.show_system_collections;
+        self.model.refresh_entries(&self.cached_connections, &self.cached_active, show_system);
+        cx.notify();
+    }
+
+    /// Re-reads connections and their contents from the state, then rebuilds the rows.
     fn refresh_tree(&mut self, cx: &mut Context<Self>) {
-        let (selected_connection, selected_db, selected_col) = {
+        {
             let state_ref = self.state.read(cx);
             self.cached_connections = Rc::new(state_ref.connections_snapshot());
             self.cached_active = Rc::new(state_ref.active_connections_snapshot());
-            (
-                state_ref.selected_connection_id(),
-                state_ref.selected_database_name(),
-                state_ref.selected_collection_name(),
-            )
-        };
-
-        if self.model.selected_tree_id.is_none() {
-            self.model.ensure_selection_from_state(selected_connection, selected_db, selected_col);
         }
+        if self.model.selected_tree_id.is_none() {
+            self.model.selected_tree_id = self.view_node(cx);
+        }
+        self.rebuild_entries(cx);
 
-        if let Some(ix) = self.model.refresh_entries(&self.cached_connections, &self.cached_active)
-        {
-            self.scroll_handle.scroll_to_item(ix, gpui::ScrollStrategy::Center);
+        // A row revealed before its parent finished loading is selected now that it exists.
+        if let Some(node_id) = self.pending_reveal.take() {
+            match self.model.select_node(node_id.clone()) {
+                Some(ix) => self.scroll_to_row(ix, ScrollStrategy::Center),
+                None => self.pending_reveal = Some(node_id),
+            }
+        }
+    }
+
+    /// Opens whatever hides `node_id`, selects it and brings it into view.
+    fn reveal_node(&mut self, node_id: TreeNodeId, cx: &mut Context<Self>) {
+        if self.model.expand_ancestors(&node_id) {
+            self.persist_expanded_nodes(cx);
+            self.rebuild_entries(cx);
+        }
+        self.pending_reveal = None;
+        match self.model.select_node(node_id.clone()) {
+            Some(ix) => self.scroll_to_row(ix, ScrollStrategy::Center),
+            None => {
+                self.model.select_nearest(node_id.clone());
+                self.pending_reveal = Some(node_id);
+            }
         }
         cx.notify();
     }
 
-    pub(crate) fn expand_connection_and_refresh(
+    /// The ancestor rows to pin over the top of the list: the connection, then the database,
+    /// of whatever has scrolled beneath them. Each level looks at the first row its
+    /// predecessors leave uncovered. Read from the live scroll offset during render, so the
+    /// pins never trail the scroll by a frame.
+    pub(super) fn sticky_rows(&self, cx: &App) -> Vec<usize> {
+        let offset = self.scroll_handle.0.borrow().base_handle.offset().y;
+        let first = (-offset / Self::row_height(cx)).floor().max(0.0) as usize;
+        let mut pinned = Vec::new();
+        for depth in 0..2 {
+            let covered = first + depth;
+            match SidebarModel::ancestor_index(&self.model.entries, covered, depth) {
+                Some(ix) if ix < covered => pinned.push(ix),
+                _ => break,
+            }
+        }
+        pinned
+    }
+
+    /// A row's height in pixels. `Root` sets the window's rem size from the theme's base font,
+    /// so that font is the length a rem resolves against.
+    fn row_height(cx: &App) -> Pixels {
+        ROW_HEIGHT.to_pixels(cx.theme().font_size)
+    }
+
+    /// Scrolls a row into view, clear of the ancestor rows pinned over the top of the list.
+    fn scroll_to_row(&self, ix: usize, strategy: ScrollStrategy) {
+        let pinned = self.model.entries.get(ix).map_or(0, |entry| entry.depth);
+        self.scroll_handle.scroll_to_item_with_offset(ix, strategy, pinned);
+    }
+
+    /// The one place a row opens or closes: the chevron, the arrow keys and Enter all land here.
+    pub(super) fn set_node_expanded(
         &mut self,
-        connection_id: Uuid,
+        node_id: &TreeNodeId,
+        expanded: bool,
+        recursive: bool,
         cx: &mut Context<Self>,
     ) {
-        self.model.expanded_nodes.insert(TreeNodeId::connection(connection_id));
-        self.persist_expanded_nodes(cx);
-        self.refresh_tree(cx);
+        if self.model.set_expanded(node_id, expanded, recursive) {
+            self.persist_expanded_nodes(cx);
+            self.rebuild_entries(cx);
+        }
+        if expanded {
+            self.load_collections_if_needed(node_id, cx);
+        }
+    }
+
+    /// Starts loading a database's collections unless they are here or already on their way.
+    fn load_collections_if_needed(&mut self, node_id: &TreeNodeId, cx: &mut Context<Self>) {
+        let TreeNodeId::Database { connection, database } = node_id else {
+            return;
+        };
+        let loaded = self
+            .state
+            .read(cx)
+            .active_connection_by_id(*connection)
+            .is_none_or(|conn| conn.collections.contains_key(database));
+        if loaded || !self.model.loading_databases.insert(node_id.clone()) {
+            return;
+        }
+        cx.notify();
+        AppCommands::load_collections(self.state.clone(), *connection, database.clone(), cx);
+    }
+
+    /// Selects an open connection's row, scrolls to it and moves focus to the tree.
+    pub(crate) fn reveal_connection(
+        &mut self,
+        connection_id: Uuid,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.collapsed {
+            self.toggle_collapsed();
+        }
+        self.reveal_node(TreeNodeId::connection(connection_id), cx);
+        window.focus(&self.focus_handle, cx);
     }
 
     pub(crate) fn mark_database_loading(&mut self, node_id: TreeNodeId, cx: &mut Context<Self>) {
@@ -444,25 +551,17 @@ impl Sidebar {
         }
     }
 
+    /// Reveals the row for the view the app switched to. `ViewChanged` fires for much more
+    /// than that, so an unchanged view reveals nothing: what the user collapsed stays closed.
     fn sync_selection_from_state(&mut self, cx: &mut Context<Self>) {
-        let (connection_id, selected_db, selected_col) = {
-            let state_ref = self.state.read(cx);
-            (
-                state_ref.selected_connection_id(),
-                state_ref.selected_database_name(),
-                state_ref.selected_collection_name(),
-            )
+        let Some(node_id) = self.view_node(cx) else {
+            return;
         };
-        if connection_id.is_none() {
+        if self.last_revealed.as_ref() == Some(&node_id) {
             return;
         }
-
-        if let Some(ix) =
-            self.model.ensure_selection_from_state(connection_id, selected_db, selected_col)
-        {
-            self.scroll_handle.scroll_to_item(ix, gpui::ScrollStrategy::Center);
-        }
-        cx.notify();
+        self.last_revealed = Some(node_id.clone());
+        self.reveal_node(node_id, cx);
     }
 
     fn persist_expanded_nodes(&mut self, cx: &mut Context<Self>) {
@@ -475,60 +574,34 @@ impl Sidebar {
     }
 
     fn restore_workspace_expansion(&mut self, cx: &mut Context<Self>) {
-        let (connection_id, selected_db, expanded) = {
+        let expanded: Vec<TreeNodeId> = {
             let state_ref = self.state.read(cx);
             let Some(connection_id) =
                 state_ref.workspace.last_connection_id.or(state_ref.selected_connection_id())
             else {
                 return;
             };
-            let Some(_active) = state_ref.active_connection_by_id(connection_id) else {
+            if state_ref.active_connection_by_id(connection_id).is_none() {
                 return;
-            };
-            let mut expanded: HashSet<TreeNodeId> = state_ref
+            }
+            state_ref
                 .workspace
                 .expanded_nodes
                 .iter()
                 .filter_map(|id| TreeNodeId::from_tree_id(id))
                 .filter(|node| node.connection_id() == connection_id)
-                .collect();
-
-            let selected_db = state_ref.selected_database_name();
-            if let Some(db) = selected_db.as_ref() {
-                expanded.insert(TreeNodeId::connection(connection_id));
-                expanded.insert(TreeNodeId::database(connection_id, db));
-            }
-
-            (connection_id, selected_db, expanded)
+                .collect()
         };
 
-        self.model.expanded_nodes = expanded;
-        if selected_db.is_some() {
-            self.model.expanded_nodes.insert(TreeNodeId::connection(connection_id));
-        }
-        self.model.clear_selection();
+        // Added to what is open, not swapped in: other connections keep their expansion.
+        self.model.expanded_nodes.extend(expanded.iter().cloned());
         self.refresh_tree(cx);
-        self.load_expanded_databases(cx);
-    }
-
-    fn load_expanded_databases(&mut self, cx: &mut Context<Self>) {
-        for node in self.model.expanded_nodes.iter() {
-            let TreeNodeId::Database { connection, database } = node else {
-                continue;
-            };
-            let collections = {
-                let state_ref = self.state.read(cx);
-                let Some(conn) = state_ref.active_connection_by_id(*connection) else {
-                    continue;
-                };
-                conn.collections.clone()
-            };
-            if collections.contains_key(database) || self.model.loading_databases.contains(node) {
-                continue;
-            }
-            self.model.loading_databases.insert(node.clone());
-            AppCommands::load_collections(self.state.clone(), *connection, database.clone(), cx);
+        for node_id in &expanded {
+            self.load_collections_if_needed(node_id, cx);
         }
+        // Land on the restored view's row; a collection waits for its database to load.
+        self.last_revealed = None;
+        self.sync_selection_from_state(cx);
     }
 
     fn open_add_dialog(state: Entity<AppState>, window: &mut Window, cx: &mut App) {
@@ -561,9 +634,7 @@ impl Sidebar {
             let is_connecting = self.model.connecting_connection == Some(connection_id);
 
             if !is_connected && !is_connecting {
-                self.model.expanded_nodes.insert(node_id.clone());
-                self.persist_expanded_nodes(cx);
-                self.refresh_tree(cx);
+                self.set_node_expanded(&node_id, true, false, cx);
                 AppCommands::connect(self.state.clone(), connection_id, cx);
             }
             return;
@@ -577,29 +648,7 @@ impl Sidebar {
                 state.select_connection(Some(node_id.connection_id()), cx);
                 state.select_database(db.clone(), cx);
             });
-            let should_expand = !self.model.expanded_nodes.contains(&node_id);
-            if should_expand {
-                self.model.expanded_nodes.insert(node_id.clone());
-                self.persist_expanded_nodes(cx);
-                self.refresh_tree(cx);
-            }
-            if should_expand && !self.model.loading_databases.contains(&node_id) {
-                let should_load = self
-                    .state
-                    .read(cx)
-                    .active_connection_by_id(node_id.connection_id())
-                    .is_some_and(|conn| !conn.collections.contains_key(&db));
-                if should_load {
-                    self.model.loading_databases.insert(node_id.clone());
-                    cx.notify();
-                    AppCommands::load_collections(
-                        self.state.clone(),
-                        node_id.connection_id(),
-                        db,
-                        cx,
-                    );
-                }
-            }
+            self.set_node_expanded(&node_id, true, false, cx);
             return;
         }
 
@@ -614,6 +663,27 @@ impl Sidebar {
             });
             window.dispatch_action(Box::new(FocusContent), cx);
         }
+    }
+
+    /// Open the selected collection in a tab of its own, leaving any tab already showing that
+    /// collection untouched. This is how two filtered views of one collection sit side by side.
+    fn handle_open_in_new_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.cancel_keyboard_preview();
+        self.clear_typeahead(cx);
+        let Some(node_id) = self.model.selected_tree_id.clone() else {
+            return;
+        };
+        let (Some(database), Some(collection)) = (
+            node_id.database_name().map(str::to_string),
+            node_id.collection_name().map(str::to_string),
+        ) else {
+            return;
+        };
+        self.state.update(cx, |state, cx| {
+            state.select_connection(Some(node_id.connection_id()), cx);
+            state.open_collection_in_new_tab(database, collection, String::new(), None, cx);
+        });
+        window.dispatch_action(Box::new(FocusContent), cx);
     }
 
     fn handle_open_forge(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -692,20 +762,8 @@ impl Sidebar {
     }
 
     fn handle_copy_selection_name(&mut self, cx: &mut Context<Self>) {
-        let Some(node_id) = self.model.selected_tree_id.clone() else {
-            return;
-        };
-        let text = match node_id {
-            TreeNodeId::Connection(connection_id) => {
-                self.state.read(cx).connection_name(connection_id)
-            }
-            TreeNodeId::Database { database, .. } => Some(database),
-            TreeNodeId::Collection { database, collection, .. } => {
-                Some(format!("{database}/{collection}"))
-            }
-        };
-        if let Some(text) = text {
-            cx.write_to_clipboard(ClipboardItem::new_string(text));
+        if let Some(node_id) = self.model.selected_tree_id.as_ref() {
+            copy_node_name(&self.state, node_id, cx);
         }
     }
 
@@ -854,79 +912,8 @@ impl Sidebar {
     }
 
     fn handle_delete_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(node_id) = self.model.selected_tree_id.clone() else {
-            return;
-        };
-        match node_id {
-            TreeNodeId::Connection(connection_id) => {
-                let name = self
-                    .state
-                    .read(cx)
-                    .connection_name(connection_id)
-                    .unwrap_or_else(|| "this connection".to_string());
-                let message = format!("Remove connection \"{name}\"? This cannot be undone.");
-                open_confirm_dialog(window, cx, "Remove connection", message, "Remove", true, {
-                    let state = self.state.clone();
-                    move |window, cx| {
-                        request_remove_connection(state.clone(), connection_id, window, cx);
-                    }
-                });
-            }
-            TreeNodeId::Database { connection, database } => {
-                let message = format!("Drop database \"{database}\"? This cannot be undone.");
-                let state = self.state.clone();
-                let state_for_write = state.clone();
-                request_connection_write(
-                    state,
-                    crate::components::WriteRequest::new(
-                        connection,
-                        database.clone(),
-                        "Drop a database",
-                        Some(WriteConfirmation {
-                            title: "Drop database".into(),
-                            message,
-                            confirm_label: "Drop".into(),
-                            destructive: true,
-                        }),
-                    ),
-                    window,
-                    cx,
-                    move |_window, cx| {
-                        AppCommands::drop_database(state_for_write, connection, database, cx);
-                    },
-                );
-            }
-            TreeNodeId::Collection { connection, database, collection } => {
-                let message =
-                    format!("Drop collection \"{database}.{collection}\"? This cannot be undone.");
-                let state = self.state.clone();
-                let state_for_write = state.clone();
-                request_connection_write(
-                    state,
-                    crate::components::WriteRequest::new(
-                        connection,
-                        format!("{database}.{collection}"),
-                        "Drop a collection",
-                        Some(WriteConfirmation {
-                            title: "Drop collection".into(),
-                            message,
-                            confirm_label: "Drop".into(),
-                            destructive: true,
-                        }),
-                    ),
-                    window,
-                    cx,
-                    move |_window, cx| {
-                        AppCommands::drop_collection(
-                            state_for_write,
-                            connection,
-                            database,
-                            collection,
-                            cx,
-                        );
-                    },
-                );
-            }
+        if let Some(node_id) = self.model.selected_tree_id.clone() {
+            confirm_delete_node(self.state.clone(), node_id, window, cx);
         }
     }
 
@@ -947,7 +934,7 @@ impl Sidebar {
         self.search_state.update(cx, |state, cx| {
             state.set_value(String::new(), window, cx);
         });
-        window.focus(&self.focus_handle);
+        window.focus(&self.focus_handle, cx);
         cx.notify();
     }
 
@@ -1056,7 +1043,7 @@ impl Sidebar {
 
     fn select_typeahead_match(&mut self, cx: &mut Context<Self>) {
         if let Some((ix, _node_id)) = self.model.select_typeahead_match() {
-            self.scroll_handle.scroll_to_item(ix, gpui::ScrollStrategy::Center);
+            self.scroll_to_row(ix, ScrollStrategy::Center);
             cx.notify();
         }
     }
@@ -1116,11 +1103,14 @@ impl Sidebar {
         self.apply_sidebar_selection(next, node_id, true, cx);
     }
 
+    /// Rows that fit in the list right now, less one so a page keeps a row of context.
+    fn page_size(&self, cx: &App) -> isize {
+        let viewport = self.scroll_handle.0.borrow().base_handle.bounds().size.height;
+        ((viewport / Self::row_height(cx)) as isize - 1).max(1)
+    }
+
     fn move_sidebar_page(&mut self, delta: isize, cx: &mut Context<Self>) {
-        let Some((next, node_id)) = self.model.move_sidebar_page(delta, 10) else {
-            return;
-        };
-        self.apply_sidebar_selection(next, node_id, true, cx);
+        self.move_sidebar_selection(delta * self.page_size(cx), cx);
     }
 
     fn select_sidebar_first(&mut self, cx: &mut Context<Self>) {
@@ -1155,7 +1145,11 @@ impl Sidebar {
         preview: bool,
         cx: &mut Context<Self>,
     ) {
-        self.scroll_handle.scroll_to_item(next, gpui::ScrollStrategy::Center);
+        // The user picked a row themselves, so a reveal still waiting on a load stands down.
+        self.pending_reveal = None;
+        // Nearest moves the list only as far as it must; centering made every step past the
+        // edge jump half a screen.
+        self.scroll_to_row(next, ScrollStrategy::Nearest);
         cx.notify();
         if preview {
             self.schedule_keyboard_preview(node_id, cx);
@@ -1165,7 +1159,9 @@ impl Sidebar {
     fn move_search_selection(&mut self, delta: isize, cx: &mut Context<Self>) {
         let query = self.search_state.read(cx).value().to_string();
         let results = self.search_results(&query, cx);
-        self.model.move_search_selection(delta, results.len());
+        if let Some(ix) = self.model.move_search_selection(delta, results.len()) {
+            self.search_scroll_handle.scroll_to_item(ix);
+        }
         cx.notify();
     }
 
@@ -1176,19 +1172,11 @@ impl Sidebar {
         cx: &mut Context<Self>,
     ) {
         self.cancel_keyboard_preview();
-        self.model.clear_selection();
-        self.model.expanded_nodes.insert(TreeNodeId::connection(result.connection_id));
-        if let Some(database) = result.database.as_ref() {
-            self.model
-                .expanded_nodes
-                .insert(TreeNodeId::database(result.connection_id, database.clone()));
+        self.reveal_node(result.node_id.clone(), cx);
+        if !result.node_id.is_collection() {
+            // Picking a connection or a database opens it, so its contents are in reach.
+            self.set_node_expanded(&result.node_id, true, false, cx);
         }
-        if result.node_id.is_connection() {
-            self.model.expanded_nodes.insert(result.node_id.clone());
-        }
-        self.persist_expanded_nodes(cx);
-        self.refresh_tree(cx);
-        self.select_sidebar_node(result.node_id.clone(), false, cx);
 
         let opened_collection = result.collection.is_some();
         match (result.database.clone(), result.collection.clone()) {
@@ -1199,21 +1187,6 @@ impl Sidebar {
                 });
             }
             (Some(database), None) => {
-                let database_node = TreeNodeId::database(result.connection_id, database.clone());
-                let should_load = self
-                    .state
-                    .read(cx)
-                    .active_connection_by_id(result.connection_id)
-                    .is_some_and(|conn| !conn.collections.contains_key(&database));
-                if should_load && !self.model.loading_databases.contains(&database_node) {
-                    self.model.loading_databases.insert(database_node.clone());
-                    AppCommands::load_collections(
-                        self.state.clone(),
-                        result.connection_id,
-                        database.clone(),
-                        cx,
-                    );
-                }
                 self.state.update(cx, |state, cx| {
                     state.select_connection(Some(result.connection_id), cx);
                     state.select_database(database, cx);
@@ -1269,7 +1242,8 @@ impl Sidebar {
             }
         }
 
-        let results = search_results(query, candidates);
+        let mut results = search_results(query, candidates);
+        results.truncate(SEARCH_RESULTS_LIMIT);
         self.search_cache = Some(SidebarSearchCache {
             query: query.to_string(),
             connections: self.cached_connections.clone(),

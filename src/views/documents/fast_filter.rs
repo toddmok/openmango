@@ -75,7 +75,9 @@ pub(crate) fn compile_filter_input(raw: &str) -> Result<CompiledFilter, FastFilt
         return Ok(CompiledFilter { raw_store: String::new(), document: None });
     }
 
-    let doc = if trimmed.starts_with('{') {
+    let doc = if let Some(id) = document_id_input(trimmed) {
+        mongodb::bson::doc! { "_id": id }
+    } else if trimmed.starts_with('{') {
         parse_document_from_json(trimmed).map_err(FastFilterError::invalid)?
     } else if looks_like_document_body(trimmed) {
         match parse_document_from_json(&format!("{{{trimmed}}}")) {
@@ -96,16 +98,18 @@ pub(crate) fn format_compiled_filter(compiled: &CompiledFilter) -> String {
     if compiled.document.is_none() { "{}".to_string() } else { compiled.raw_store.clone() }
 }
 
-pub(crate) fn filter_chips_for_input(raw: &str) -> Vec<String> {
-    let Ok(compiled) = compile_filter_input(raw) else {
-        return Vec::new();
-    };
-    let Some(doc) = compiled.document else {
-        return Vec::new();
-    };
-    let mut chips = Vec::new();
-    collect_document_chips(&doc, &mut chips);
-    chips
+/// Recognize unambiguous scalar IDs; bare words remain field-name input.
+pub(crate) fn document_id_input(raw: &str) -> Option<Bson> {
+    let raw = raw.trim();
+    if raw.len() == 24 && raw.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return ObjectId::parse_str(raw).ok().map(Bson::ObjectId);
+    }
+    if raw.starts_with("ObjectId(") || raw.starts_with("UUID(") || raw.starts_with('"') {
+        return parse_bson_from_relaxed_json(raw).ok().filter(|value| {
+            matches!(value, Bson::ObjectId(_) | Bson::Binary(_) | Bson::String(_))
+        });
+    }
+    None
 }
 
 fn compiled_from_document(doc: Document) -> CompiledFilter {
@@ -115,101 +119,6 @@ fn compiled_from_document(doc: Document) -> CompiledFilter {
 
     let value = Bson::Document(doc.clone()).into_relaxed_extjson();
     CompiledFilter { raw_store: format_relaxed_json_compact(&value), document: Some(doc) }
-}
-
-fn collect_document_chips(doc: &Document, out: &mut Vec<String>) {
-    if let Some(Bson::Array(items)) = doc.get("$and") {
-        for item in items {
-            if let Bson::Document(child) = item {
-                collect_document_chips(child, out);
-            }
-        }
-    }
-    if let Some(Bson::Array(items)) = doc.get("$or") {
-        let mut clauses = Vec::new();
-        for item in items {
-            if let Bson::Document(child) = item {
-                let mut child_chips = Vec::new();
-                collect_document_chips(child, &mut child_chips);
-                if !child_chips.is_empty() {
-                    clauses.push(child_chips.join(" AND "));
-                }
-            }
-        }
-        if !clauses.is_empty() {
-            out.push(format!("({})", clauses.join(" OR ")));
-        }
-    }
-
-    for (field, value) in doc {
-        if field == "$and" || field == "$or" {
-            continue;
-        }
-        collect_field_chips(field, value, out);
-    }
-}
-
-fn collect_field_chips(field: &str, value: &Bson, out: &mut Vec<String>) {
-    let Bson::Document(operators) = value else {
-        out.push(format!("{field} = {}", chip_value(value)));
-        return;
-    };
-
-    if !operators.keys().all(|key| key.starts_with('$')) {
-        out.push(format!("{field} = {}", chip_value(value)));
-        return;
-    }
-
-    if let Some(value) = operators.get("$exists") {
-        match value {
-            Bson::Boolean(true) => out.push(format!("{field} exists")),
-            Bson::Boolean(false) => out.push(format!("{field} missing")),
-            _ => out.push(format!("{field} exists {}", chip_value(value))),
-        }
-    }
-    if let Some(value) = operators.get("$eq") {
-        out.push(format!("{field} = {}", chip_value(value)));
-    }
-    if let Some(value) = operators.get("$ne") {
-        out.push(format!("{field} != {}", chip_value(value)));
-    }
-    for (operator, label) in
-        [("$gt", ">"), ("$gte", ">="), ("$lt", "<"), ("$lte", "<="), ("$type", "type")]
-    {
-        if let Some(value) = operators.get(operator) {
-            out.push(format!("{field} {label} {}", chip_value(value)));
-        }
-    }
-    if let Some(value) = operators.get("$in") {
-        out.push(format!("{field} in {}", chip_value(value)));
-    }
-    if let Some(value) = operators.get("$nin") {
-        out.push(format!("{field} not in {}", chip_value(value)));
-    }
-    if let Some(value) = operators.get("$regex") {
-        out.push(format!("{field} ~ {}", chip_value(value)));
-    }
-}
-
-fn chip_value(value: &Bson) -> String {
-    let label = match value {
-        Bson::String(value) => value.clone(),
-        Bson::Array(values) => values.iter().map(chip_value).collect::<Vec<_>>().join(", "),
-        _ => {
-            let value = value.clone().into_relaxed_extjson();
-            format_relaxed_json_compact(&value)
-        }
-    };
-    truncate_chip_label(&label, 54)
-}
-
-fn truncate_chip_label(label: &str, max_chars: usize) -> String {
-    if label.chars().count() <= max_chars {
-        return label.to_string();
-    }
-    let mut out = label.chars().take(max_chars.saturating_sub(3)).collect::<String>();
-    out.push_str("...");
-    out
 }
 
 fn looks_like_document_body(trimmed: &str) -> bool {
@@ -1168,7 +1077,36 @@ fn is_quoted(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{compile_filter_input, filter_chips_for_input, format_compiled_filter};
+    use super::{compile_filter_input, format_compiled_filter};
+
+    #[test]
+    fn document_ids_compile_to_typed_id_queries_without_reinterpreting_field_names() {
+        use mongodb::bson::{Bson, oid::ObjectId};
+        let hex = "507f1f77bcf86cd799439011";
+        for raw in [hex.to_string(), format!("ObjectId(\"{hex}\")")] {
+            let doc = compile_filter_input(&raw).unwrap().document.unwrap();
+            assert_eq!(doc.get("_id"), Some(&Bson::ObjectId(ObjectId::parse_str(hex).unwrap())));
+            assert_eq!(doc.len(), 1);
+        }
+        assert_eq!(
+            compile_filter_input("\"customer-42\"")
+                .unwrap()
+                .document
+                .unwrap()
+                .get_str("_id")
+                .unwrap(),
+            "customer-42"
+        );
+        assert!(super::document_id_input("status").is_none());
+        assert!(compile_filter_input("status").is_err());
+        assert!(
+            compile_filter_input("{ status: \"active\" }")
+                .unwrap()
+                .document
+                .unwrap()
+                .contains_key("status")
+        );
+    }
 
     fn formatted(raw: &str) -> String {
         let compiled = compile_filter_input(raw).expect("compile filter");
@@ -1177,18 +1115,18 @@ mod tests {
 
     #[test]
     fn compiles_fast_equality_filter() {
-        assert_eq!(formatted("status:active"), "{status: \"active\"}");
-        assert_eq!(formatted("status:active,type:user"), "{status: \"active\", type: \"user\"}");
-        assert_eq!(formatted("name: \"alice\""), "{name: \"alice\"}");
+        assert_eq!(formatted("status:active"), "{ status: \"active\" }");
+        assert_eq!(formatted("status:active,type:user"), "{ status: \"active\", type: \"user\" }");
+        assert_eq!(formatted("name: \"alice\""), "{ name: \"alice\" }");
     }
 
     #[test]
     fn compiles_fast_comparison_filters() {
-        assert_eq!(formatted("age>30"), "{age: {$gt: 30}}");
-        assert_eq!(formatted("age>30 age<50"), "{age: {$gt: 30, $lt: 50}}");
+        assert_eq!(formatted("age>30"), "{ age: { $gt: 30 } }");
+        assert_eq!(formatted("age>30 age<50"), "{ age: { $gt: 30, $lt: 50 } }");
         assert_eq!(
             formatted("createdAt>=ISODate(\"2024-01-01T00:00:00Z\")"),
-            "{createdAt: {$gte: ISODate(\"2024-01-01T00:00:00Z\")}}"
+            "{ createdAt: { $gte: ISODate(\"2024-01-01T00:00:00Z\") } }"
         );
     }
 
@@ -1196,29 +1134,32 @@ mod tests {
     fn compiles_fast_contains_and_negation_filters() {
         assert_eq!(
             formatted("email~gmail !deleted"),
-            "{email: {$regex: \"gmail\", $options: \"i\"}, deleted: {$ne: true}}"
+            "{ email: { $regex: \"gmail\", $options: \"i\" }, deleted: { $ne: true } }"
         );
     }
 
     #[test]
     fn compiles_fast_in_filters() {
-        assert_eq!(formatted("plan in pro,team"), "{plan: {$in: [\"pro\", \"team\"]}}");
-        assert_eq!(formatted("plan not in [free,team]"), "{plan: {$nin: [\"free\", \"team\"]}}");
+        assert_eq!(formatted("plan in pro,team"), "{ plan: { $in: [\"pro\", \"team\"] } }");
+        assert_eq!(
+            formatted("plan not in [free,team]"),
+            "{ plan: { $nin: [\"free\", \"team\"] } }"
+        );
     }
 
     #[test]
     fn smart_converts_bare_object_ids_for_id_fields() {
         assert_eq!(
             formatted("_id:6392478cbdd1f183c69543c3"),
-            "{_id: ObjectId(\"6392478cbdd1f183c69543c3\")}"
+            "{ _id: ObjectId(\"6392478cbdd1f183c69543c3\") }"
         );
         assert_eq!(
             formatted("ownerId:6392478cbdd1f183c69543c3"),
-            "{ownerId: ObjectId(\"6392478cbdd1f183c69543c3\")}"
+            "{ ownerId: ObjectId(\"6392478cbdd1f183c69543c3\") }"
         );
         assert_eq!(
             formatted("_id in 6392478cbdd1f183c69543c3,6392478cbdd1f183c69543c4"),
-            "{_id: {$in: [ObjectId(\"6392478cbdd1f183c69543c3\"), ObjectId(\"6392478cbdd1f183c69543c4\")]}}"
+            "{ _id: { $in: [ObjectId(\"6392478cbdd1f183c69543c3\"), ObjectId(\"6392478cbdd1f183c69543c4\")] } }"
         );
     }
 
@@ -1226,11 +1167,11 @@ mod tests {
     fn smart_object_id_conversion_is_field_aware_and_quote_safe() {
         assert_eq!(
             formatted("token:6392478cbdd1f183c69543c3"),
-            "{token: \"6392478cbdd1f183c69543c3\"}"
+            "{ token: \"6392478cbdd1f183c69543c3\" }"
         );
         assert_eq!(
             formatted("_id:\"6392478cbdd1f183c69543c3\""),
-            "{_id: \"6392478cbdd1f183c69543c3\"}"
+            "{ _id: \"6392478cbdd1f183c69543c3\" }"
         );
     }
 
@@ -1238,11 +1179,11 @@ mod tests {
     fn smart_converts_date_day_shorthand_for_date_fields() {
         assert_eq!(
             formatted("createdAt:2026-05-23"),
-            "{createdAt: {$gte: ISODate(\"2026-05-23T00:00:00Z\"), $lt: ISODate(\"2026-05-24T00:00:00Z\")}}"
+            "{ createdAt: { $gte: ISODate(\"2026-05-23T00:00:00Z\"), $lt: ISODate(\"2026-05-24T00:00:00Z\") } }"
         );
         assert_eq!(
             formatted("createdAt<=2026-05-23"),
-            "{createdAt: {$lt: ISODate(\"2026-05-24T00:00:00Z\")}}"
+            "{ createdAt: { $lt: ISODate(\"2026-05-24T00:00:00Z\") } }"
         );
     }
 
@@ -1250,29 +1191,29 @@ mod tests {
     fn smart_converts_month_year_quarter_and_explicit_ranges() {
         assert_eq!(
             formatted("createdAt:2026-05"),
-            "{createdAt: {$gte: ISODate(\"2026-05-01T00:00:00Z\"), $lt: ISODate(\"2026-06-01T00:00:00Z\")}}"
+            "{ createdAt: { $gte: ISODate(\"2026-05-01T00:00:00Z\"), $lt: ISODate(\"2026-06-01T00:00:00Z\") } }"
         );
         assert_eq!(
             formatted("createdAt:2026"),
-            "{createdAt: {$gte: ISODate(\"2026-01-01T00:00:00Z\"), $lt: ISODate(\"2027-01-01T00:00:00Z\")}}"
+            "{ createdAt: { $gte: ISODate(\"2026-01-01T00:00:00Z\"), $lt: ISODate(\"2027-01-01T00:00:00Z\") } }"
         );
         assert_eq!(
             formatted("createdAt:2026Q2"),
-            "{createdAt: {$gte: ISODate(\"2026-04-01T00:00:00Z\"), $lt: ISODate(\"2026-07-01T00:00:00Z\")}}"
+            "{ createdAt: { $gte: ISODate(\"2026-04-01T00:00:00Z\"), $lt: ISODate(\"2026-07-01T00:00:00Z\") } }"
         );
         assert_eq!(
             formatted("createdAt:2026-05-01..2026-05-31"),
-            "{createdAt: {$gte: ISODate(\"2026-05-01T00:00:00Z\"), $lt: ISODate(\"2026-06-01T00:00:00Z\")}}"
+            "{ createdAt: { $gte: ISODate(\"2026-05-01T00:00:00Z\"), $lt: ISODate(\"2026-06-01T00:00:00Z\") } }"
         );
         assert_eq!(
             formatted("createdAt:..2026-05-31"),
-            "{createdAt: {$lt: ISODate(\"2026-06-01T00:00:00Z\")}}"
+            "{ createdAt: { $lt: ISODate(\"2026-06-01T00:00:00Z\") } }"
         );
     }
 
     #[test]
     fn date_conversion_is_field_aware() {
-        assert_eq!(formatted("status:2026-05-23"), "{status: \"2026-05-23\"}");
+        assert_eq!(formatted("status:2026-05-23"), "{ status: \"2026-05-23\" }");
     }
 
     #[test]
@@ -1285,25 +1226,12 @@ mod tests {
     }
 
     #[test]
-    fn builds_readable_filter_chips() {
-        assert_eq!(
-            filter_chips_for_input("status:active age>30 email~gmail !deleted"),
-            vec!["status = active", "age > 30", "email ~ gmail", "deleted != true",]
-        );
-    }
-
-    #[test]
-    fn builds_readable_or_filter_chip() {
-        assert_eq!(
-            filter_chips_for_input(r#"{"$or":[{"status":"active"},{"age":{"$gt":30}}]}"#),
-            vec!["(status = active OR age > 30)",]
-        );
-    }
-
-    #[test]
     fn preserves_raw_document_filters() {
-        assert_eq!(formatted("name:\"alice\",age:1"), "{name: \"alice\", age: 1}");
-        assert_eq!(formatted("{ status: { $ne: \"archived\" } }"), "{status: {$ne: \"archived\"}}");
+        assert_eq!(formatted("name:\"alice\",age:1"), "{ name: \"alice\", age: 1 }");
+        assert_eq!(
+            formatted("{ status: { $ne: \"archived\" } }"),
+            "{ status: { $ne: \"archived\" } }"
+        );
     }
 
     #[test]

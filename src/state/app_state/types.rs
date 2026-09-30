@@ -25,8 +25,12 @@ pub enum View {
     Documents,
     Database,
     Transfer,
+    Compare,
     Forge,
+    References,
+    Relations,
     AgentActivity,
+    Tasks,
     Connections,
     Settings,
     Changelog,
@@ -37,6 +41,7 @@ pub enum DocumentViewMode {
     #[default]
     Tree,
     Table,
+    Json,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -74,14 +79,17 @@ impl CollectionSubview {
     }
 }
 
+/// Identifies a collection. Everything cached per collection rather than per open view
+/// (schema metadata, Forge field lists) is keyed by this, so several views of one collection
+/// share a single cache entry.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct SessionKey {
+pub struct CollectionKey {
     pub connection_id: Uuid,
     pub database: String,
     pub collection: String,
 }
 
-impl SessionKey {
+impl CollectionKey {
     pub fn new(
         connection_id: Uuid,
         database: impl Into<String>,
@@ -92,6 +100,59 @@ impl SessionKey {
 
     pub fn namespace(&self) -> String {
         format!("{}.{}", self.database, self.collection)
+    }
+}
+
+/// Identifies one open view of a collection: its documents, filter, selection and scroll.
+///
+/// `instance` separates two views of the same collection, which is what lets a tab keep its
+/// previous view alive in history while showing another, and lets the same collection be open
+/// in two tabs at once. Instance 0 is the view a plain sidebar open creates.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SessionKey {
+    pub connection_id: Uuid,
+    pub database: String,
+    pub collection: String,
+    pub instance: u32,
+}
+
+impl SessionKey {
+    pub fn new(
+        connection_id: Uuid,
+        database: impl Into<String>,
+        collection: impl Into<String>,
+    ) -> Self {
+        Self::with_instance(connection_id, database, collection, 0)
+    }
+
+    pub fn with_instance(
+        connection_id: Uuid,
+        database: impl Into<String>,
+        collection: impl Into<String>,
+        instance: u32,
+    ) -> Self {
+        Self { connection_id, database: database.into(), collection: collection.into(), instance }
+    }
+
+    pub fn namespace(&self) -> String {
+        format!("{}.{}", self.database, self.collection)
+    }
+
+    pub fn collection_key(&self) -> CollectionKey {
+        CollectionKey::new(self.connection_id, &self.database, &self.collection)
+    }
+
+    /// True when both keys name the same collection, whichever view each one is.
+    pub fn same_collection(&self, other: &SessionKey) -> bool {
+        self.connection_id == other.connection_id
+            && self.database == other.database
+            && self.collection == other.collection
+    }
+
+    pub fn is_collection(&self, connection_id: Uuid, database: &str, collection: &str) -> bool {
+        self.connection_id == connection_id
+            && self.database == database
+            && self.collection == collection
     }
 }
 
@@ -112,8 +173,14 @@ pub enum TabKey {
     Collection(SessionKey),
     Database(DatabaseKey),
     Transfer(TransferTabKey),
+    Compare(crate::state::compare::CompareTabKey),
     Forge(ForgeTabKey),
+    References(ReferencesTabKey),
+    /// The relation canvas of one database. One per database: it shows a place, so asking again
+    /// returns to the tab that is already open.
+    Relations(DatabaseKey),
     AgentActivity,
+    Tasks,
     Connections,
     Settings,
     Changelog,
@@ -203,11 +270,6 @@ impl TransferFormat {
             TransferFormat::Bson => "bson",
         }
     }
-
-    #[allow(dead_code)]
-    pub fn available_for_collection(self) -> bool {
-        !matches!(self, TransferFormat::Bson)
-    }
 }
 
 // InsertMode, ExtendedJsonMode, BsonOutputFormat: canonical definitions in crate::connection::types
@@ -249,12 +311,24 @@ pub struct ForgeTabKey {
     pub database: String,
 }
 
+/// Identifies a tab answering "what points at this document?".
+///
+/// Carries its own id because the same document can be asked about twice, and because the tab
+/// holds a result rather than a place — re-asking is a new tab, not a changed one.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ReferencesTabKey {
+    pub id: Uuid,
+    pub connection_id: Uuid,
+    pub database: String,
+    /// The collection being pointed at.
+    pub collection: String,
+}
+
 /// Default content for a Forge query shell tab.
 pub const DEFAULT_FORGE_CONTENT: &str = "";
 
 /// State for a Forge query shell tab
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct ForgeTabState {
     pub content: String,
     pub collection: Option<String>,
@@ -385,12 +459,26 @@ impl TransferOptions {
     }
 }
 
+/// A connection a task run opened for itself, for a transfer to use.
+#[derive(Clone, Debug)]
+pub struct TaskClient {
+    pub client: mongodb::Client,
+    /// The address the BSON tools use to reach it through the run's own tunnel.
+    pub tool_uri: Option<String>,
+}
+
 /// Runtime transfer execution state (not serialized)
 #[derive(Default)]
 pub struct TransferRuntime {
     pub is_running: bool,
+    /// The last failure can pass, such as a dropped connection: a task may run it again.
+    pub failure_transient: bool,
+    /// Connections a task run opened for itself, used instead of the sidebar's.
+    pub clients: HashMap<Uuid, TaskClient>,
     pub has_started: bool,
     pub cancellation_requested: bool,
+    /// A BSON tool was asked to stop but its exit couldn't be confirmed, so it isn't a clean cancel.
+    pub cancellation_unconfirmed: bool,
     pub progress_count: u64,
     pub error_message: Option<String>,
     pub transfer_generation: Arc<AtomicU64>,
@@ -408,9 +496,12 @@ impl TransferRuntime {
 impl Clone for TransferRuntime {
     fn clone(&self) -> Self {
         Self {
+            failure_transient: self.failure_transient,
+            clients: self.clients.clone(),
             is_running: self.is_running,
             has_started: self.has_started,
             cancellation_requested: self.cancellation_requested,
+            cancellation_unconfirmed: self.cancellation_unconfirmed,
             progress_count: self.progress_count,
             error_message: self.error_message.clone(),
             transfer_generation: Arc::new(AtomicU64::new(
@@ -429,6 +520,7 @@ impl std::fmt::Debug for TransferRuntime {
             .field("is_running", &self.is_running)
             .field("has_started", &self.has_started)
             .field("cancellation_requested", &self.cancellation_requested)
+            .field("cancellation_unconfirmed", &self.cancellation_unconfirmed)
             .field("progress_count", &self.progress_count)
             .field("error_message", &self.error_message)
             .field("database_progress", &self.database_progress)
@@ -460,6 +552,10 @@ pub struct TransferTabState {
     /// Preview state (not serialized)
     #[serde(skip)]
     pub preview: TransferPreview,
+
+    /// The task this tab was opened to edit, if any: saving writes back to that task.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<Uuid>,
 }
 
 impl TransferTabState {
@@ -503,6 +599,29 @@ pub struct ConnectionState {
     pub selection_cache: HashMap<Uuid, (Option<String>, Option<String>)>,
 }
 
+/// Where a collection tab has been, so Back returns to the exact view it left.
+///
+/// Every entry is a live `SessionKey`: its documents, filter, selection and scroll are still in
+/// the session store, so going back restores the view instead of re-running the query.
+#[derive(Debug, Default, Clone)]
+pub struct NavHistory {
+    /// Views behind the current one, oldest first.
+    pub back: Vec<SessionKey>,
+    /// Views ahead of the current one, nearest first.
+    pub forward: Vec<SessionKey>,
+}
+
+impl NavHistory {
+    /// Every session this history holds, excluding whichever one the tab shows now.
+    pub fn sessions(&self) -> impl Iterator<Item = &SessionKey> {
+        self.back.iter().chain(self.forward.iter())
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.back.is_empty() && self.forward.is_empty()
+    }
+}
+
 /// Tab management state
 #[derive(Default)]
 pub struct TabState {
@@ -516,6 +635,13 @@ pub struct TabState {
     pub dirty: HashSet<SessionKey>,
     /// Current drag-over target for open tab reordering: (tab_index, insert_after)
     pub drag_over: Option<(usize, bool)>,
+    /// Back/forward stacks, keyed by the session the owning tab currently shows. Navigating
+    /// moves a tab's entry from its old key to its new one, so the key is always the tab's
+    /// current view and no separate tab identity is needed.
+    pub history: HashMap<SessionKey, NavHistory>,
+    /// Source of `SessionKey::instance`. Never reused, so a closed view's key cannot collide
+    /// with a later one.
+    pub next_instance: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -720,7 +846,9 @@ pub struct ExplainState {
     pub summary: Option<ExplainSummary>,
     pub rejected_plans: Vec<ExplainRejectedPlan>,
     pub bottlenecks: Vec<ExplainBottleneck>,
-    pub history: Vec<ExplainRun>,
+    /// Shared, not owned: the documents view snapshots this state every frame while the modal
+    /// is open, and each run carries its whole raw plan.
+    pub history: Vec<Arc<ExplainRun>>,
     pub current_run_id: Option<String>,
     pub compare_run_id: Option<String>,
     pub diff: Option<ExplainDiff>,
@@ -737,7 +865,7 @@ impl ExplainState {
     }
 
     pub fn push_run_with_limit(&mut self, run: ExplainRun, max_history: usize) {
-        self.history.push(run);
+        self.history.push(Arc::new(run));
         if max_history > 0 && self.history.len() > max_history {
             let overflow = self.history.len() - max_history;
             self.history.drain(0..overflow);
@@ -748,28 +876,6 @@ impl ExplainState {
         } else {
             None
         };
-        self.sync_from_selected_runs();
-    }
-
-    pub fn set_current_run(&mut self, run_id: Option<String>) {
-        if let Some(run_id) = run_id {
-            if self.history.iter().any(|run| run.id == run_id) {
-                self.current_run_id = Some(run_id);
-            }
-        } else {
-            self.current_run_id = None;
-        }
-        self.sync_from_selected_runs();
-    }
-
-    pub fn set_compare_run(&mut self, run_id: Option<String>) {
-        if let Some(run_id) = run_id {
-            if self.history.iter().any(|run| run.id == run_id) {
-                self.compare_run_id = Some(run_id);
-            }
-        } else {
-            self.compare_run_id = None;
-        }
         self.sync_from_selected_runs();
     }
 
@@ -1103,10 +1209,13 @@ pub struct SessionData {
     pub is_loading: bool,
     pub loaded: bool,
     pub request_id: u64,
-    pub query_error: Option<String>,
+    pub query_error: Option<crate::error::ErrorReport>,
     pub query_cancellation: Option<crate::connection::types::CancellationToken>,
     pub filter_raw: String,
     pub filter: Option<Document>,
+    /// `filter` as compact JSON. Kept beside it by `set_filter`: the documents view reads it on
+    /// every frame, and serializing BSON that often is wasted work.
+    pub filter_compiled_raw: String,
     pub sort_raw: String,
     pub sort: Option<Document>,
     pub projection_raw: String,
@@ -1117,6 +1226,10 @@ pub struct SessionData {
     pub indexes: Option<Vec<IndexModel>>,
     pub indexes_loading: bool,
     pub indexes_error: Option<String>,
+    /// How often each index is used, by name. `None` when the server would not say: no
+    /// privilege, a view, or a server too old. Loaded with `indexes`, never an error by itself.
+    pub index_usage:
+        Option<std::collections::HashMap<String, crate::connection::ops::indexes::IndexUsage>>,
     pub aggregation: PipelineState,
     pub explain: ExplainState,
     pub ai_chat: AiChatState,
@@ -1150,6 +1263,7 @@ impl Default for SessionData {
             query_cancellation: None,
             filter_raw: String::new(),
             filter: None,
+            filter_compiled_raw: String::new(),
             sort_raw: String::new(),
             sort: None,
             projection_raw: String::new(),
@@ -1160,6 +1274,7 @@ impl Default for SessionData {
             indexes: None,
             indexes_loading: false,
             indexes_error: None,
+            index_usage: None,
             aggregation: PipelineState::default(),
             explain: ExplainState::default(),
             ai_chat: AiChatState::default(),
@@ -1196,6 +1311,8 @@ pub struct SessionViewState {
     pub selected_docs: HashSet<DocumentKey>,
     pub expanded_nodes: HashSet<String>,
     pub drafts: HashMap<DocumentKey, Document>,
+    pub draft_baselines: HashMap<DocumentKey, Document>,
+    pub saving_documents: HashSet<DocumentKey>,
     pub dirty: HashSet<DocumentKey>,
     pub subview: CollectionSubview,
     pub view_mode: DocumentViewMode,
@@ -1232,11 +1349,12 @@ pub struct SessionSnapshot {
     pub page: u64,
     pub per_page: i64,
     pub is_loading: bool,
-    pub query_error: Option<String>,
+    pub query_error: Option<crate::error::ErrorReport>,
     pub selected_doc: Option<DocumentKey>,
     pub selected_docs: HashSet<DocumentKey>,
     pub selected_count: usize,
-    pub any_selected_dirty: bool,
+    /// Documents in this tab with unsaved edits.
+    pub dirty_count: usize,
     pub filter_raw: String,
     pub filter_compiled_raw: String,
     pub sort_raw: String,
@@ -1409,7 +1527,6 @@ pub enum CopiedTreeItem {
 
 /// Status of a single collection transfer
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-#[allow(dead_code)]
 pub enum CollectionTransferStatus {
     #[default]
     Pending,
@@ -1447,27 +1564,9 @@ pub struct DatabaseTransferProgress {
     pub panel_expanded: bool,
 }
 
-#[allow(dead_code)]
 impl DatabaseTransferProgress {
     pub fn total_documents_processed(&self) -> u64 {
         self.collections.iter().map(|c| c.documents_processed).sum()
-    }
-
-    pub fn total_documents_total(&self) -> Option<u64> {
-        let totals: Vec<u64> = self.collections.iter().filter_map(|c| c.documents_total).collect();
-        if totals.len() == self.collections.len() && !totals.is_empty() {
-            Some(totals.iter().sum())
-        } else {
-            None
-        }
-    }
-
-    pub fn overall_percentage(&self) -> Option<f32> {
-        let total = self.total_documents_total()?;
-        if total == 0 {
-            return Some(100.0);
-        }
-        Some((self.total_documents_processed() as f32 / total as f32) * 100.0)
     }
 
     pub fn completed_count(&self) -> usize {

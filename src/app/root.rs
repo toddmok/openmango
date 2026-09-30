@@ -1,28 +1,31 @@
 use std::sync::Arc;
 
-use gpui::prelude::{FluentBuilder as _, InteractiveElement as _};
-use gpui::*;
-use gpui_component::ActiveTheme as _;
-use gpui_component::tooltip::Tooltip;
+use gpui_kit::component::ActiveTheme as _;
+use gpui_kit::component::TitleBar;
+use gpui_kit::component::tooltip::Tooltip;
+use gpui_kit::prelude::{FluentBuilder as _, InteractiveElement as _};
+use gpui_kit::*;
 use uuid::Uuid;
 
 use super::sidebar::Sidebar;
+use super::sidebar_model::SidebarModel;
 use crate::components::action_bar::ActionBar;
+use crate::components::node_commands::{confirm_delete_node, copy_node_name};
 use crate::components::{
-    ConnectionManager, ContentArea, QueryLibraryDialog, StatusBar, WriteConfirmation,
-    open_confirm_dialog, request_app_quit, request_connection_write, request_disconnect_connection,
-    request_remove_connection,
+    ConnectionManager, ContentArea, OpenTabsBar, QueryLibraryDialog, StatusBar, request_app_quit,
+    request_disconnect_connection,
 };
 use crate::helpers::keystore::KeyStore;
 use crate::helpers::validate::UriSecrets;
 use crate::keyboard::{
     self, CloseTab, CopyConnectionUri, CopySelectionName, CreateCollection, CreateDatabase,
     CreateIndex, DeleteConnection, DeleteDatabase, DisconnectConnection, DownloadUpdate,
-    EditConnection, FocusContent, FocusSidebar, InstallUpdate, NewConnection, NextTab,
-    OpenActionBar, OpenForge, OpenQueryLibrary, OpenSettings, PrevTab, QuitApp, RefreshView,
-    SelectTab1, SelectTab2, SelectTab3, SelectTab4, SelectTab5, SelectTab6, SelectTab7, SelectTab8,
-    SelectTab9, ToggleAiPanel,
+    EditConnection, FocusContent, FocusSidebar, InstallUpdate, NavigateBack, NavigateForward,
+    NewConnection, NextTab, OpenActionBar, OpenConnectionSwitcher, OpenForge, OpenQueryLibrary,
+    OpenSettings, PrevTab, QuitApp, RefreshView, SelectTab1, SelectTab2, SelectTab3, SelectTab4,
+    SelectTab5, SelectTab6, SelectTab7, SelectTab8, SelectTab9, ToggleAiPanel,
 };
+use crate::models::TreeNodeId;
 use crate::state::app_state::updater::UpdateStatus;
 use crate::state::app_state::{
     ConnectionSecrets, LEGACY_CONNECTION_SECRET_KEYS, connection_secret_bundle_key,
@@ -44,6 +47,7 @@ pub struct AppRoot {
     pub(super) focus_handle: FocusHandle,
     pub(super) sidebar: Entity<Sidebar>,
     pub(super) content_area: Entity<ContentArea>,
+    workspace_tabs: Entity<OpenTabsBar>,
     ai_view: Entity<AiView>,
     pub(super) action_bar: Entity<ActionBar>,
     pub(super) key_debug: bool,
@@ -55,6 +59,10 @@ pub struct AppRoot {
     ai_drag_start_x: Pixels,
     ai_drag_start_width: f32,
     ai_drag_current_width: Option<f32>,
+    /// Newest error already shown as a notification.
+    notified_error_id: u64,
+    /// Connections with a Reconnect notification on screen.
+    reconnect_toasts: std::collections::HashSet<Uuid>,
     _subscriptions: Vec<Subscription>,
     mcp_shutdown: Option<tokio_util::sync::CancellationToken>,
     mcp_enabled: bool,
@@ -196,7 +204,7 @@ impl AppRoot {
                         writes.push(KeyStore::write(cx, legacy_provider, api_key));
                     }
                     writes
-                })?;
+                });
                 let mut write_failure = None;
                 for write in writes {
                     if let Err(error) = write.await
@@ -211,7 +219,7 @@ impl AppRoot {
                             .iter()
                             .map(|(id, key, _)| KeyStore::delete_conn(cx, *id, key))
                             .collect::<Vec<_>>()
-                    })?;
+                    });
                     for cleanup in cleanups {
                         let _ = cleanup.await;
                     }
@@ -225,7 +233,7 @@ impl AppRoot {
             }
             .await;
 
-            let _ = cx.update(|cx| match result {
+            cx.update(|cx| match result {
                 Ok((hydrated, migrated_ids, candidate_bundles, api_key, had_legacy_dev)) => {
                     let completed = state.update(cx, |state, cx| {
                         state.complete_connection_secret_startup(hydrated, cx)
@@ -246,7 +254,7 @@ impl AppRoot {
                                 }
                             }
                             if let Some(error) = first_error {
-                                let _ = cx.update(|cx| {
+                                cx.update(|cx| {
                                     state_for_cleanup.update(cx, |state, cx| {
                                         state.report_connection_secret_error(error, cx);
                                     });
@@ -291,7 +299,7 @@ impl AppRoot {
                             cleanup_error = Some(error);
                         }
                         if let Some(error) = cleanup_error {
-                            let _ = cx.update(|cx| {
+                            cx.update(|cx| {
                                 state_for_cleanup.update(cx, |state, cx| {
                                     state.report_connection_secret_error(error, cx);
                                 });
@@ -310,6 +318,104 @@ impl AppRoot {
         .detach();
     }
 
+    /// Open the store the assistant remembers conversations in.
+    ///
+    /// The key lives in the OS keychain, like the History key. If it cannot be read or written,
+    /// the assistant keeps the conversation in memory for this run only — writing it to disk
+    /// unprotected would be worse than forgetting it.
+    fn open_ai_memory(state: &Entity<AppState>, cx: &mut Context<Self>) {
+        let key_read = KeyStore::read_memory_key(cx);
+        let path = state.read(cx).config.ai_memory_path();
+        let retention = state.read(cx).settings.ai.memory_retention_days as i64;
+        let remember = state.read(cx).settings.ai.remember_conversations;
+        let state = state.clone();
+        cx.spawn(async move |_view: WeakEntity<Self>, cx: &mut AsyncApp| {
+            let key = match key_read.await {
+                Ok(Some(key)) => <[u8; 32]>::try_from(key).ok(),
+                Ok(None) => {
+                    let key: [u8; 32] = rand::random();
+                    let write = cx.update(|cx| KeyStore::write_memory_key(cx, &key));
+                    write.await.is_ok().then_some(key)
+                }
+                Err(error) => {
+                    log::error!("The assistant's memory key could not be read: {error}");
+                    None
+                }
+            };
+
+            let memory = match key {
+                Some(key) if remember => match crate::ai::memory::ChatMemory::open(
+                    path, key, retention,
+                ) {
+                    Ok(memory) => Some(memory),
+                    Err(error) => {
+                        log::error!("Could not open the assistant's memory: {error}");
+                        crate::ai::memory::ChatMemory::in_memory().ok()
+                    }
+                },
+                // The user asked us not to remember: this run only.
+                Some(_) => crate::ai::memory::ChatMemory::in_memory().ok(),
+                None => {
+                    log::warn!(
+                        "Without a keychain entry the assistant keeps this conversation in memory only"
+                    );
+                    crate::ai::memory::ChatMemory::in_memory().ok()
+                }
+            };
+            cx.update(|cx| {
+                state.update(cx, |state, _| state.ai_chat.memory = memory);
+            });
+        })
+        .detach();
+    }
+
+    /// Open the encrypted record of task runs. Without a keychain entry, runs are kept for this
+    /// session only rather than written unprotected.
+    fn open_task_runs(state: &Entity<AppState>, cx: &mut Context<Self>) {
+        let key_read = KeyStore::read_task_runs_key(cx);
+        let path = state.read(cx).config.task_runs_path();
+        let state = state.clone();
+        cx.spawn(async move |_view: WeakEntity<Self>, cx: &mut AsyncApp| {
+            let key = match key_read.await {
+                Ok(Some(key)) => <[u8; 32]>::try_from(key).ok(),
+                Ok(None) => {
+                    let key: [u8; 32] = rand::random();
+                    let write = cx.update(|cx| KeyStore::write_task_runs_key(cx, &key));
+                    write.await.is_ok().then_some(key)
+                }
+                Err(error) => {
+                    log::error!("The task run history key could not be read: {error}");
+                    None
+                }
+            };
+            use crate::tasks::store::RunStore;
+            let opened = match key {
+                Some(key) => RunStore::open(path, key).map(|store| (store, None)),
+                None => Err(anyhow::anyhow!("no keychain entry")),
+            };
+            let (store, note) = match opened {
+                Ok(opened) => opened,
+                Err(error) => {
+                    log::warn!("Task runs are kept for this session only: {error:#}");
+                    let Ok(store) = RunStore::in_memory() else {
+                        return;
+                    };
+                    let note = "Run history can't be saved on this computer, so it's kept until OpenMango closes.";
+                    (store, Some(note.to_string()))
+                }
+            };
+            cx.update(|cx| {
+                state.update(cx, |state, cx| {
+                    state.attach_task_runs(store, note);
+                    cx.notify();
+                });
+                // After the history, so runs cut short last time are marked before any starts.
+                AppCommands::start_scheduler(state.downgrade(), cx);
+            });
+        })
+        .detach();
+    }
+
     fn start_history(state: Entity<AppState>, cx: &mut Context<Self>) {
         let key_read = KeyStore::read_history_key(cx);
         let path = state.read(cx).config.history_path();
@@ -320,24 +426,24 @@ impl AppRoot {
                 Ok(Some(key)) => match <[u8; 32]>::try_from(key) {
                     Ok(key) => key,
                     Err(_) => {
-                        log::error!("History key has an invalid length");
+                        history_unavailable(&state, "Its encryption key is damaged.", cx);
                         return;
                     }
                 },
                 Ok(None) => {
                     let key: [u8; 32] = rand::random();
-                    let Ok(write) = cx.update(|cx| KeyStore::write_history_key(cx, &key)) else {
-                        log::error!("History key could not be stored");
-                        return;
-                    };
+                    let write = cx.update(|cx| KeyStore::write_history_key(cx, &key));
                     if write.await.is_err() {
-                        log::error!("History key could not be stored");
+                        let reason = "Its encryption key could not be saved to the keychain.";
+                        history_unavailable(&state, reason, cx);
                         return;
                     }
                     key
                 }
                 Err(error) => {
                     log::error!("History key could not be read: {error}");
+                    let reason = "Its encryption key could not be read from the keychain.";
+                    history_unavailable(&state, reason, cx);
                     return;
                 }
             };
@@ -347,14 +453,12 @@ impl AppRoot {
                 })
                 .await;
             let Ok(Ok(service)) = opened else {
-                log::error!("History could not be initialized");
+                history_unavailable(&state, "Its database could not be opened.", cx);
                 return;
             };
             let _ = service.reconcile();
-            let active =
-                cx.update(|cx| state.read(cx).active_connections_snapshot()).unwrap_or_default();
-            let configurations =
-                cx.update(|cx| state.read(cx).connections.clone()).unwrap_or_default();
+            let active = cx.update(|cx| state.read(cx).active_connections_snapshot());
+            let configurations = cx.update(|cx| state.read(cx).connections.clone());
             let enabled_connections = active
                 .into_keys()
                 .filter(|connection_id| {
@@ -363,7 +467,7 @@ impl AppRoot {
                     })
                 })
                 .collect::<Vec<_>>();
-            let _ = cx.update(|cx| {
+            cx.update(|cx| {
                 state.update(cx, |state, cx| {
                     state.set_history_service(service);
                     cx.notify();
@@ -387,6 +491,11 @@ impl AppRoot {
         let state = cx.new(|_| AppState::new());
 
         Self::hydrate_connection_secrets(state.clone(), cx);
+        Self::open_ai_memory(&state, cx);
+        Self::open_task_runs(&state, cx);
+        // Registers the background runner if a task needs it and it went missing, and notes
+        // whether it's switched off in Login Items or Task Scheduler.
+        state.update(cx, |state, _| state.sync_background_runner());
         Self::start_history(state.clone(), cx);
         let mcp_enabled = state.read(cx).settings.mcp.enabled;
         let mcp_access_signature = Self::mcp_access_signature(state.read(cx));
@@ -397,15 +506,17 @@ impl AppRoot {
 
         // Create content area with state reference
         let content_area = cx.new(|cx| ContentArea::new(state.clone(), cx));
+        let workspace_tabs = cx.new(|cx| OpenTabsBar::new(state.clone(), cx));
         let ai_view = cx.new(|cx| AiView::new(state.clone(), cx));
 
         // Create action bar with execution callback
-        let action_bar = cx.new(|_cx| {
-            ActionBar::new(state.clone()).on_execute({
+        let action_bar = cx.new(|cx| {
+            ActionBar::new(state.clone(), cx).on_execute({
                 let state = state.clone();
                 let content_area = content_area.clone();
+                let sidebar = sidebar.clone();
                 move |execution, window, cx| {
-                    Self::execute_action(&state, &content_area, execution, window, cx);
+                    Self::execute_action(&state, &content_area, &sidebar, execution, window, cx);
                 }
             })
         });
@@ -424,27 +535,46 @@ impl AppRoot {
             let recheck_secs = std::env::var("OPENMANGO_UPDATE_INTERVAL_SECS")
                 .ok()
                 .and_then(|v| v.parse::<u64>().ok())
-                .unwrap_or(4 * 60 * 60);
-            async move |_this: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
-                gpui::Timer::after(std::time::Duration::from_secs(startup_delay)).await;
-                let should_check =
-                    cx.update(|cx| state.read(cx).settings.auto_update).unwrap_or(false);
+                .unwrap_or(4 * 60 * 60)
+                .max(1);
+            async move |this: WeakEntity<Self>, cx: &mut gpui_kit::AsyncApp| {
+                cx.background_executor().timer(std::time::Duration::from_secs(startup_delay)).await;
+                if this.upgrade().is_none() {
+                    return;
+                }
+                let should_check = cx.update(|cx| {
+                    state.read(cx).settings.auto_update
+                        && AppCommands::automatic_updates_supported()
+                });
                 if should_check {
-                    let _ = cx.update(|cx| {
+                    cx.update(|cx| {
                         AppCommands::check_for_updates(state.clone(), cx);
                     });
                 }
                 // Periodic re-check
                 loop {
-                    gpui::Timer::after(std::time::Duration::from_secs(recheck_secs)).await;
-                    let should_check = cx
-                        .update(|cx| {
-                            let s = state.read(cx);
-                            s.settings.auto_update && matches!(s.update_status, UpdateStatus::Idle)
-                        })
-                        .unwrap_or(false);
+                    cx.background_executor()
+                        .timer(std::time::Duration::from_secs(recheck_secs))
+                        .await;
+                    if this.upgrade().is_none() {
+                        break;
+                    }
+                    let should_check = cx.update(|cx| {
+                        let s = state.read(cx);
+                        s.settings.auto_update
+                            && AppCommands::automatic_updates_supported()
+                            && matches!(
+                                s.update_status,
+                                UpdateStatus::Idle
+                                    | UpdateStatus::UpToDate { .. }
+                                    | UpdateStatus::Failed {
+                                        stage: crate::state::app_state::updater::UpdateStage::Check,
+                                        ..
+                                    }
+                            )
+                    });
                     if should_check {
-                        let _ = cx.update(|cx| {
+                        cx.update(|cx| {
                             AppCommands::check_for_updates(state.clone(), cx);
                         });
                     }
@@ -453,19 +583,19 @@ impl AppRoot {
         })
         .detach();
 
-        // Show "What's New" dialog if build changed since last launch
+        // Show "What's New" when the notes it leads with changed since they were last seen, so a
+        // nightly build with the same highlights does not open it again.
         {
-            let current_sha = env!("OPENMANGO_GIT_SHA");
+            let key = crate::changelog::current_key();
             let last_seen = &state.read(cx).settings.last_seen_version;
-            // Skip if SHA matches, or if last_seen is a legacy semver value
-            // (pre-SHA migration) — treat those as "already seen"
+            // A semver value predates this tracking; treat those notes as seen.
             let is_legacy_version = last_seen.contains('.');
-            let force_changelog = std::env::var("OPENMANGO_SHOW_CHANGELOG").is_ok();
-            let should_show = force_changelog || (!is_legacy_version && last_seen != current_sha);
+            let force_changelog = crate::changelog::forced();
+            let should_show =
+                force_changelog || (!is_legacy_version && !key.is_empty() && *last_seen != key);
             if !force_changelog && is_legacy_version {
-                // Migrate legacy semver value to current SHA silently
                 state.update(cx, |state, _cx| {
-                    state.settings.last_seen_version = current_sha.to_string();
+                    state.settings.last_seen_version = key;
                     state.save_settings();
                 });
             } else if should_show {
@@ -478,6 +608,36 @@ impl AppRoot {
 
         let key_debug = std::env::var("OPENMANGO_DEBUG_KEYS").is_ok();
         let mut subscriptions = Vec::new();
+        subscriptions.push(crate::components::drag::cancel_drag_on_escape(cx));
+        // Startup already shows the matching theme; this records it and follows later changes.
+        crate::theme::sync_system_theme(&state, window, cx);
+        subscriptions.push(cx.observe_in(&state, window, |this, _, window, cx| {
+            this.notify_new_errors(window, cx);
+            if !this.state.read(cx).tasks.notices.is_empty() {
+                AppState::post_task_notices(&this.state, window.is_window_active(), true, cx);
+            }
+        }));
+        AppState::open_tasks_from_notifications(state.clone(), cx);
+        // Many failure paths emit an event without notifying, so check on events too.
+        subscriptions.push(cx.subscribe_in(
+            &state,
+            window,
+            |this, _, _: &crate::state::AppEvent, window, cx| {
+                this.notify_new_errors(window, cx);
+            },
+        ));
+        // Errors from startup (unreadable connection or library files) predate the observer.
+        cx.defer_in(window, |this, window, cx| this.notify_new_errors(window, cx));
+        subscriptions.push(cx.observe_window_appearance(window, |this, window, cx| {
+            crate::theme::sync_system_theme(&this.state, window, cx);
+        }));
+        // The background runner is switched on and off in Login Items, Task Scheduler or
+        // systemd; coming back to OpenMango picks that up.
+        subscriptions.push(cx.observe_window_activation(window, |this, window, cx| {
+            if window.is_window_active() {
+                this.state.update(cx, |state, cx| state.refresh_background_runner(cx));
+            }
+        }));
         subscriptions.push(cx.observe(&state, |this, state, cx| {
             let enabled = state.read(cx).settings.mcp.enabled;
             let access_signature = Self::mcp_access_signature(state.read(cx));
@@ -512,18 +672,21 @@ impl AppRoot {
             });
             if is_close && event.action.is_none() {
                 this.handle_close_tab(window, cx);
-                window.focus(&this.focus_handle);
+                window.focus(&this.focus_handle, cx);
             }
         });
         subscriptions.push(keystroke_sub);
 
         let focus_handle = cx.focus_handle();
+        // Activate the Workspace key context before the first mouse interaction.
+        window.focus(&focus_handle, cx);
 
         Self {
             state,
             focus_handle,
             sidebar,
             content_area,
+            workspace_tabs,
             ai_view,
             action_bar,
             key_debug,
@@ -535,10 +698,58 @@ impl AppRoot {
             ai_drag_start_x: px(0.0),
             ai_drag_start_width: AI_ISLAND_DEFAULT_WIDTH,
             ai_drag_current_width: None,
+            notified_error_id: 0,
+            reconnect_toasts: Default::default(),
             _subscriptions: subscriptions,
             mcp_shutdown,
             mcp_enabled,
             mcp_access_signature,
+        }
+    }
+
+    fn notify_new_errors(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        use crate::components::error_history::ErrorToast;
+        use gpui_kit::component::WindowExt as _;
+
+        // A Reconnect notification is moot once the connection is back.
+        let reconnected: Vec<_> = self
+            .reconnect_toasts
+            .iter()
+            .copied()
+            .filter(|id| self.state.read(cx).is_connected(*id))
+            .collect();
+        for connection_id in reconnected {
+            self.reconnect_toasts.remove(&connection_id);
+            window.remove_notification1::<ErrorToast>(
+                SharedString::from(format!("reconnect-{connection_id}")),
+                cx,
+            );
+        }
+
+        let state = self.state.read(cx);
+        if state.last_error_id() == self.notified_error_id {
+            return;
+        }
+        let notifications: Vec<_> = state
+            .errors_after(self.notified_error_id)
+            .filter(|entry| entry.notify)
+            .map(|entry| {
+                let reconnect = match &entry.action {
+                    Some(crate::state::ErrorAction::Reconnect(id)) => Some(*id),
+                    _ => None,
+                };
+                (
+                    reconnect,
+                    crate::components::error_history::error_notification(entry, self.state.clone()),
+                )
+            })
+            .collect();
+        self.notified_error_id = state.last_error_id();
+        for (reconnect, notification) in notifications {
+            if let Some(connection_id) = reconnect {
+                self.reconnect_toasts.insert(connection_id);
+            }
+            window.push_notification(notification, cx);
         }
     }
 
@@ -580,7 +791,7 @@ impl AppRoot {
             let state = state.clone();
             async move |_view: WeakEntity<Self>, cx: &mut AsyncApp| {
                 while let Some(grant_id) = grant_usage_receiver.recv().await {
-                    let _ = cx.update(|cx| {
+                    cx.update(|cx| {
                         state.update(cx, |state, cx| {
                             let now = chrono::Utc::now();
                             let Some(grant) = state
@@ -615,13 +826,7 @@ impl AppRoot {
                         let bytes: [u8; 32] = rand::random();
                         let token =
                             bytes.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
-                        let Ok(write) = cx.update(|cx| KeyStore::write_mcp_token(cx, &token))
-                        else {
-                            log::error!(
-                                "MCP server disabled: legacy access token could not be stored"
-                            );
-                            return;
-                        };
+                        let write = cx.update(|cx| KeyStore::write_mcp_token(cx, &token));
                         if write.await.is_err() {
                             log::error!(
                                 "MCP server disabled: legacy access token could not be stored"
@@ -661,7 +866,7 @@ impl AppRoot {
             match start.await {
                 Ok(Ok(handle)) => {
                     let actual_port = handle.addr().port();
-                    let _ = cx.update(|cx| {
+                    cx.update(|cx| {
                         state.update(cx, |state, cx| {
                             if state.settings.mcp.port != actual_port {
                                 state.settings.mcp.port = actual_port;
@@ -682,22 +887,8 @@ impl AppRoot {
         Some(cancellation)
     }
 
-    pub fn flush_workspace_on_shutdown(&mut self, cx: &mut App) {
-        self.state.update(cx, |state, _cx| {
-            state.update_workspace_from_state();
-            state.flush_workspace_now();
-        });
-    }
-
     pub fn request_quit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         request_app_quit(self.state.clone(), window, cx);
-    }
-
-    pub fn close_all_editor_windows(&self, cx: &mut App) {
-        let sessions = self.state.read(cx).editor_sessions();
-        for handle in sessions.all_window_handles() {
-            handle.update(cx, |_, window, _cx| window.remove_window()).ok();
-        }
     }
 }
 
@@ -730,7 +921,6 @@ impl Render for AppRoot {
             .ai_drag_current_width
             .unwrap_or(persisted_ai_panel_width)
             .clamp(AI_ISLAND_MIN_WIDTH, AI_ISLAND_MAX_WIDTH);
-        let vibrancy = state.startup_vibrancy;
         let update_status = state.update_status.clone();
 
         let documents_subview = if matches!(state.current_view, View::Documents) {
@@ -754,9 +944,12 @@ impl Render for AppRoot {
             View::Database => key_context.push_str(" Database"),
             View::Databases => key_context.push_str(" Databases"),
             View::Collections => key_context.push_str(" Collections"),
-            View::Transfer => {}
+            View::Transfer | View::Compare => {}
             View::Forge => key_context.push_str(" Forge"),
+            View::References => key_context.push_str(" References"),
+            View::Relations => key_context.push_str(" Relations"),
             View::AgentActivity => key_context.push_str(" AgentActivity"),
+            View::Tasks => {}
             View::Connections => key_context.push_str(" Connections"),
             View::Welcome => key_context.push_str(" Welcome"),
             View::Settings => key_context.push_str(" Settings"),
@@ -764,8 +957,9 @@ impl Render for AppRoot {
         }
 
         // Render dialog layer (Context derefs to App)
-        use gpui_component::Root;
+        use gpui_kit::component::Root;
         let dialog_layer = Root::render_dialog_layer(window, cx);
+        let notification_layer = Root::render_notification_layer(window, cx);
 
         let mut root = div()
             .key_context(key_context.as_str())
@@ -774,17 +968,25 @@ impl Render for AppRoot {
             .flex_col()
             .size_full()
             .relative()
-            .when(vibrancy, |s| s.pt(px(28.0)))
             .bg(islands::canvas_bg(&appearance, cx))
-            .border_1()
-            .border_color(islands::panel_border(&appearance, cx))
-            .rounded(islands::radius_md(&appearance))
             .text_color(cx.theme().foreground)
             .font_family(crate::theme::fonts::ui())
             .line_height(crate::theme::fonts::ui_line_height())
             .on_action(cx.listener(|this, _: &CloseTab, window, cx| {
                 this.handle_close_tab(window, cx);
-                window.focus(&this.focus_handle);
+                window.focus(&this.focus_handle, cx);
+            }))
+            .on_action(cx.listener(|this, _: &NavigateBack, window, cx| {
+                let moved = this.state.update(cx, |state, cx| state.navigate_back(cx));
+                if moved {
+                    this.focus_current_content(window, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &NavigateForward, window, cx| {
+                let moved = this.state.update(cx, |state, cx| state.navigate_forward(cx));
+                if moved {
+                    this.focus_current_content(window, cx);
+                }
             }))
             .on_action(cx.listener(|this, _: &NextTab, window, cx| {
                 this.state.update(cx, |state, cx| state.select_next_tab(cx));
@@ -840,63 +1042,21 @@ impl Render for AppRoot {
                 this.handle_create_collection(window, cx);
             }))
             .on_action(cx.listener(|this, _: &CreateIndex, window, cx| {
-                this.handle_create_index(window, cx);
+                Self::create_index(&this.state, window, cx);
             }))
             .on_action(cx.listener(|this, _: &QuitApp, window, cx| {
                 this.request_quit(window, cx);
             }))
             .on_action(cx.listener(|this, _: &DeleteDatabase, window, cx| {
-                let Some(database_key) = this.state.read(cx).current_database_key() else {
-                    return;
-                };
-                let message =
-                    format!("Drop database \"{}\"? This cannot be undone.", database_key.database);
-                let state = this.state.clone();
-                let state_for_write = state.clone();
-                let database = database_key.database;
-                let connection_id = database_key.connection_id;
-                request_connection_write(
-                    state,
-                    crate::components::WriteRequest::new(
-                        connection_id,
-                        database.clone(),
-                        "Drop a database",
-                        Some(WriteConfirmation {
-                            title: "Drop database".into(),
-                            message,
-                            confirm_label: "Drop".into(),
-                            destructive: true,
-                        }),
-                    ),
-                    window,
-                    cx,
-                    move |_window, cx| {
-                        AppCommands::drop_database(state_for_write, connection_id, database, cx);
-                    },
-                );
+                if let Some(key) = this.state.read(cx).current_database_key() {
+                    let node = TreeNodeId::database(key.connection_id, key.database);
+                    confirm_delete_node(this.state.clone(), node, window, cx);
+                }
             }))
             .on_action(cx.listener(|this, _: &DeleteConnection, window, cx| {
                 if let Some(connection_id) = this.state.read(cx).selected_connection_id() {
-                    let name = this
-                        .state
-                        .read(cx)
-                        .connection_name(connection_id)
-                        .unwrap_or_else(|| "connection".to_string());
-                    let message = format!("Remove connection \"{name}\"?");
-                    open_confirm_dialog(
-                        window,
-                        cx,
-                        "Remove connection",
-                        message,
-                        "Remove",
-                        true,
-                        {
-                            let state = this.state.clone();
-                            move |window, cx| {
-                                request_remove_connection(state.clone(), connection_id, window, cx);
-                            }
-                        },
-                    );
+                    let node = TreeNodeId::connection(connection_id);
+                    confirm_delete_node(this.state.clone(), node, window, cx);
                 }
             }))
             .on_action(cx.listener(|this, _: &DisconnectConnection, window, cx| {
@@ -917,19 +1077,17 @@ impl Render for AppRoot {
                 }
             }))
             .on_action(cx.listener(|this, _: &CopySelectionName, _window, cx| {
-                let state_ref = this.state.read(cx);
-                let selection_name = if let Some(collection) = state_ref.selected_collection_name()
-                {
-                    Some(collection)
-                } else if let Some(database) = state_ref.selected_database_name() {
-                    Some(database)
-                } else if let Some(connection_id) = state_ref.selected_connection_id() {
-                    state_ref.connection_name(connection_id)
-                } else {
-                    None
+                // The node the app is showing; the sidebar answers for its own selected row.
+                let node = {
+                    let state = this.state.read(cx);
+                    SidebarModel::node_for_view(
+                        state.selected_connection_id(),
+                        state.selected_database_name(),
+                        state.selected_collection_name(),
+                    )
                 };
-                if let Some(name) = selection_name {
-                    cx.write_to_clipboard(ClipboardItem::new_string(name));
+                if let Some(node) = node {
+                    copy_node_name(&this.state, &node, cx);
                 }
             }))
             .on_action(cx.listener(|this, _: &RefreshView, window, cx| {
@@ -938,6 +1096,11 @@ impl Render for AppRoot {
             .on_action(cx.listener(|this, _: &OpenActionBar, window, cx| {
                 this.action_bar.update(cx, |bar, cx| {
                     bar.toggle(window, cx);
+                });
+            }))
+            .on_action(cx.listener(|this, _: &OpenConnectionSwitcher, window, cx| {
+                this.action_bar.update(cx, |bar, cx| {
+                    bar.toggle_connections(window, cx);
                 });
             }))
             .on_action(cx.listener(|this, _: &OpenQueryLibrary, window, cx| {
@@ -953,6 +1116,10 @@ impl Render for AppRoot {
                 if opened {
                     this.ai_view.update(cx, |view, cx| view.focus_input(window, cx));
                 }
+            }))
+            .on_action(cx.listener(|this, _: &crate::keyboard::OpenCompare, window, cx| {
+                this.state.update(cx, |state, cx| state.open_compare_tab(None, cx));
+                this.focus_current_content(window, cx);
             }))
             .on_action(cx.listener(|this, _: &OpenForge, window, cx| {
                 let opened = this.state.update(cx, |state, cx| {
@@ -973,18 +1140,49 @@ impl Render for AppRoot {
                         sidebar.toggle_collapsed();
                         cx.notify();
                     }
-                    window.focus(&sidebar.focus_handle);
+                    window.focus(&sidebar.focus_handle, cx);
                 });
             }))
             .on_action(cx.listener(|this, _: &FocusContent, window, cx| {
                 this.focus_current_content(window, cx);
             }))
-            .on_action(cx.listener(|this, _: &DownloadUpdate, _window, cx| {
+            .on_action(cx.listener(|this, _: &DownloadUpdate, window, cx| {
                 AppCommands::download_update(this.state.clone(), cx);
+                crate::components::updater::open_updates(this.state.clone(), window, cx);
             }))
             .on_action(cx.listener(|this, _: &InstallUpdate, _window, cx| {
                 AppCommands::install_update(this.state.clone(), cx);
             }))
+            .child(
+                TitleBar::new()
+                    .w_full()
+                    .bg(islands::canvas_bg(&appearance, cx))
+                    .border_0()
+                    .when(cfg!(target_os = "macos") && window.is_fullscreen(), |bar| bar.pl_0())
+                    .on_close_window(cx.listener(|this, _, window, cx| {
+                        this.request_quit(window, cx);
+                    }))
+                    .child(
+                        div()
+                            .relative()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .h_full()
+                            .overflow_hidden()
+                            // Tab contents must not determine the titlebar's
+                            // intrinsic width: the scroll viewport is the space
+                            // left by the platform controls, even with many tabs.
+                            .child(
+                                div()
+                                    .absolute()
+                                    .top_0()
+                                    .left_0()
+                                    .size_full()
+                                    .child(self.workspace_tabs.clone()),
+                            ),
+                    )
+                    .child(div().w(px(12.0)).h_full().flex_shrink_0()),
+            )
             .child({
                 let is_dragging = self.sidebar_dragging;
                 let is_ai_dragging = self.ai_dragging;
@@ -998,7 +1196,7 @@ impl Render for AppRoot {
                     .cursor_col_resize()
                     .bg(crate::theme::colors::transparent())
                     .my(px(10.0))
-                    .rounded(px(999.0))
+                    .rounded_full()
                     .hover(|s| s.bg(islands::panel_border(&appearance, cx).opacity(0.7)))
                     .tooltip(|window, cx| {
                         Tooltip::new("Drag to resize sidebar. Double-click to hide or show.")
@@ -1058,7 +1256,7 @@ impl Render for AppRoot {
                     .cursor_col_resize()
                     .bg(crate::theme::colors::transparent())
                     .my(px(10.0))
-                    .rounded(px(999.0))
+                    .rounded_full()
                     .hover(|s| s.bg(islands::panel_border(&appearance, cx).opacity(0.7)))
                     .when(is_ai_dragging, |s: Stateful<Div>| {
                         s.bg(islands::panel_border(&appearance, cx).opacity(0.9))
@@ -1097,7 +1295,7 @@ impl Render for AppRoot {
                     .flex_1()
                     .min_h(px(0.0))
                     .px(spacing::xs())
-                    .py(spacing::xs())
+                    .pb(spacing::xs())
                     .child(sidebar_panel)
                     .child(resize_handle)
                     .child(content_panel)
@@ -1174,7 +1372,13 @@ impl Render for AppRoot {
                 })
             }))
             .children(dialog_layer)
+            .children(notification_layer)
             .child(self.action_bar.clone());
+
+        // Hidden, the HUD costs nothing: its clock stops a second after it leaves the tree.
+        if self.state.read(cx).show_fps_monitor {
+            root = root.child(gpui_fps::fps_monitor(window, cx));
+        }
 
         if self.key_debug {
             root = root.child(render_key_debug_overlay(
@@ -1186,6 +1390,18 @@ impl Render for AppRoot {
 
         root
     }
+}
+
+/// History failing to start is otherwise invisible: the feature is simply never there. Say so.
+fn history_unavailable(state: &Entity<AppState>, reason: &str, cx: &mut AsyncApp) {
+    log::error!("History is unavailable: {reason}");
+    cx.update(|cx| {
+        state.update(cx, |state, cx| {
+            let message = format!("History is off. {reason}");
+            state.set_status_message(Some(crate::state::StatusMessage::error(message)));
+            cx.notify();
+        });
+    });
 }
 
 fn render_key_debug_overlay(

@@ -1,14 +1,14 @@
-use gpui::*;
+use gpui_kit::*;
 use uuid::Uuid;
 
 use crate::components::action_bar::ActionExecution;
 use crate::components::{
-    ConnectionManager, ContentArea, QueryLibraryDialog, request_disconnect_connection,
-    request_unsaved_action,
+    ConnectionManager, ContentArea, request_disconnect_connection, request_unsaved_action,
 };
 use crate::keyboard::{
-    CloseTab, DiscardDocumentChanges, FocusContent, FocusSidebar, OpenForge, RefreshView,
-    SaveDocument, format_keystroke,
+    CloseTab, CreateCollection, CreateDatabase, DiscardDocumentChanges, FocusContent, FocusSidebar,
+    OpenForge, OpenQueryLibrary, OpenSettings, RefreshView, SaveDocument, ToggleAiPanel,
+    format_keystroke,
 };
 use crate::state::settings::AppTheme;
 use crate::state::{
@@ -19,6 +19,7 @@ use crate::views::CollectionView;
 
 use super::AppRoot;
 use super::dialogs::{open_create_collection_dialog, open_create_database_dialog};
+use super::sidebar::Sidebar;
 
 impl AppRoot {
     pub(super) fn install_global_shortcuts(cx: &mut Context<Self>) -> Subscription {
@@ -88,22 +89,23 @@ impl AppRoot {
         open_create_collection_dialog(self.state.clone(), database, window, cx);
     }
 
-    pub(super) fn handle_create_index(&mut self, window: &mut Window, cx: &mut App) {
-        if !matches!(self.state.read(cx).current_view, View::Documents) {
+    /// Create Index, from the shortcut and from the command palette alike: shows the collection's
+    /// Indexes and opens the dialog there. The shortcut is bound only while Indexes is showing;
+    /// the palette offers it for any open collection.
+    pub(super) fn create_index(state: &Entity<AppState>, window: &mut Window, cx: &mut App) {
+        if !matches!(state.read(cx).current_view, View::Documents) {
             return;
         }
-        let Some(session_key) = self.state.read(cx).current_session_key() else {
+        let Some(session_key) = state.read(cx).current_session_key() else {
             return;
         };
-        let subview = self
-            .state
-            .read(cx)
-            .session_subview(&session_key)
-            .unwrap_or(CollectionSubview::Documents);
-        if subview != CollectionSubview::Indexes {
-            return;
+        if state.read(cx).session_subview(&session_key) != Some(CollectionSubview::Indexes) {
+            state.update(cx, |state, cx| {
+                state.set_collection_subview(&session_key, CollectionSubview::Indexes);
+                cx.notify();
+            });
         }
-        CollectionView::open_index_create_dialog(self.state.clone(), session_key, window, cx);
+        CollectionView::open_index_create_dialog(state.clone(), session_key, window, cx);
     }
 
     pub(super) fn handle_close_tab(&mut self, window: &mut Window, cx: &mut App) {
@@ -146,6 +148,7 @@ impl AppRoot {
     pub(super) fn execute_action(
         state: &Entity<AppState>,
         content_area: &Entity<ContentArea>,
+        sidebar: &Entity<Sidebar>,
         exec: ActionExecution,
         window: &mut Window,
         cx: &mut App,
@@ -158,6 +161,7 @@ impl AppRoot {
                 state.update(cx, |state, cx| {
                     state.select_connection(Some(conn_id), cx);
                 });
+                sidebar.update(cx, |sidebar, cx| sidebar.reveal_connection(conn_id, window, cx));
             }
             return;
         }
@@ -211,34 +215,10 @@ impl AppRoot {
 
         // Theme actions
         if let Some(theme_id) = id.strip_prefix("theme:") {
-            if let Some(theme) = AppTheme::from_theme_id(theme_id) {
-                state.update(cx, |state, cx| {
-                    state.settings.appearance.theme = theme;
-                    state.save_settings();
-                    cx.notify();
-                });
-                let (user_vibrancy, startup_vibrancy) = {
-                    let state_ref = state.read(cx);
-                    (state_ref.settings.appearance.vibrancy, state_ref.startup_vibrancy)
-                };
-                let target_vibrancy = crate::theme::effective_vibrancy(theme, user_vibrancy);
-                crate::theme::apply_theme(theme, target_vibrancy, window, cx);
-                if crate::theme::requires_vibrancy_restart(startup_vibrancy, theme, user_vibrancy) {
-                    crate::components::open_confirm_dialog(
-                        window,
-                        cx,
-                        "Restart required",
-                        "Switching this theme changes window vibrancy mode. Restart now to fully apply it.",
-                        "Restart now",
-                        false,
-                        {
-                            let state = state.clone();
-                            move |window, cx| {
-                                crate::components::request_app_quit(state.clone(), window, cx);
-                            }
-                        },
-                    );
-                }
+            if theme_id == "system" {
+                crate::theme::set_follow_system(state, true, window, cx);
+            } else if let Some(theme) = AppTheme::from_theme_id(theme_id) {
+                crate::theme::pick_theme(state, theme, window, cx);
             }
             return;
         }
@@ -265,28 +245,14 @@ impl AppRoot {
             "cmd:new-connection" => {
                 ConnectionManager::open_new(state.clone(), window, cx);
             }
+            "cmd:manage-connections" => {
+                ConnectionManager::open(state.clone(), window, cx);
+            }
             "cmd:create-database" => {
-                let state_ref = state.read(cx);
-                let Some(conn_id) = state_ref.selected_connection_id() else {
-                    return;
-                };
-                if !state_ref.is_connected(conn_id) {
-                    return;
-                }
-                open_create_database_dialog(state.clone(), window, cx);
+                window.dispatch_action(Box::new(CreateDatabase), cx);
             }
             "cmd:create-collection" => {
-                let state_ref = state.read(cx);
-                let Some(conn_id) = state_ref.selected_connection_id() else {
-                    return;
-                };
-                if !state_ref.is_connected(conn_id) {
-                    return;
-                }
-                let Some(database) = state_ref.selected_database_name() else {
-                    return;
-                };
-                open_create_collection_dialog(state.clone(), database, window, cx);
+                window.dispatch_action(Box::new(CreateCollection), cx);
             }
             "cmd:insert-document" => {
                 let Some(session_key) = state.read(cx).current_session_key() else {
@@ -304,14 +270,7 @@ impl AppRoot {
                 );
             }
             "cmd:create-index" => {
-                let Some(session_key) = state.read(cx).current_session_key() else {
-                    return;
-                };
-                state.update(cx, |state, cx| {
-                    state.set_collection_subview(&session_key, CollectionSubview::Indexes);
-                    cx.notify();
-                });
-                CollectionView::open_index_create_dialog(state.clone(), session_key, window, cx);
+                Self::create_index(state, window, cx);
             }
             "cmd:run-aggregation" => {
                 let Some(session_key) = state.read(cx).current_session_key() else {
@@ -338,6 +297,30 @@ impl AppRoot {
                         content.focus_current_view(window, cx);
                     });
                 }
+            }
+            "cmd:tasks" => {
+                state.update(cx, |state, cx| state.open_tasks_tab(cx));
+                content_area.update(cx, |content, cx| {
+                    content.focus_current_view(window, cx);
+                });
+            }
+            "cmd:compare" => {
+                state.update(cx, |state, cx| state.open_compare_tab(None, cx));
+                content_area.update(cx, |content, cx| {
+                    content.focus_current_view(window, cx);
+                });
+            }
+            "cmd:compare-databases" => {
+                state.update(cx, |state, cx| {
+                    state.open_scoped_compare_tab(
+                        crate::state::compare::CompareScope::Databases,
+                        None,
+                        cx,
+                    )
+                });
+                content_area.update(cx, |content, cx| {
+                    content.focus_current_view(window, cx);
+                });
             }
             "cmd:transfer-import" => {
                 if Self::open_transfer_from_current(state, TransferMode::Import, cx) {
@@ -380,20 +363,26 @@ impl AppRoot {
                 // Handled as two-step in ActionBar (switches to Disconnect mode)
             }
             "cmd:query-library" => {
-                QueryLibraryDialog::open_for_current(state.clone(), window, cx);
+                window.dispatch_action(Box::new(OpenQueryLibrary), cx);
             }
             "cmd:settings" => {
-                state.update(cx, |state, cx| {
-                    state.open_settings_tab(cx);
-                });
+                window.dispatch_action(Box::new(OpenSettings), cx);
             }
             "cmd:ai" => {
-                state.update(cx, |state, cx| {
-                    state.toggle_ai_panel(cx);
-                });
+                // The action, not a copy of it: its handler also focuses the input on open.
+                window.dispatch_action(Box::new(ToggleAiPanel), cx);
             }
             "cmd:whats-new" => {
                 crate::changelog::open_changelog_tab(state.clone(), cx);
+            }
+            "cmd:date-display" => {
+                state.update(cx, |state, cx| state.toggle_date_display(cx));
+            }
+            "cmd:fps-monitor" => {
+                state.update(cx, |state, cx| {
+                    state.show_fps_monitor = !state.show_fps_monitor;
+                    cx.notify();
+                });
             }
             "view:documents" => {
                 Self::show_collection_subview(state, CollectionSubview::Documents, cx);
@@ -415,9 +404,11 @@ impl AppRoot {
             }
             "cmd:check-updates" => {
                 AppCommands::check_for_updates(state.clone(), cx);
+                crate::components::updater::open_updates(state.clone(), window, cx);
             }
             "cmd:download-update" => {
                 AppCommands::download_update(state.clone(), cx);
+                crate::components::updater::open_updates(state.clone(), window, cx);
             }
             "cmd:install-update" => {
                 AppCommands::install_update(state.clone(), cx);
@@ -488,7 +479,7 @@ impl AppRoot {
 
     pub(super) fn focus_current_content(&mut self, window: &mut Window, cx: &mut App) {
         if !self.content_area.update(cx, |content, cx| content.focus_current_view(window, cx)) {
-            window.focus(&self.focus_handle);
+            window.focus(&self.focus_handle, cx);
         }
     }
 
@@ -552,8 +543,12 @@ impl AppRoot {
                 AppCommands::reload_database(self.state.clone(), database_key, cx);
             }
             View::Transfer
+            | View::Compare
             | View::Forge
+            | View::References
+            | View::Relations
             | View::AgentActivity
+            | View::Tasks
             | View::Connections
             | View::Settings
             | View::Changelog => {}

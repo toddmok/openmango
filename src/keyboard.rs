@@ -1,9 +1,9 @@
 use std::collections::BTreeMap;
 use std::rc::Rc;
 
-use gpui::{
-    Action, App, DummyKeyboardMapper, KeyBinding, KeyBindingContextPredicate, KeyContext,
-    Keystroke, actions,
+use gpui_kit::{
+    Action, App, AsKeystroke as _, DummyKeyboardMapper, KeyBinding, KeyBindingContextPredicate,
+    KeyContext, Keystroke, actions,
 };
 
 use crate::state::KeybindingSettings;
@@ -28,6 +28,19 @@ actions!(
         TransferCopy,
         RunTransfer,
         CancelTransfer,
+        OpenCompare,
+        RunCompare,
+        CancelCompare,
+        CompareNext,
+        ComparePrevious,
+        FocusCompareDetail,
+        TaskNext,
+        TaskPrevious,
+        EditSelectedTask,
+        FindInCompare,
+        ToggleCompareSelection,
+        SelectCompareSegment,
+        ClearCompareTarget,
         SaveTransferQuery,
         CloseTransferQueryModal,
         CreateDatabase,
@@ -39,6 +52,16 @@ actions!(
         CloseEditorWindow,
         NextTab,
         PrevTab,
+        NavigateBack,
+        NavigateForward,
+        GoToReference,
+        PeekReference,
+        FindReferences,
+        RelationsZoomIn,
+        RelationsZoomOut,
+        RelationsFit,
+        RelationsClearFocus,
+        OpenSelectionInNewTab,
         SelectTab1,
         SelectTab2,
         SelectTab3,
@@ -84,24 +107,46 @@ actions!(
         DuplicateAggregationStage,
         DeleteAggregationStage,
         ToggleAggregationStageEnabled,
+        AddAggregationStage,
+        UndoAggregationEdit,
+        RedoAggregationEdit,
+        FocusAggregationStageEditor,
         FindInSidebar,
         CloseSidebarSearch,
         OpenActionBar,
+        OpenConnectionSwitcher,
         OpenQueryLibrary,
         OpenSettings,
         OpenForge,
         ToggleAiPanel,
+        ClearAiChat,
+        PreviousAiMention,
+        NextAiMention,
+        ConfirmAiMention,
+        AskAiFilter,
         RunForgeAll,
         RunForgeSelectionOrStatement,
         CancelForgeRun,
         ClearForgeOutput,
         FocusForgeEditor,
         FocusForgeOutput,
+        AcceptForgeCompletion,
+        TriggerForgeCompletion,
+        PreviousForgeCompletion,
+        NextForgeCompletion,
+        InsertForgeNewline,
+        DeleteForgeWordBackward,
+        DeleteForgeWordForward,
+        MoveForgeWordBackward,
+        MoveForgeWordForward,
+        SelectForgeWordBackward,
+        SelectForgeWordForward,
         FindInForgeOutput,
         SelectAllForgeResults,
         CopyForgeResults,
         CopyAs,
         CopyAsJson,
+        CopyAsPlainJson,
         CopyAsJsonLines,
         CopyAsCsv,
         CopyAsMarkdown,
@@ -116,6 +161,8 @@ actions!(
 );
 
 const DOCUMENT_EDIT_CONTEXT: &str = "Documents && !Input && !Aggregation";
+/// Set on the aggregation stage list, so list keys never fire while results or editors have focus.
+pub const AGGREGATION_STAGES_CONTEXT: &str = "AggregationStages";
 const FOCUS_CONTENT_KEYS: [&str; 2] = ["cmd-shift-1", "ctrl-shift-1"];
 
 pub fn bind_keymap(cx: &mut App, settings: &KeybindingSettings) {
@@ -132,6 +179,8 @@ fn default_keybindings() -> Vec<KeyBinding> {
         KeyBinding::new("return", OpenSelection, Some("Sidebar")),
         KeyBinding::new("cmd-enter", OpenSelectionPreview, Some("Sidebar")),
         KeyBinding::new("ctrl-enter", OpenSelectionPreview, Some("Sidebar")),
+        KeyBinding::new("cmd-shift-enter", OpenSelectionInNewTab, Some("Sidebar")),
+        KeyBinding::new("ctrl-shift-enter", OpenSelectionInNewTab, Some("Sidebar")),
         KeyBinding::new("cmd-shift-f", OpenForge, Some("Sidebar")),
         KeyBinding::new("ctrl-shift-f", OpenForge, Some("Sidebar")),
         KeyBinding::new("cmd-e", EditConnection, Some("Sidebar")),
@@ -173,6 +222,33 @@ fn default_keybindings() -> Vec<KeyBinding> {
             Some("Transfer && TransferRunning && !TransferQueryModal"),
         ),
         KeyBinding::new("cmd-enter", SaveTransferQuery, Some("Transfer && TransferQueryModal")),
+        KeyBinding::new("cmd-enter", RunCompare, Some("Compare && !CompareRunning")),
+        KeyBinding::new("ctrl-enter", RunCompare, Some("Compare && !CompareRunning")),
+        KeyBinding::new("escape", CancelCompare, Some("Compare && CompareRunning")),
+        KeyBinding::new("escape", ClearCompareTarget, Some("Compare && !Input && !CompareRunning")),
+        KeyBinding::new("down", CompareNext, Some("Compare && !Input")),
+        KeyBinding::new("up", ComparePrevious, Some("Compare && !Input")),
+        KeyBinding::new("enter", FocusCompareDetail, Some("Compare && !Input")),
+        KeyBinding::new("down", TaskNext, Some("Tasks && !Input")),
+        KeyBinding::new("up", TaskPrevious, Some("Tasks && !Input")),
+        KeyBinding::new("enter", EditSelectedTask, Some("Tasks && !Input")),
+        KeyBinding::new("cmd-f", FindInCompare, Some("Compare")),
+        KeyBinding::new("ctrl-f", FindInCompare, Some("Compare")),
+        KeyBinding::new(
+            "space",
+            ToggleCompareSelection,
+            Some("Compare && !Input && !CompareRunning"),
+        ),
+        KeyBinding::new(
+            "cmd-a",
+            SelectCompareSegment,
+            Some("Compare && !Input && !CompareRunning"),
+        ),
+        KeyBinding::new(
+            "ctrl-a",
+            SelectCompareSegment,
+            Some("Compare && !Input && !CompareRunning"),
+        ),
         KeyBinding::new("ctrl-enter", SaveTransferQuery, Some("Transfer && TransferQueryModal")),
         KeyBinding::new("escape", CloseTransferQueryModal, Some("Transfer && TransferQueryModal")),
         KeyBinding::new("cmd-alt-f", OpenForge, Some("Workspace")),
@@ -230,6 +306,42 @@ fn default_keybindings() -> Vec<KeyBinding> {
         KeyBinding::new("ctrl-e", FocusForgeEditor, Some("ForgeView")),
         KeyBinding::new("cmd-o", FocusForgeOutput, Some("ForgeView")),
         KeyBinding::new("ctrl-o", FocusForgeOutput, Some("ForgeView")),
+        KeyBinding::new("tab", AcceptForgeCompletion, Some("ForgeView > Input")),
+        KeyBinding::new("ctrl-space", TriggerForgeCompletion, Some("ForgeView > Input")),
+        KeyBinding::new("up", PreviousForgeCompletion, Some("ForgeView > Input")),
+        KeyBinding::new("down", NextForgeCompletion, Some("ForgeView > Input")),
+        KeyBinding::new("enter", InsertForgeNewline, Some("ForgeView > Input")),
+        KeyBinding::new("return", InsertForgeNewline, Some("ForgeView > Input")),
+        KeyBinding::new(
+            if cfg!(target_os = "macos") { "alt-backspace" } else { "ctrl-backspace" },
+            DeleteForgeWordBackward,
+            Some("ForgeView > Input"),
+        ),
+        KeyBinding::new(
+            if cfg!(target_os = "macos") { "alt-delete" } else { "ctrl-delete" },
+            DeleteForgeWordForward,
+            Some("ForgeView > Input"),
+        ),
+        KeyBinding::new(
+            if cfg!(target_os = "macos") { "alt-left" } else { "ctrl-left" },
+            MoveForgeWordBackward,
+            Some("ForgeView > Input"),
+        ),
+        KeyBinding::new(
+            if cfg!(target_os = "macos") { "alt-right" } else { "ctrl-right" },
+            MoveForgeWordForward,
+            Some("ForgeView > Input"),
+        ),
+        KeyBinding::new(
+            if cfg!(target_os = "macos") { "alt-shift-left" } else { "ctrl-shift-left" },
+            SelectForgeWordBackward,
+            Some("ForgeView > Input"),
+        ),
+        KeyBinding::new(
+            if cfg!(target_os = "macos") { "alt-shift-right" } else { "ctrl-shift-right" },
+            SelectForgeWordForward,
+            Some("ForgeView > Input"),
+        ),
         KeyBinding::new("cmd-f", FindInForgeOutput, Some("ForgeView && !Input")),
         KeyBinding::new("ctrl-f", FindInForgeOutput, Some("ForgeView && !Input")),
         KeyBinding::new("cmd-a", SelectAllForgeResults, Some("ForgeView && !Input")),
@@ -250,10 +362,27 @@ fn default_keybindings() -> Vec<KeyBinding> {
         KeyBinding::new("ctrl-n", NewConnection, Some("Workspace && Collections")),
         KeyBinding::new("cmd-shift-n", CreateDatabase, Some("Workspace && !Documents")),
         KeyBinding::new("ctrl-shift-n", CreateDatabase, Some("Workspace && !Documents")),
+        KeyBinding::new("cmd-b", GoToReference, Some(DOCUMENT_EDIT_CONTEXT)),
+        KeyBinding::new("ctrl-b", GoToReference, Some(DOCUMENT_EDIT_CONTEXT)),
+        KeyBinding::new("f12", GoToReference, Some(DOCUMENT_EDIT_CONTEXT)),
+        KeyBinding::new("space", PeekReference, Some(DOCUMENT_EDIT_CONTEXT)),
+        KeyBinding::new("shift-f12", FindReferences, Some(DOCUMENT_EDIT_CONTEXT)),
+        // Plain keys: the canvas has no text input for them to land in.
+        KeyBinding::new("=", RelationsZoomIn, Some("Relations && !Input")),
+        KeyBinding::new("-", RelationsZoomOut, Some("Relations && !Input")),
+        KeyBinding::new("0", RelationsFit, Some("Relations && !Input")),
+        KeyBinding::new("escape", RelationsClearFocus, Some("Relations && !Input")),
+        KeyBinding::new("cmd-[", NavigateBack, Some("Workspace && !Input")),
+        KeyBinding::new("ctrl-[", NavigateBack, Some("Workspace && !Input")),
+        KeyBinding::new("cmd-]", NavigateForward, Some("Workspace && !Input")),
+        KeyBinding::new("ctrl-]", NavigateForward, Some("Workspace && !Input")),
         KeyBinding::new("cmd-w", CloseTab, Some("Workspace")),
         KeyBinding::new("ctrl-w", CloseTab, Some("Workspace")),
         KeyBinding::new("cmd-w", CloseEditorWindow, Some("JsonEditorWindow")),
         KeyBinding::new("ctrl-w", CloseEditorWindow, Some("JsonEditorWindow")),
+        // The Documents binding excludes a focused input, and the editor is one.
+        KeyBinding::new("cmd-s", SaveDocument, Some("JsonEditorWindow")),
+        KeyBinding::new("ctrl-s", SaveDocument, Some("JsonEditorWindow")),
         KeyBinding::new("ctrl-tab", NextTab, Some("Workspace")),
         KeyBinding::new("ctrl-shift-tab", PrevTab, Some("Workspace")),
         KeyBinding::new("cmd-1", SelectTab1, Some("Workspace")),
@@ -278,8 +407,10 @@ fn default_keybindings() -> Vec<KeyBinding> {
         KeyBinding::new("ctrl-r", RefreshView, Some("Workspace")),
         KeyBinding::new("cmd-q", QuitApp, Some("Workspace")),
         KeyBinding::new("ctrl-q", QuitApp, Some("Workspace")),
-        KeyBinding::new("cmd-f", FindInResults, Some("Documents")),
-        KeyBinding::new("ctrl-f", FindInResults, Some("Documents")),
+        // Not while typing: the query editors have their own find, and taking Cmd+F from an
+        // input to open the document search is not what anyone means by it.
+        KeyBinding::new("cmd-f", FindInResults, Some("Documents && !Input")),
+        KeyBinding::new("ctrl-f", FindInResults, Some("Documents && !Input")),
         KeyBinding::new("escape", CloseSearch, Some("Documents")),
         KeyBinding::new("escape", CloseSearch, Some("Documents && Input")),
         KeyBinding::new("cmd-f", FindInSidebar, Some("Sidebar")),
@@ -328,14 +459,30 @@ fn default_keybindings() -> Vec<KeyBinding> {
         KeyBinding::new("ctrl-c", CopyAs, Some("Documents && !Input && !Aggregation")),
         KeyBinding::new("cmd-shift-c", CopyKey, Some("Documents && !Input")),
         KeyBinding::new("ctrl-shift-c", CopyKey, Some("Documents && !Input")),
+        // VS Code's palette shortcut also works; ⌘K is bound after it, so hints show ⌘K.
+        KeyBinding::new("cmd-shift-p", OpenActionBar, Some("Workspace")),
+        KeyBinding::new("ctrl-shift-p", OpenActionBar, Some("Workspace")),
         KeyBinding::new("cmd-k", OpenActionBar, Some("Workspace")),
         KeyBinding::new("ctrl-k", OpenActionBar, Some("Workspace")),
+        KeyBinding::new("cmd-shift-k", OpenConnectionSwitcher, Some("Workspace")),
+        KeyBinding::new("ctrl-shift-k", OpenConnectionSwitcher, Some("Workspace")),
         KeyBinding::new("cmd-shift-h", OpenQueryLibrary, Some("Workspace")),
         KeyBinding::new("ctrl-shift-h", OpenQueryLibrary, Some("Workspace")),
         KeyBinding::new("cmd-,", OpenSettings, Some("Workspace")),
         KeyBinding::new("ctrl-,", OpenSettings, Some("Workspace")),
         KeyBinding::new("cmd-l", ToggleAiPanel, Some("Workspace")),
         KeyBinding::new("ctrl-l", ToggleAiPanel, Some("Workspace")),
+        // Only while the chat has focus, so it cannot be mistaken for deleting a collection.
+        KeyBinding::new("cmd-shift-backspace", ClearAiChat, Some("AiPanel")),
+        KeyBinding::new("ctrl-shift-backspace", ClearAiChat, Some("AiPanel")),
+        // The @collection list is a list. Without these the arrows moved the caret behind it and
+        // Enter sent the half-typed name as a message.
+        KeyBinding::new("up", PreviousAiMention, Some("AiPanel > Input")),
+        KeyBinding::new("down", NextAiMention, Some("AiPanel > Input")),
+        KeyBinding::new("enter", ConfirmAiMention, Some("AiPanel > Input")),
+        // Turns the filter bar into the one you describe a filter to, and back.
+        KeyBinding::new("cmd-i", AskAiFilter, Some("Documents")),
+        KeyBinding::new("ctrl-i", AskAiFilter, Some("Documents")),
         KeyBinding::new("cmd-0", FocusSidebar, Some("Workspace")),
         KeyBinding::new("ctrl-0", FocusSidebar, Some("Workspace")),
         KeyBinding::new(FOCUS_CONTENT_KEYS[0], FocusContent, Some("Workspace")),
@@ -359,40 +506,33 @@ fn default_keybindings() -> Vec<KeyBinding> {
         KeyBinding::new("cmd-enter", RunAggregation, Some("Documents && Aggregation")),
         KeyBinding::new("ctrl-enter", RunAggregation, Some("Documents && Aggregation")),
         KeyBinding::new("secondary-enter", RunAggregation, Some("Documents && Aggregation")),
+        // Bound on the editor as well: the input's own secondary-enter inserts a newline and then
+        // lets the key fall through, so without these the pipeline runs and the stage gains a line.
+        KeyBinding::new("cmd-enter", RunAggregation, Some("Documents && Aggregation > Input")),
+        KeyBinding::new("ctrl-enter", RunAggregation, Some("Documents && Aggregation > Input")),
+        KeyBinding::new(
+            "secondary-enter",
+            RunAggregation,
+            Some("Documents && Aggregation > Input"),
+        ),
         KeyBinding::new("cmd-shift-enter", RunAggregation, Some("Documents && Aggregation")),
         KeyBinding::new("ctrl-shift-enter", RunAggregation, Some("Documents && Aggregation")),
         KeyBinding::new("cmd-shift-f", FormatAggregationStage, Some("Documents && Aggregation")),
         KeyBinding::new("ctrl-shift-f", FormatAggregationStage, Some("Documents && Aggregation")),
-        KeyBinding::new(
-            "cmd-alt-k",
-            ClearAggregationStage,
-            Some("Documents && Aggregation && Input"),
-        ),
-        KeyBinding::new(
-            "ctrl-alt-k",
-            ClearAggregationStage,
-            Some("Documents && Aggregation && Input"),
-        ),
-        KeyBinding::new(
-            "cmd-shift-backspace",
-            ClearAggregationStage,
-            Some("Documents && Aggregation && Input"),
-        ),
-        KeyBinding::new(
-            "ctrl-shift-backspace",
-            ClearAggregationStage,
-            Some("Documents && Aggregation && Input"),
-        ),
-        KeyBinding::new(
-            "up",
-            SelectPrevAggregationStage,
-            Some("Documents && Aggregation && !Input"),
-        ),
-        KeyBinding::new(
-            "down",
-            SelectNextAggregationStage,
-            Some("Documents && Aggregation && !Input"),
-        ),
+        KeyBinding::new("cmd-alt-k", ClearAggregationStage, Some("Aggregation > Input")),
+        KeyBinding::new("ctrl-alt-k", ClearAggregationStage, Some("Aggregation > Input")),
+        KeyBinding::new("cmd-shift-backspace", ClearAggregationStage, Some("Aggregation > Input")),
+        KeyBinding::new("ctrl-shift-backspace", ClearAggregationStage, Some("Aggregation > Input")),
+        KeyBinding::new("up", SelectPrevAggregationStage, Some(AGGREGATION_STAGES_CONTEXT)),
+        KeyBinding::new("down", SelectNextAggregationStage, Some(AGGREGATION_STAGES_CONTEXT)),
+        KeyBinding::new("space", ToggleAggregationStageEnabled, Some(AGGREGATION_STAGES_CONTEXT)),
+        KeyBinding::new("enter", FocusAggregationStageEditor, Some(AGGREGATION_STAGES_CONTEXT)),
+        KeyBinding::new("cmd-z", UndoAggregationEdit, Some(AGGREGATION_STAGES_CONTEXT)),
+        KeyBinding::new("ctrl-z", UndoAggregationEdit, Some(AGGREGATION_STAGES_CONTEXT)),
+        KeyBinding::new("cmd-shift-z", RedoAggregationEdit, Some(AGGREGATION_STAGES_CONTEXT)),
+        KeyBinding::new("ctrl-shift-z", RedoAggregationEdit, Some(AGGREGATION_STAGES_CONTEXT)),
+        KeyBinding::new("cmd-shift-n", AddAggregationStage, Some("Documents && Aggregation")),
+        KeyBinding::new("ctrl-shift-n", AddAggregationStage, Some("Documents && Aggregation")),
         KeyBinding::new("cmd-d", DuplicateAggregationStage, Some("Documents && Aggregation")),
         KeyBinding::new("ctrl-d", DuplicateAggregationStage, Some("Documents && Aggregation")),
         KeyBinding::new(
@@ -405,16 +545,8 @@ fn default_keybindings() -> Vec<KeyBinding> {
             ToggleAggregationStageEnabled,
             Some("Documents && Aggregation && !Input"),
         ),
-        KeyBinding::new(
-            "delete",
-            DeleteAggregationStage,
-            Some("Documents && Aggregation && !Input"),
-        ),
-        KeyBinding::new(
-            "backspace",
-            DeleteAggregationStage,
-            Some("Documents && Aggregation && !Input"),
-        ),
+        KeyBinding::new("delete", DeleteAggregationStage, Some(AGGREGATION_STAGES_CONTEXT)),
+        KeyBinding::new("backspace", DeleteAggregationStage, Some(AGGREGATION_STAGES_CONTEXT)),
         KeyBinding::new("cmd-shift-up", MoveAggregationStageUp, Some("Documents && Aggregation")),
         KeyBinding::new(
             "cmd-shift-down",
@@ -566,7 +698,29 @@ pub fn effective_shortcuts_for_action(
     shortcuts
 }
 
-pub fn format_keystroke(event: &gpui::KeystrokeEvent) -> String {
+/// The keystroke to show for an action. Shortcuts are registered as ⌘ and Ctrl pairs and
+/// GPUI reports the last binding added, so prefer the platform's own modifier.
+pub fn display_keystroke(bindings: &[KeyBinding]) -> Option<Keystroke> {
+    let binding = bindings
+        .iter()
+        .rev()
+        .find(|binding| {
+            binding.keystrokes().first().is_some_and(|key| {
+                let modifiers = key.as_keystroke().modifiers;
+                if cfg!(target_os = "macos") { modifiers.platform } else { modifiers.control }
+            })
+        })
+        .or_else(|| bindings.last())?;
+    Some(binding.keystrokes().first()?.as_keystroke().clone())
+}
+
+/// Platform-formatted shortcut text for an action in the focused context, such as `⇧⌘K`.
+pub fn shortcut_label(window: &gpui_kit::Window, action: &dyn Action) -> Option<String> {
+    display_keystroke(&window.bindings_for_action(action))
+        .map(|keystroke| gpui_kit::component::kbd::Kbd::format(&keystroke))
+}
+
+pub fn format_keystroke(event: &gpui_kit::KeystrokeEvent) -> String {
     let modifiers = event.keystroke.modifiers;
     let mut parts = Vec::new();
     if modifiers.platform {
@@ -758,16 +912,20 @@ fn canonical_conflict_key(shortcut: &str) -> String {
 }
 
 fn is_reserved_shortcut(shortcut: &str) -> bool {
-    matches!(
-        shortcut,
-        "cmd-space"
-            | "cmd-tab"
-            | "cmd-shift-3"
-            | "cmd-shift-4"
-            | "cmd-shift-5"
-            | "alt-cmd-escape"
-            | "ctrl-cmd-q"
-    )
+    let reserved: &[&str] = if cfg!(target_os = "macos") {
+        &[
+            "cmd-space",
+            "cmd-tab",
+            "cmd-shift-3",
+            "cmd-shift-4",
+            "cmd-shift-5",
+            "alt-cmd-escape",
+            "ctrl-cmd-q",
+        ]
+    } else {
+        &["alt-tab", "alt-shift-tab", "alt-f4", "ctrl-alt-delete"]
+    };
+    reserved.iter().any(|key| normalize_shortcut(key).is_ok_and(|key| key == shortcut))
 }
 
 fn is_unmodified_printable(shortcut: &str) -> bool {
@@ -811,9 +969,14 @@ fn context_samples() -> Vec<Vec<KeyContext>> {
         single("Workspace Documents Schema"),
         single("Workspace Documents Aggregation"),
         single("Workspace Documents Aggregation Input"),
+        path("Workspace Documents Aggregation", "AggregationStages"),
+        path("Workspace Documents Aggregation", "Input"),
         single("Workspace ForgeView"),
         path("Workspace ForgeView", "Input"),
         single("Workspace Transfer"),
+        single("Workspace Compare"),
+        path("Workspace Compare", "Input"),
+        single("Workspace Compare CompareRunning"),
         single("Workspace Transfer TransferRunning"),
         single("Workspace Transfer TransferQueryModal"),
         single("Sidebar"),
@@ -826,7 +989,7 @@ fn context_samples() -> Vec<Vec<KeyContext>> {
 mod tests {
     use std::collections::HashSet;
 
-    use gpui::{KeyBindingContextPredicate, KeyContext};
+    use gpui_kit::{KeyBindingContextPredicate, KeyContext};
 
     use super::*;
 
@@ -856,15 +1019,47 @@ mod tests {
         }
     }
 
+    /// Cmd+F inside a query editor is the editor's own find. Taking it for the document search
+    /// meant typing a filter and having a search bar open over the results.
+    #[test]
+    fn nothing_view_level_fires_while_a_query_editor_has_focus() {
+        let typing = [
+            KeyContext::parse("Workspace").unwrap(),
+            KeyContext::parse("Documents").unwrap(),
+            KeyContext::parse("Input").unwrap(),
+        ];
+        let not_typing = &typing[..2];
+
+        for binding in default_keybindings() {
+            let Some(predicate) = binding.predicate() else { continue };
+            let keys: String =
+                binding.keystrokes().iter().map(ToString::to_string).collect::<Vec<_>>().join(" ");
+            if keys != "cmd-f" && keys != "ctrl-f" {
+                continue;
+            }
+            assert!(
+                predicate.depth_of(&typing).is_none(),
+                "{keys} still reaches {} while typing",
+                binding.action().name()
+            );
+        }
+
+        let search = KeyBindingContextPredicate::parse("Documents && !Input").unwrap();
+        assert!(search.depth_of(not_typing).is_some(), "and still works outside an input");
+    }
+
     #[test]
     fn document_duplicate_and_delete_do_not_match_aggregation() {
         let document = KeyBindingContextPredicate::parse(DOCUMENT_EDIT_CONTEXT).unwrap();
-        let aggregation =
-            KeyBindingContextPredicate::parse("Documents && Aggregation && !Input").unwrap();
-        let contexts = [KeyContext::parse("Documents Aggregation").unwrap()];
+        let aggregation = KeyBindingContextPredicate::parse(AGGREGATION_STAGES_CONTEXT).unwrap();
+        let contexts = [
+            KeyContext::parse("Documents Aggregation").unwrap(),
+            KeyContext::parse(AGGREGATION_STAGES_CONTEXT).unwrap(),
+        ];
 
         assert!(document.depth_of(&contexts).is_none());
         assert!(aggregation.depth_of(&contexts).is_some());
+        assert!(aggregation.depth_of(&contexts[..1]).is_none());
     }
 
     #[test]
@@ -892,7 +1087,7 @@ mod tests {
             shortcuts("show-schema-subview.").contains(&normalize_shortcut("ctrl-alt-5").unwrap())
         );
         assert!(shortcuts("run-transfer.").contains(&normalize_shortcut("cmd-enter").unwrap()));
-        assert!(shortcuts("run-transfer.").contains(&normalize_shortcut("ctrl-enter").unwrap()));
+        assert!(shortcuts("run-transfer.").contains(&"ctrl-enter".to_string()));
         assert!(shortcuts("cancel-transfer.").contains(&"escape".to_string()));
         assert!(
             shortcuts("save-transfer-query.").contains(&normalize_shortcut("cmd-enter").unwrap())
@@ -902,6 +1097,31 @@ mod tests {
             Some("Transfer && !TransferRunning && !TransferQueryModal"),
             Some("Transfer && TransferQueryModal")
         ));
+    }
+
+    #[test]
+    fn running_a_pipeline_outranks_the_stage_editors_own_enter() {
+        // The input binds secondary-enter itself, inserts a newline, and lets the key fall
+        // through. A run binding that matches no deeper than the view loses to it, and the
+        // pipeline runs with a line added to the stage.
+        let contexts = [
+            KeyContext::parse("Workspace").unwrap(),
+            KeyContext::parse("Documents Aggregation").unwrap(),
+            KeyContext::parse("Input").unwrap(),
+        ];
+        let input = KeyBindingContextPredicate::parse("Input").unwrap().depth_of(&contexts);
+        let deepest_run = default_keybindings()
+            .iter()
+            .filter(|binding| binding.action().name().ends_with("RunAggregation"))
+            .filter(|binding| {
+                normalize_shortcut(&binding.keystrokes()[0].inner().unparse())
+                    == normalize_shortcut("secondary-enter")
+            })
+            .filter_map(|binding| binding.predicate()?.depth_of(&contexts))
+            .max();
+
+        assert!(input.is_some());
+        assert!(deepest_run >= input, "run matched at {deepest_run:?}, the input at {input:?}");
     }
 
     #[test]
@@ -987,19 +1207,27 @@ mod tests {
     }
 
     #[test]
+    fn palette_hint_uses_the_platform_modifier_over_the_alias() {
+        let (bindings, _) = effective_keybindings(&KeybindingSettings::default());
+        let palette = bindings
+            .into_iter()
+            .filter(|binding| binding.action().name().ends_with("OpenActionBar"))
+            .collect::<Vec<_>>();
+        // GPUI's own pick is the last binding added, which is the Ctrl variant.
+        assert_eq!(palette.last().unwrap().keystrokes()[0].inner().unparse(), "ctrl-k");
+        let expected = if cfg!(target_os = "macos") { "cmd-k" } else { "ctrl-k" };
+        assert_eq!(display_keystroke(&palette).unwrap().unparse(), expected);
+    }
+
+    #[test]
     fn invalid_and_reserved_shortcuts_fail_safely() {
         assert!(normalize_shortcut("").is_err());
-        // The reserved shortcuts are macOS system bindings. On other platforms,
-        // GPUI normalizes `cmd` to the platform's secondary modifier first.
-        #[cfg(target_os = "macos")]
-        {
-            let issues = validate_keybinding_override(
-                &KeybindingSettings::default(),
-                "open-action-bar.workspace",
-                "cmd-space",
-            )
-            .unwrap();
-            assert!(issues.iter().any(|issue| issue.severity == KeybindingIssueSeverity::Error));
-        }
+        let issues = validate_keybinding_override(
+            &KeybindingSettings::default(),
+            "open-action-bar.workspace",
+            if cfg!(target_os = "macos") { "cmd-space" } else { "alt-tab" },
+        )
+        .unwrap();
+        assert!(issues.iter().any(|issue| issue.severity == KeybindingIssueSeverity::Error));
     }
 }

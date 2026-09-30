@@ -1,6 +1,6 @@
 import { ElectronRuntime } from "@mongosh/browser-runtime-electron";
 import { CompassServiceProvider } from "@mongosh/service-provider-node-driver";
-import { EJSON } from "bson";
+import { formatPrintValue, safePrintable } from "./format";
 import { EventEmitter } from "events";
 import readline from "readline";
 
@@ -27,20 +27,8 @@ type ResponseMessage = {
 
 const sessions = new Map<string, Session>();
 
-const IDLE_TIMEOUT_MS = 30_000;
-let idleTimer: ReturnType<typeof setTimeout> | null = null;
-
-function resetIdleTimer() {
-  if (idleTimer) clearTimeout(idleTimer);
-  idleTimer = setTimeout(async () => {
-    for (const [, session] of sessions) {
-      try { await session.provider.close(true); } catch {}
-    }
-    sessions.clear();
-  }, IDLE_TIMEOUT_MS);
-}
-
-resetIdleTimer();
+// Sessions belong to Forge tabs. The host disposes them when tabs close or restart;
+// inactivity must not discard shell variables or interrupt an evaluation.
 
 function send(message: ResponseMessage) {
   process.stdout.write(`${JSON.stringify(message)}\n`);
@@ -50,57 +38,12 @@ function sendEvent(message: Record<string, unknown>) {
   process.stdout.write(`${JSON.stringify(message)}\n`);
 }
 
-function safePrintable(value: unknown) {
-  if (value === undefined) {
-    return null;
-  }
-  try {
-    // Structured payloads back the editable result views, so use canonical EJSON to
-    // preserve Int32/Int64/Double and every other BSON type exactly. Raw printed
-    // output remains relaxed and human-readable in formatPrintValue below.
-    return EJSON.serialize(value as any, { relaxed: false });
-  } catch {
-    // fall through
-  }
-  try {
-    return JSON.parse(JSON.stringify(value));
-  } catch {
-    try {
-      return String(value);
-    } catch {
-      return null;
-    }
-  }
-}
-
 function requireSession(sessionId: string): Session {
   const session = sessions.get(sessionId);
   if (!session) {
     throw new Error(`Session not found: ${sessionId}`);
   }
   return session;
-}
-
-function formatPrintValue(value: unknown, kind: "print" | "printjson"): string {
-  const printable =
-    value && typeof value === "object" && "printable" in (value as any)
-      ? (value as any).printable
-      : value;
-  try {
-    if (kind === "printjson") {
-      return EJSON.stringify(printable as any, { relaxed: true, indent: 2 });
-    }
-    if (typeof printable === "string") {
-      return printable;
-    }
-    return EJSON.stringify(printable as any, { relaxed: true });
-  } catch {
-    try {
-      return JSON.stringify(printable, null, kind === "printjson" ? 2 : undefined);
-    } catch {
-      return String(printable);
-    }
-  }
 }
 
 function splitLines(text: string): string[] {
@@ -255,6 +198,7 @@ async function evaluate(params: Record<string, unknown>) {
     return {
       ...result,
       run_id: runId,
+      is_undefined: result.printable === undefined,
       printable: safePrintable(result.printable),
     };
   } finally {
@@ -295,7 +239,6 @@ async function handleRequest(req: RequestMessage) {
 const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
 
 rl.on("line", async (line) => {
-  resetIdleTimer();
   const trimmed = line.trim();
   if (!trimmed) return;
 
