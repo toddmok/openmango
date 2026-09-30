@@ -132,6 +132,7 @@ pub fn write_documents_to_xlsx(
     while let Some(chunk) = source.next_chunk()? {
         check()?;
         for document in chunk {
+            check_distinct_columns(&document, count + 1)?;
             collect_document_columns(&document, &mut seen, &mut columns);
             document.to_writer(&mut spill)?;
             count += 1;
@@ -207,6 +208,22 @@ fn excel_sheet_name(name: &str) -> String {
         .take(31)
         .collect();
     if cleaned.trim().is_empty() { "Results".to_string() } else { cleaned }
+}
+
+/// A field literally named `a.b` and a field `b` inside `a` both flatten to the column `a.b`.
+/// Writing both would keep whichever came last, so the export stops and says which.
+fn check_distinct_columns(document: &Document, row: u64) -> Result<(), ExportError> {
+    let mut cells = Vec::new();
+    flatten_cells(document, "", &mut cells);
+    let mut names = HashSet::with_capacity(cells.len());
+    for (name, _) in &cells {
+        if !names.insert(name.as_str()) {
+            return Err(ExportError::Failed(format!(
+                "Row {row} has two fields that both become the column '{name}' (a field named with a dot and a nested field). Rename one with $project, then export again."
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// The same columns `collect_document_columns` names: nested documents become dotted paths and
@@ -929,6 +946,24 @@ mod tests {
         let Err(ExportError::Failed(message)) = result else { panic!("expected failure") };
         assert!(message.contains("column 'note'"), "{message}");
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn a_dotted_field_and_a_nested_field_with_the_same_path_fail_instead_of_overwriting() {
+        let mut document = doc! { "_id": 1 };
+        document.insert("a.b", "literal");
+        document.insert("a", doc! { "b": "nested" });
+        let (_dir, path, result) = export(vec![vec![doc! { "_id": 0 }, document]]);
+        let Err(ExportError::Failed(message)) = result else { panic!("expected failure") };
+        assert!(message.contains("Row 2") && message.contains("'a.b'"), "{message}");
+        assert!(!path.exists());
+
+        // Either one alone is fine.
+        let mut dotted = doc! { "_id": 1 };
+        dotted.insert("a.b", "literal");
+        let (_dir, path, result) = export(vec![vec![dotted]]);
+        assert_eq!(result.unwrap(), 1);
+        assert!(sheet_xml(&path).contains("literal"));
     }
 
     #[test]
