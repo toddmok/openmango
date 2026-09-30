@@ -12,6 +12,7 @@ pub(crate) mod logic;
 mod mongosh;
 mod output;
 pub(crate) mod parser;
+mod query_export;
 mod result_edit;
 mod runtime;
 mod state;
@@ -36,6 +37,7 @@ use crate::state::{AppEvent, AppState, View};
 use crate::theme::{fonts, islands, spacing};
 use crate::views::results::ResultViewMode;
 use controller::ForgeController;
+pub(crate) use mongosh::group_thousands as mongosh_group_thousands;
 use output::format_result_tab_label;
 use state::ForgeState;
 use types::ForgeOutputTab;
@@ -108,7 +110,8 @@ impl ForgeView {
         cx.notify();
     }
 
-    fn render_header(&self, cx: &App) -> impl IntoElement {
+    fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let forge_view = cx.entity();
         let target = self.app_state.read(cx).active_forge_tab_key().cloned();
         let database = target
             .as_ref()
@@ -145,26 +148,57 @@ impl ForgeView {
                     .child(div().text_xs().text_color(cx.theme().muted_foreground).child(database)),
             )
             .child(
-                Button::new("forge-query-library")
-                    .ghost()
-                    .xsmall()
-                    .icon(Icon::new(IconName::BookOpen).xsmall())
-                    .label("Query library")
-                    .disabled(target.is_none())
-                    .on_click({
-                        let state = self.app_state.clone();
-                        move |_, window, cx| {
-                            let Some(target) = target.clone() else {
-                                return;
-                            };
-                            QueryLibraryDialog::open(
-                                state.clone(),
-                                QueryLibraryTarget::forge(state.read(cx), target),
-                                window,
-                                cx,
-                            );
-                        }
-                    }),
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(spacing::xs())
+                    .child(
+                        Button::new("forge-export-excel")
+                            .ghost()
+                            .xsmall()
+                            .icon(Icon::new(crate::assets::AppIcon::FileSpreadsheet).xsmall())
+                            .label("Export to Excel")
+                            .tooltip_with_action(
+                                "Run the query and save every result to an .xlsx file, without showing it",
+                                &crate::keyboard::ExportForgeQueryToExcel,
+                                Some("ForgeView"),
+                            )
+                            .disabled(
+                                target.is_none()
+                                    || self.state.runtime.is_running
+                                    || self.state.runtime.export.is_some(),
+                            )
+                            .on_click({
+                                let view = forge_view.clone();
+                                move |_, window, cx| {
+                                    view.update(cx, |view, cx| {
+                                        view.export_query_to_excel(window, cx);
+                                    });
+                                }
+                            }),
+                    )
+                    .child(
+                        Button::new("forge-query-library")
+                            .ghost()
+                            .xsmall()
+                            .icon(Icon::new(IconName::BookOpen).xsmall())
+                            .label("Query library")
+                            .disabled(target.is_none())
+                            .on_click({
+                                let state = self.app_state.clone();
+                                move |_, window, cx| {
+                                    let Some(target) = target.clone() else {
+                                        return;
+                                    };
+                                    QueryLibraryDialog::open(
+                                        state.clone(),
+                                        QueryLibraryTarget::forge(state.read(cx), target),
+                                        window,
+                                        cx,
+                                    );
+                                }
+                            }),
+                    ),
             )
     }
 
@@ -535,12 +569,30 @@ impl Render for ForgeView {
             .w_full()
             .into_any_element();
         let status_text = if self.state.runtime.mongosh_error.is_some() {
-            "Shell error"
+            "Shell error".to_string()
+        } else if let Some(export) = &self.state.runtime.export {
+            format!(
+                "Exporting… {} rows",
+                mongosh::group_thousands(export.rows.load(std::sync::atomic::Ordering::Relaxed))
+            )
         } else if self.state.runtime.is_running {
-            "Running…"
+            "Running…".to_string()
         } else {
-            "Ready"
+            "Ready".to_string()
         };
+        let cancel_export_button = self.state.runtime.export.as_ref().map(|_| {
+            Button::new("forge-export-cancel")
+                .ghost()
+                .xsmall()
+                .icon(Icon::new(IconName::Close).xsmall())
+                .label("Cancel export")
+                .on_click({
+                    let forge_view = cx.entity();
+                    move |_, _window, cx| {
+                        forge_view.update(cx, |view, cx| view.cancel_export(cx));
+                    }
+                })
+        });
 
         let editor_panel = {
             let mut panel = div()
@@ -633,7 +685,9 @@ impl Render for ForgeView {
                             .text_xs()
                             .text_color(cx.theme().muted_foreground)
                             .font_family(fonts::ui())
-                            .child("⌘↩ Run all | ⌘⇧↩ Run selection/statement | Esc Cancel"),
+                            .child(
+                                "⌘↩ Run all | ⌘⇧↩ Run selection/statement | ⌘⇧E Export to Excel | Esc Cancel",
+                            ),
                     )
                     .child(
                         div()
@@ -641,6 +695,7 @@ impl Render for ForgeView {
                             .items_center()
                             .gap(spacing::sm())
                             .children(show_output_button)
+                            .children(cancel_export_button)
                             .child(
                                 div()
                                     .flex()

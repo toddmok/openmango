@@ -101,3 +101,46 @@ test.skipIf(!binary || !uri)("compiled shell preserves BSON, completion, output 
     }
   });
 }, 60_000);
+
+test.skipIf(!binary || !uri)("compiled shell pages a large result and exports it in chunks", async () => {
+  await withSidecar(async (request) => {
+    const session_id = "paging";
+    expect(await request("create_session", { session_id, uri, database: "forge_sidecar_test" }))
+      .toMatchObject({ ok: true });
+    await request("evaluate", {
+      session_id,
+      code: "db.paged.drop(); db.paged.insertMany(Array.from({ length: 2500 }, (_, i) => ({ _id: i })))",
+    });
+
+    // Without a page size, mongosh prints the first batch of 20 as it always has.
+    const printed = await request("evaluate", { session_id, code: "db.paged.find().sort({ _id: 1 })" });
+    expect(printed.result.printable.documents).toHaveLength(20);
+    expect(printed.result.paging).toBeUndefined();
+
+    const first = await request("evaluate", {
+      session_id, code: "db.paged.find().sort({ _id: 1 }).toArray()", page_size: 1000,
+    });
+    expect(first.result.printable).toHaveLength(1000);
+    expect(first.result.paging).toMatchObject({ page: 0, has_more: true, total: 2500 });
+
+    const last = await request("page", {
+      session_id, result_id: first.result.paging.result_id, page: "last", page_size: 1000,
+    });
+    expect(last.result.printable).toHaveLength(500);
+    expect(last.result.printable[0]).toEqual({ _id: { $numberInt: "2000" } });
+
+    const opened = await request("export_open", { session_id, code: "db.paged.find()" });
+    let exported = 0;
+    for (let done = false; !done;) {
+      const chunk = await request("export_next", {
+        session_id, export_id: opened.result.export_id, max: 1000,
+      });
+      exported += chunk.result.documents.length;
+      done = chunk.result.done;
+    }
+    expect(exported).toBe(2500);
+
+    await request("evaluate", { session_id, code: "db.paged.drop()" });
+    expect(await request("dispose_session", { session_id })).toMatchObject({ ok: true });
+  });
+}, 60_000);

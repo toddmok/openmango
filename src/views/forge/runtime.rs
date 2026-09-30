@@ -178,6 +178,7 @@ impl ForgeView {
 
         let code = text.to_string();
         let history_statement = code.clone();
+        let page_size = self.app_state.read(cx).settings.forge_page_size();
         super::controller::ForgeController::clear_result_pages(self, true);
         self.begin_run(seq, &code, result_origin.clone());
         self.ensure_output_listener(cx);
@@ -187,34 +188,28 @@ impl ForgeView {
             let result = runtime_handle
                 .spawn_blocking(move || {
                     bridge.ensure_session(session_id, &uri, &database)?;
-                    let mut eval = match bridge.evaluate(
+                    // The sidecar sends one page and keeps the rest, so a result of any size
+                    // costs one page to draw. This replaces the old preview re-run, which
+                    // appended `.limit(50)` and so overrode a query's own limit.
+                    let eval = match bridge.evaluate_paged(
                         session_id,
                         &code,
                         Some(seq),
+                        Some(page_size),
                         Duration::from_secs(60),
                     ) {
                         Err(e) if e.to_string().contains("Session not found") => {
                             bridge.ensure_session(session_id, &uri, &database)?;
-                            bridge.evaluate(
+                            bridge.evaluate_paged(
                                 session_id,
                                 &code,
                                 Some(seq),
+                                Some(page_size),
                                 Duration::from_secs(60),
                             )?
                         }
                         other => other?,
                     };
-                    if ForgeView::should_auto_preview(eval.result_type.as_deref(), &code)
-                        && let Some(preview_code) = ForgeView::build_preview_code(&code)
-                        && let Ok(preview) = bridge.evaluate(
-                            session_id,
-                            &preview_code,
-                            Some(seq),
-                            Duration::from_secs(30),
-                        )
-                    {
-                        eval = preview;
-                    }
                     Ok::<mongosh::RuntimeEvaluationResult, crate::error::Error>(eval)
                 })
                 .await;
@@ -228,9 +223,11 @@ impl ForgeView {
                     this.state.runtime.is_running = false;
                     match result {
                         Ok(Ok(eval)) => {
-                            if let Some(docs) =
-                                super::output::documents_from_printable(&eval.printable)
-                            {
+                            let docs = match eval.paging {
+                                Some(_) => Some(super::logic::paged_documents(&eval.printable)),
+                                None => super::output::documents_from_printable(&eval.printable),
+                            };
+                            if let Some(docs) = docs {
                                 let label =
                                     super::controller::ForgeController::run_label(this, seq)
                                         .unwrap_or_else(|| {
@@ -242,6 +239,12 @@ impl ForgeView {
                                     docs,
                                     result_origin.clone(),
                                 );
+                                if let Some(paging) = eval.paging.clone()
+                                    && let Some(page) = this.state.output.result_pages.last_mut()
+                                {
+                                    page.paging = Some(paging);
+                                    page.paging_session = Some(session_id);
+                                }
                                 this.state.output.last_result = None;
                             } else if this.state.output.result_pages.is_empty() {
                                 if Self::is_trivial_printable(&eval.printable) {
@@ -254,7 +257,18 @@ impl ForgeView {
                             }
                             this.state.output.last_error = None;
                             super::controller::ForgeController::sync_output_tab(this);
-                            if !eval.is_undefined {
+                            if let Some(paging) = eval.paging.as_ref() {
+                                // The console gets a line about the result, not every document:
+                                // pretty-printing a page of them is what the results view is for.
+                                this.append_output_lines(
+                                    seq,
+                                    vec![format!(
+                                        "{} documents · page {} (see Results)",
+                                        paging.range_label(),
+                                        paging.page + 1
+                                    )],
+                                );
+                            } else if !eval.is_undefined {
                                 this.append_eval_output(seq, &eval.printable);
                             }
                             if let Some(forge_key) = forge_key.as_ref() {
@@ -488,59 +502,6 @@ impl ForgeView {
 
     pub fn handle_mongosh_event(&mut self, event: MongoshEvent, cx: &mut Context<Self>) {
         super::controller::ForgeController::handle_mongosh_event(self, event, cx);
-    }
-
-    pub fn should_auto_preview(result_type: Option<&str>, code: &str) -> bool {
-        let Some(code) = Self::sanitize_preview_source(code) else {
-            return false;
-        };
-        let Some(result_type) = result_type else {
-            return false;
-        };
-        if !result_type.contains("Cursor") {
-            return false;
-        }
-        if result_type.contains("ChangeStream") {
-            return false;
-        }
-
-        let trimmed = code.trim();
-        if trimmed.is_empty() {
-            return false;
-        }
-        let trimmed_no_semicolon = trimmed.trim_end_matches(';');
-        if trimmed_no_semicolon.contains(';') {
-            return false;
-        }
-
-        let lowered = trimmed_no_semicolon.to_ascii_lowercase();
-        for blocked in
-            [".toarray", ".itcount", ".next(", ".foreach", ".hasnext", ".pretty", ".watch("]
-        {
-            if lowered.contains(blocked) {
-                return false;
-            }
-        }
-
-        true
-    }
-
-    pub fn build_preview_code(code: &str) -> Option<String> {
-        let trimmed = Self::sanitize_preview_source(code)?;
-        let trimmed = trimmed.trim_end_matches(';');
-        Some(format!("{}.limit(50).toArray()", trimmed))
-    }
-
-    pub fn sanitize_preview_source(code: &str) -> Option<String> {
-        let trimmed = code.trim();
-        if trimmed.is_empty() {
-            return None;
-        }
-        let trimmed = trimmed.trim_end_matches(';').trim();
-        if trimmed.contains(';') {
-            return None;
-        }
-        Some(trimmed.to_string())
     }
 }
 

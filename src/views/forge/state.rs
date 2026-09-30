@@ -32,6 +32,8 @@ pub struct ForgeRuntimeState {
     pub run_seq: u64,
     pub is_running: bool,
     pub mongosh_error: Option<String>,
+    /// An Export to Excel in progress: rows written so far and how to stop it.
+    pub export: Option<super::query_export::ForgeExportProgress>,
 }
 
 pub struct ForgeOutputState {
@@ -100,7 +102,12 @@ impl ForgeState {
                 result_inline_subscription: None,
                 output_visible: true,
             },
-            runtime: ForgeRuntimeState { run_seq: 0, is_running: false, mongosh_error: None },
+            runtime: ForgeRuntimeState {
+                run_seq: 0,
+                is_running: false,
+                mongosh_error: None,
+                export: None,
+            },
             focus_handle,
         }
     }

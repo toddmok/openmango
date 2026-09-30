@@ -83,6 +83,12 @@ pub struct ResultPage {
     pub expanded_nodes: HashSet<String>,
     pub scroll: UniformListScrollHandle,
     pub origin: ResultOrigin,
+    /// Set when the sidecar keeps the full result and this page is one slice of it.
+    pub paging: Option<super::mongosh::ResultPaging>,
+    /// The session the paged result lives in, for fetching another page.
+    pub paging_session: Option<Uuid>,
+    /// A page request is in flight; the pager is disabled until it lands.
+    pub paging_busy: bool,
 }
 
 #[cfg(test)]

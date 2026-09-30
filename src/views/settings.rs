@@ -640,6 +640,7 @@ fn render_query_section(
     cx: &App,
 ) -> impl IntoElement {
     let timeout_input = NumberInput::new(&query_timeout_input_state).small().w(px(120.0));
+    let page_size_state = state.clone();
     let double_click_action =
         gpui_kit::component::button::Button::new("collection-double-click-action")
             .xsmall()
@@ -662,6 +663,33 @@ fn render_query_section(
                 }
                 menu
             });
+    let forge_page_size = settings.forge_page_size();
+    let forge_page_size_dropdown =
+        gpui_kit::component::button::Button::new("forge-page-size-setting")
+            .xsmall()
+            .label(crate::views::forge::mongosh_group_thousands(forge_page_size))
+            .dropdown_caret(true)
+            .with_size(Size::Small)
+            .dropdown_menu_with_anchor(Anchor::BottomLeft, {
+                let state = page_size_state;
+                move |mut menu: PopupMenu, _, _| {
+                    for &size in crate::state::settings::FORGE_PAGE_SIZES {
+                        let state = state.clone();
+                        menu = menu.item(
+                            PopupMenuItem::new(crate::views::forge::mongosh_group_thousands(size))
+                                .checked(size == forge_page_size)
+                                .on_click(move |_, _, cx| {
+                                    state.update(cx, |state, cx| {
+                                        state.settings.forge_page_size = size;
+                                        state.save_settings();
+                                        cx.notify();
+                                    });
+                                }),
+                        );
+                    }
+                    menu
+                }
+            });
     section(
         "Queries",
         div()
@@ -678,6 +706,12 @@ fn render_query_section(
                 "Collection double-click action",
                 "Forge opens a find-all query for the collection, ready to run.",
                 double_click_action,
+                cx,
+            ))
+            .child(setting_row_with_description(
+                "Forge results per page",
+                "Forge shows this many documents at a time and fetches the next page when you ask for it. Export to Excel always writes every document.",
+                forge_page_size_dropdown,
                 cx,
             )),
         cx,

@@ -142,6 +142,7 @@ actions!(
         SelectForgeWordBackward,
         SelectForgeWordForward,
         FindInForgeOutput,
+        ExportForgeQueryToExcel,
         SelectAllForgeResults,
         CopyForgeResults,
         CopyAs,
@@ -342,6 +343,9 @@ fn default_keybindings() -> Vec<KeyBinding> {
             SelectForgeWordForward,
             Some("ForgeView > Input"),
         ),
+        // Runs the query straight into an .xlsx file without drawing the results.
+        KeyBinding::new("cmd-shift-e", ExportForgeQueryToExcel, Some("ForgeView")),
+        KeyBinding::new("ctrl-shift-e", ExportForgeQueryToExcel, Some("ForgeView")),
         KeyBinding::new("cmd-f", FindInForgeOutput, Some("ForgeView && !Input")),
         KeyBinding::new("ctrl-f", FindInForgeOutput, Some("ForgeView && !Input")),
         KeyBinding::new("cmd-a", SelectAllForgeResults, Some("ForgeView && !Input")),

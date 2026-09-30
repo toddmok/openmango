@@ -6,10 +6,11 @@ use crate::state::AppState;
 
 use crate::keyboard::{
     AcceptForgeCompletion, CancelForgeRun, ClearForgeOutput, CopyForgeResults,
-    DeleteForgeWordBackward, DeleteForgeWordForward, FindInForgeOutput, FocusForgeEditor,
-    FocusForgeOutput, InsertForgeNewline, MoveForgeWordBackward, MoveForgeWordForward,
-    NextForgeCompletion, PreviousForgeCompletion, RunForgeAll, RunForgeSelectionOrStatement,
-    SelectAllForgeResults, SelectForgeWordBackward, SelectForgeWordForward, TriggerForgeCompletion,
+    DeleteForgeWordBackward, DeleteForgeWordForward, ExportForgeQueryToExcel, FindInForgeOutput,
+    FocusForgeEditor, FocusForgeOutput, InsertForgeNewline, MoveForgeWordBackward,
+    MoveForgeWordForward, NextForgeCompletion, PreviousForgeCompletion, RunForgeAll,
+    RunForgeSelectionOrStatement, SelectAllForgeResults, SelectForgeWordBackward,
+    SelectForgeWordForward, TriggerForgeCompletion,
 };
 use crate::views::results::ResultViewMode;
 use crate::views::results::table::ResultCopyFormat;
@@ -109,7 +110,14 @@ pub fn bind_root_actions(
             );
         })
         .on_action(cx.listener(|this, _: &CancelForgeRun, _window, cx| {
-            super::controller::ForgeController::cancel_run(this, cx);
+            if this.state.runtime.export.is_some() {
+                this.cancel_export(cx);
+            } else {
+                super::controller::ForgeController::cancel_run(this, cx);
+            }
+        }))
+        .on_action(cx.listener(|this, _: &ExportForgeQueryToExcel, window, cx| {
+            this.export_query_to_excel(window, cx);
         }))
         .on_action(cx.listener(|this, _: &ClearForgeOutput, _window, cx| {
             super::controller::ForgeController::clear_output(this, _window, cx);

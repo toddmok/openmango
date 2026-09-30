@@ -235,7 +235,11 @@ impl ForgeView {
         }
     }
 
-    fn editor_selection_text(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<String> {
+    pub(super) fn editor_selection_text(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<String> {
         let editor_state = self.state.editor.editor_state.as_ref()?;
         editor_state.update(cx, |state, cx| {
             let selection = state.selected_text_range(true, window, cx)?;

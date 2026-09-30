@@ -279,6 +279,10 @@ impl ForgeView {
             );
         }
 
+        if let Some(pager) = self.render_result_pager(cx) {
+            body = body.child(pager);
+        }
+
         if let Some(documents) = self.current_result_documents() {
             if self.state.output.result_view_mode == ResultViewMode::Table {
                 if let Some(table) = self.sync_result_table(window, cx) {
@@ -387,6 +391,15 @@ impl ForgeController {
 
     pub fn clear_result_pages(view: &mut ForgeView, keep_pinned: bool) {
         Self::reset_result_workbench(view);
+        let dropped: Vec<_> = view
+            .state
+            .output
+            .result_pages
+            .iter()
+            .filter(|page| !(keep_pinned && page.pinned))
+            .cloned()
+            .collect();
+        view.release_paged_results(&dropped);
         let selected = view
             .state
             .output
@@ -474,6 +487,9 @@ impl ForgeController {
             expanded_nodes: Default::default(),
             scroll: UniformListScrollHandle::new(),
             origin,
+            paging: None,
+            paging_session: None,
+            paging_busy: false,
         });
         if view.state.output.auto_select_results && (print_run.is_none() || !has_evaluation) {
             view.state.output.result_page_index = view.state.output.result_pages.len() - 1;
@@ -503,7 +519,8 @@ impl ForgeController {
             return;
         }
         let was_active = index == view.state.output.result_page_index;
-        view.state.output.result_pages.remove(index);
+        let removed = view.state.output.result_pages.remove(index);
+        view.release_paged_results(std::slice::from_ref(&removed));
         if was_active {
             Self::reset_result_workbench(view);
         }

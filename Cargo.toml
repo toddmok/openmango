@@ -114,6 +114,8 @@ reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 rmcp ={ version = "=3.1.2", default-features = false, features = ["client", "transport-streamable-http-client-reqwest"] }
 testcontainers = "0.27"
 testcontainers-modules = { version = "0.15.0", features = ["mongo"] }
+# Reads exported .xlsx files back in tests; already built for rust_xlsxwriter.
+zip = { version = "7.2", default-features = false, features = ["deflate"] }
 
 [profile.dev]
 opt-level = 1

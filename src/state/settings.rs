@@ -34,6 +34,28 @@ pub struct AppSettings {
     pub update_channel: UpdateChannel,
     #[serde(default)]
     pub collection_double_click_action: CollectionDoubleClickAction,
+    /// Documents Forge shows per page. The rest of a result stays in the Forge runtime and is
+    /// fetched a page at a time, so a large result never has to be drawn at once.
+    #[serde(default = "default_forge_page_size")]
+    pub forge_page_size: u64,
+}
+
+/// Page sizes offered for Forge results.
+pub const FORGE_PAGE_SIZES: &[u64] = &[50, 100, 500, 1000, 2000, 5000];
+
+pub fn default_forge_page_size() -> u64 {
+    1000
+}
+
+impl AppSettings {
+    /// The saved page size, or the default when the file holds something unusable.
+    pub fn forge_page_size(&self) -> u64 {
+        if (1..=100_000).contains(&self.forge_page_size) {
+            self.forge_page_size
+        } else {
+            default_forge_page_size()
+        }
+    }
 }
 
 impl Default for AppSettings {
@@ -49,6 +71,7 @@ impl Default for AppSettings {
             auto_update: true,
             update_channel: UpdateChannel::default(),
             collection_double_click_action: CollectionDoubleClickAction::default(),
+            forge_page_size: default_forge_page_size(),
         }
     }
 }
