@@ -64,8 +64,9 @@ test.skipIf(!binary || !uri)("compiled shell preserves BSON, completion, output 
     for (const session_id of ["idle", "active"]) {
       expect(await request("create_session", { session_id, uri, database: "forge_sidecar_test" }))
         .toMatchObject({ ok: true });
+      // Canonical Extended JSON: the fork's editable results need Int32 to stay Int32.
       expect(await request("evaluate", { session_id, code: "const kept = 42; kept" }))
-        .toMatchObject({ ok: true, result: { printable: 42 } });
+        .toMatchObject({ ok: true, result: { printable: { $numberInt: "42" } } });
     }
 
     const complete = await request("complete", { session_id: "active", code: "db.getCol" });
@@ -81,7 +82,7 @@ test.skipIf(!binary || !uri)("compiled shell preserves BSON, completion, output 
     expect(printed.events[0]).toMatchObject({ run_id: 7, lines: ["hello"] });
     expect(printed.events[1].payload).toEqual([{
       id: { $oid: "507f1f77bcf86cd799439011" },
-      when: { $date: "2020-01-01T00:00:00Z" },
+      when: { $date: { $numberLong: "1577836800000" } },
     }]);
     expect(await request("evaluate", { session_id: "active", code: "null" }))
       .toMatchObject({ ok: true, result: { printable: null, is_undefined: false } });
@@ -89,9 +90,9 @@ test.skipIf(!binary || !uri)("compiled shell preserves BSON, completion, output 
     // The old global idle timer closed both the running query and the idle shell.
     expect(await request("evaluate", {
       session_id: "active", code: "(async () => { await sleep(31_000); return kept + (await db.runCommand({ ping: 1 })).ok; })()",
-    }, 40_000)).toMatchObject({ ok: true, result: { printable: 43 } });
+    }, 40_000)).toMatchObject({ ok: true, result: { printable: { $numberInt: "43" } } });
     expect(await request("evaluate", { session_id: "idle", code: "kept" }))
-      .toMatchObject({ ok: true, result: { printable: 42 } });
+      .toMatchObject({ ok: true, result: { printable: { $numberInt: "42" } } });
 
     for (const session_id of ["idle", "active"]) {
       expect(await request("dispose_session", { session_id })).toMatchObject({ ok: true });
