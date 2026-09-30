@@ -43,6 +43,8 @@ export type ResultSource = {
   cursor: ShellCursor | null;
   exhausted: boolean;
   limit: number;
+  // Result pages in the app showing this result; it is closed when the last one lets go.
+  holders: number;
 };
 
 export function shellApiType(value: unknown): string | null {
@@ -158,6 +160,16 @@ export async function readLastPage(source: ResultSource, pageSize: number) {
 export class ResultRegistry {
   private results = new Map<string, ResultSource>();
   private nextId = 1;
+  // A cursor kept in a shell variable can be the result of more than one run. Two owners would
+  // each read part of it and show pages with documents missing, so a cursor has one owner.
+  private owners = new WeakMap<object, string>();
+
+  // The result that already holds this cursor, if it is still open.
+  ownerOf(value: unknown): ResultSource | null {
+    if (value === null || typeof value !== "object") return null;
+    const id = this.owners.get(value);
+    return id ? (this.results.get(id) ?? null) : null;
+  }
 
   get size() {
     return this.results.size;
@@ -171,7 +183,13 @@ export class ResultRegistry {
     let source: ResultSource;
     const id = `r${this.nextId++}`;
     if (isPageableCursor(value)) {
-      source = { id, cache: [], base: 0, cursor: value, exhausted: false, limit };
+      const owner = this.ownerOf(value);
+      if (owner) {
+        owner.holders += 1;
+        return owner;
+      }
+      source = { id, cache: [], base: 0, cursor: value, exhausted: false, limit, holders: 1 };
+      this.owners.set(value, id);
     } else if (isDocumentArray(value)) {
       source = {
         id,
@@ -180,6 +198,7 @@ export class ResultRegistry {
         cursor: null,
         exhausted: true,
         limit: Number.MAX_SAFE_INTEGER,
+        holders: 1,
       };
     } else {
       return null;
@@ -187,7 +206,7 @@ export class ResultRegistry {
     this.results.set(source.id, source);
     while (this.results.size > MAX_RESULTS_PER_SESSION) {
       const oldest = this.results.keys().next().value as string;
-      await this.release(oldest);
+      await this.close(oldest);
     }
     return source;
   }
@@ -202,7 +221,15 @@ export class ResultRegistry {
     return source;
   }
 
+  // One result page let go of this result.
   async release(id: string) {
+    const source = this.results.get(id);
+    if (source && --source.holders <= 0) {
+      await this.close(id);
+    }
+  }
+
+  private async close(id: string) {
     const source = this.results.get(id);
     this.results.delete(id);
     await closeCursor(source?.cursor ?? null);
@@ -210,7 +237,7 @@ export class ResultRegistry {
 
   async clear() {
     for (const id of [...this.results.keys()]) {
-      await this.release(id);
+      await this.close(id);
     }
   }
 }

@@ -383,6 +383,17 @@ async function exportOpenNow(session: Session, params: Record<string, unknown>) 
     session.mode = "print";
     session.captured = null;
   }
+  // A cursor a paged result is still reading can't also be exported: each would get part of it.
+  if (session.results.ownerOf(value)) {
+    throw new Error(
+      "This cursor is already open in the results. Export the query itself, e.g. db.coll.find(...), rather than a variable holding it.",
+    );
+  }
+  for (const source of session.exports.values()) {
+    if (source.cursor !== null && source.cursor === value) {
+      throw new Error("This cursor is already being exported.");
+    }
+  }
   const id = `e${session.nextExportId++}`;
   session.exports.set(id, exportSourceFor(id, value));
   return { export_id: id, type: shellApiType(value) };

@@ -85,6 +85,25 @@ test("an array of documents pages; values and BSON scalars do not", async () => 
   expect(isPlainDocument({ _id: new ObjectId() })).toBe(true);
 });
 
+test("a cursor shown twice is one result, so neither owner loses documents", async () => {
+  const registry = new ResultRegistry();
+  const cursor = fakeCursor(26);
+  const first = (await registry.register(cursor))!;
+  expect(ids((await readPage(first, 0, 5)).documents)).toEqual([0, 1, 2, 3, 4]);
+  // Running `shared` again hands back the same cursor object.
+  const second = (await registry.register(cursor))!;
+  expect(second.id).toBe(first.id);
+  expect(ids((await readPage(second, 0, 5)).documents)).toEqual([0, 1, 2, 3, 4]);
+  expect(ids((await readPage(first, 1, 5)).documents)).toEqual([5, 6, 7, 8, 9]);
+  expect((await readLastPage(first, 5)).paging.total).toBe(26);
+
+  // Closing one of the two pages keeps the result for the other.
+  await registry.release(first.id);
+  expect(registry.get(first.id)).toBe(first);
+  await registry.release(first.id);
+  expect(() => registry.get(first.id)).toThrow("Run the query again");
+});
+
 test("older results are closed when a session keeps too many", async () => {
   const registry = new ResultRegistry();
   const first = fakeCursor(10);
