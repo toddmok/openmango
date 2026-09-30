@@ -24,7 +24,6 @@ use crate::state::StatusMessage;
 
 use super::ForgeView;
 use super::mongosh::{MongoshBridge, PageRequest};
-use super::runtime::active_forge_session_info;
 
 /// Documents asked of the sidecar per round trip during an export.
 const EXPORT_CHUNK: u64 = 5_000;
@@ -326,11 +325,41 @@ impl ForgeView {
         };
         let collection = self.app_state.read(cx).forge_tab_collection(key.id).map(str::to_string);
         let default_name = default_export_name(collection.as_deref());
+        // Choose the file first. The write gate comes after, so its confirmation (and a
+        // Production authorization) is used at once by the export it approved, for the tab it
+        // approved, rather than lapsing while a file dialog is open.
+        let pick = cx.background_spawn(open_file_dialog_async(
+            FilePickerMode::Save,
+            vec![FileFilter::excel(), FileFilter::all()],
+            Some(default_name),
+        ));
+        cx.spawn_in(window, async move |view, cx| {
+            let Some(path) = pick.await else {
+                return;
+            };
+            let _ = cx.update(|window, cx| {
+                view.update(cx, |view, cx| {
+                    view.gate_export(key, code, path, collection, window, cx);
+                })
+            });
+        })
+        .detach();
+    }
+
+    /// A Forge query can write, so exporting one goes through the same gate as running it, and
+    /// the export starts inside the gate's callback against the tab that was approved.
+    fn gate_export(
+        &mut self,
+        key: crate::state::ForgeTabKey,
+        code: String,
+        path: PathBuf,
+        collection: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let view = cx.entity();
-        let app_state = self.app_state.clone();
-        // A Forge query can write, so exporting one goes through the same gate as running it.
         request_connection_write(
-            app_state,
+            self.app_state.clone(),
             WriteRequest::new(
                 key.connection_id,
                 key.database.clone(),
@@ -340,20 +369,7 @@ impl ForgeView {
             window,
             cx,
             move |_window, cx| {
-                let pick = cx.background_spawn(open_file_dialog_async(
-                    FilePickerMode::Save,
-                    vec![FileFilter::excel(), FileFilter::all()],
-                    Some(default_name),
-                ));
-                cx.spawn(async move |cx: &mut AsyncApp| {
-                    let Some(path) = pick.await else {
-                        return;
-                    };
-                    cx.update(|cx| {
-                        view.update(cx, |view, cx| view.start_export(code, path, collection, cx));
-                    });
-                })
-                .detach();
+                view.update(cx, |view, cx| view.start_export(key, code, path, collection, cx));
             },
         );
     }
@@ -372,6 +388,7 @@ impl ForgeView {
 
     fn start_export(
         &mut self,
+        key: crate::state::ForgeTabKey,
         code: String,
         path: PathBuf,
         collection: Option<String>,
@@ -385,13 +402,39 @@ impl ForgeView {
             );
             return;
         }
+        // The approved tab must still be the one in front: the export runs in its shell.
+        if self.app_state.read(cx).active_forge_tab_key() != Some(&key) {
+            self.set_export_status(
+                "The Forge tab changed before the export started. Nothing was run.",
+                true,
+                cx,
+            );
+            return;
+        }
+        // The same checks Run makes at the moment it executes.
+        let (read_only, protected) = {
+            let state = self.app_state.read(cx);
+            (
+                state.connection_read_only(key.connection_id),
+                state.connection_requires_production_write_confirmation(key.connection_id),
+            )
+        };
+        let authorized = !protected
+            || self.app_state.update(cx, |state, _cx| {
+                state.consume_production_write_authorization(key.connection_id)
+            });
+        if let Err(error) =
+            super::runtime::ensure_forge_execution_allowed(read_only, protected, authorized)
+        {
+            self.set_export_status(&error.to_string(), true, cx);
+            return;
+        }
         let (session_id, uri, database, runtime_handle) = {
             let state = self.app_state.read(cx);
-            match active_forge_session_info(state) {
-                Ok(Some((session_id, uri, database))) => {
-                    (session_id, uri, database, state.connection_manager().runtime_handle())
+            match state.active_connection_tool_uri(key.connection_id) {
+                Ok(uri) => {
+                    (key.id, uri, key.database.clone(), state.connection_manager().runtime_handle())
                 }
-                Ok(None) => return,
                 Err(error) => {
                     self.set_export_status(&error.to_string(), true, cx);
                     return;
@@ -464,8 +507,17 @@ impl ForgeView {
                 Err(error) => Err(ExportError::Failed(error.to_string())),
             };
             let _ = view.update(cx, |view, cx| {
-                view.state.runtime.export = None;
-                view.state.runtime.is_running = false;
+                // Only the export that set the busy state may clear it.
+                let ours = view
+                    .state
+                    .runtime
+                    .export
+                    .as_ref()
+                    .is_some_and(|export| Arc::ptr_eq(&export.rows, &progress.rows));
+                if ours {
+                    view.state.runtime.export = None;
+                    view.state.runtime.is_running = false;
+                }
                 match result {
                     Ok(rows) => {
                         let name = progress

@@ -59,7 +59,7 @@ pub fn active_forge_session_info(
 
 const READ_ONLY_FORGE_ERROR: &str = "Forge execution is disabled for read-only connections. Use a writable connection or a server-enforced read-only MongoDB account.";
 
-fn ensure_forge_execution_allowed(
+pub(super) fn ensure_forge_execution_allowed(
     read_only: bool,
     protected_production: bool,
     authorized: bool,
@@ -77,6 +77,17 @@ fn ensure_forge_execution_allowed(
 
 impl ForgeView {
     pub fn handle_execute_query(&mut self, text: &str, cx: &mut Context<Self>) {
+        // An export is reading this tab's shell a chunk at a time; a run would interleave with
+        // it and end its busy state early.
+        if self.state.runtime.export.is_some() {
+            self.app_state.update(cx, |state, cx| {
+                state.set_status_message(Some(crate::state::StatusMessage::error(
+                    "An export is running. Cancel it (Esc) or wait for it to finish.",
+                )));
+                cx.notify();
+            });
+            return;
+        }
         let (
             session_id,
             uri,
@@ -313,6 +324,9 @@ impl ForgeView {
     }
 
     pub fn restart_session(&mut self, cx: &mut Context<Self>) {
+        if self.state.runtime.export.is_some() {
+            return;
+        }
         let (session_id, uri, database, runtime_handle) = {
             let state_ref = self.app_state.read(cx);
             let (session_id, uri, database) = match active_forge_session_info(state_ref) {
