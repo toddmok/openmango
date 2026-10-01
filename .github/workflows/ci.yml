@@ -49,6 +49,8 @@ jobs:
 
   linux:
     name: Linux (${{ matrix.arch }})
+    # Fork: only the macOS arm64 app is used, so other platforms don't build here.
+    if: github.repository != 'toddmok/openmango'
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
     strategy:
@@ -113,6 +115,8 @@ jobs:
 
   windows:
     name: Windows (${{ matrix.arch }})
+    # Fork: only the macOS arm64 app is used, so other platforms don't build here.
+    if: github.repository != 'toddmok/openmango'
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 120
     strategy:

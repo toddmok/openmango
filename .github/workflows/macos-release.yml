@@ -29,10 +29,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Fork: Apple silicon only. Upstream also builds x86_64-apple-darwin.
           - target: aarch64-apple-darwin
             suffix: macos-arm64
-          - target: x86_64-apple-darwin
-            suffix: macos-x86_64
     env:
       OPENMANGO_RELEASE_CHANNEL: ${{ inputs.channel }}
       CARGO_INCREMENTAL: 0
