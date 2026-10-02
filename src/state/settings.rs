@@ -6,6 +6,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use super::app_state::updater::UpdateChannel;
 use super::app_state::{InsertMode, TransferFormat};
 use crate::ai::settings::AiSettings;
 
@@ -24,12 +25,37 @@ pub struct AppSettings {
     pub mcp: McpSettings,
     #[serde(default = "default_interactive_query_timeout_ms")]
     pub interactive_query_timeout_ms: u64,
+    /// The key of the What's New notes last shown (`changelog::current_key`), despite the name.
     #[serde(default = "default_current_version")]
     pub last_seen_version: String,
     #[serde(default = "default_true")]
     pub auto_update: bool,
     #[serde(default)]
+    pub update_channel: UpdateChannel,
+    #[serde(default)]
     pub collection_double_click_action: CollectionDoubleClickAction,
+    /// Documents Forge shows per page. The rest of a result stays in the Forge runtime and is
+    /// fetched a page at a time, so a large result never has to be drawn at once.
+    #[serde(default = "default_forge_page_size")]
+    pub forge_page_size: u64,
+}
+
+/// Page sizes offered for Forge results.
+pub const FORGE_PAGE_SIZES: &[u64] = &[50, 100, 500, 1000, 2000, 5000];
+
+pub fn default_forge_page_size() -> u64 {
+    1000
+}
+
+impl AppSettings {
+    /// The saved page size, or the default when the file holds something unusable.
+    pub fn forge_page_size(&self) -> u64 {
+        if (1..=100_000).contains(&self.forge_page_size) {
+            self.forge_page_size
+        } else {
+            default_forge_page_size()
+        }
+    }
 }
 
 impl Default for AppSettings {
@@ -43,7 +69,9 @@ impl Default for AppSettings {
             interactive_query_timeout_ms: default_interactive_query_timeout_ms(),
             last_seen_version: default_current_version(),
             auto_update: true,
+            update_channel: UpdateChannel::default(),
             collection_double_click_action: CollectionDoubleClickAction::default(),
+            forge_page_size: default_forge_page_size(),
         }
     }
 }
@@ -151,10 +179,19 @@ fn default_current_version() -> String {
 pub struct AppearanceSettings {
     #[serde(default)]
     pub theme: AppTheme,
+    /// Switch between Mango Dark and Mango Light with the system appearance. New installs
+    /// start with it on; settings saved before it existed keep their chosen theme.
+    #[serde(default)]
+    pub follow_system: bool,
     #[serde(default = "default_true")]
     pub show_status_bar: bool,
+    /// The zone BSON dates are drawn in. UTC unless the user asks for local time.
     #[serde(default)]
-    pub vibrancy: bool,
+    pub date_display: crate::bson::DateDisplay,
+    /// List server-internal `system.*` namespaces in the sidebar. Off by default: they are
+    /// hidden, never dropped from the data, so everything else still sees them.
+    #[serde(default)]
+    pub show_system_collections: bool,
     #[serde(default)]
     pub islands: IslandsAppearanceSettings,
 }
@@ -163,8 +200,10 @@ impl Default for AppearanceSettings {
     fn default() -> Self {
         Self {
             theme: AppTheme::default(),
+            follow_system: true,
             show_status_bar: true,
-            vibrancy: false,
+            date_display: crate::bson::DateDisplay::default(),
+            show_system_collections: false,
             islands: IslandsAppearanceSettings::default(),
         }
     }
@@ -235,6 +274,8 @@ impl IslandsCornerSoftness {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub enum AppTheme {
     #[default]
+    MangoDark,
+    MangoLight,
     VercelDark,
     DarculaDark,
     TokyoNight,
@@ -253,6 +294,8 @@ pub enum AppTheme {
 impl AppTheme {
     pub fn label(self) -> &'static str {
         match self {
+            AppTheme::MangoDark => "Mango Dark",
+            AppTheme::MangoLight => "Mango Light",
             AppTheme::VercelDark => "Vercel Dark",
             AppTheme::DarculaDark => "Darcula Dark",
             AppTheme::TokyoNight => "Tokyo Night",
@@ -271,6 +314,8 @@ impl AppTheme {
 
     pub fn theme_id(self) -> &'static str {
         match self {
+            AppTheme::MangoDark => "mango-dark",
+            AppTheme::MangoLight => "mango-light",
             AppTheme::VercelDark => "vercel-dark",
             AppTheme::DarculaDark => "darcula-dark",
             AppTheme::TokyoNight => "tokyo-night",
@@ -293,6 +338,7 @@ impl AppTheme {
 
     pub fn dark_themes() -> &'static [AppTheme] {
         &[
+            AppTheme::MangoDark,
             AppTheme::VercelDark,
             AppTheme::DarculaDark,
             AppTheme::TokyoNight,
@@ -307,6 +353,7 @@ impl AppTheme {
 
     pub fn light_themes() -> &'static [AppTheme] {
         &[
+            AppTheme::MangoLight,
             AppTheme::CatppuccinLatte,
             AppTheme::SolarizedLight,
             AppTheme::RosePineDawn,
@@ -406,9 +453,9 @@ mod tests {
     #[test]
     fn test_default_settings() {
         let settings = AppSettings::default();
-        assert_eq!(settings.appearance.theme, AppTheme::VercelDark);
+        assert_eq!(settings.appearance.theme, AppTheme::MangoDark);
+        assert!(settings.appearance.follow_system);
         assert!(settings.appearance.show_status_bar);
-        assert!(!settings.appearance.vibrancy);
         assert!(settings.appearance.islands.different_tool_window_background);
         assert_eq!(settings.appearance.islands.tab_style, IslandsTabStyle::Islands);
         assert_eq!(settings.appearance.islands.corner_softness, IslandsCornerSoftness::Medium);
@@ -421,7 +468,8 @@ mod tests {
         assert!(settings.mcp.grants.is_empty());
         assert!(settings.mcp.legacy_access);
         assert!(!settings.ai.enabled);
-        assert_eq!(settings.ai.model, "gemini-3-flash-preview");
+        // The balanced preset; `scripts/update_ai_models.sh` moves this on.
+        assert_eq!(settings.ai.model, "gemini-3.8-flash");
         assert_eq!(settings.interactive_query_timeout_ms, 30_000);
     }
 
@@ -488,6 +536,7 @@ mod tests {
         let raw = r#"{
             "appearance": {
                 "theme": "VercelDark",
+                "vibrancy": true,
                 "islands": {
                     "tab_style": "DataGrip"
                 }
@@ -497,6 +546,10 @@ mod tests {
         let settings: AppSettings = serde_json::from_str(raw).expect("should deserialize");
         assert_eq!(settings.appearance.islands.tab_style, IslandsTabStyle::Islands);
         assert_eq!(settings.interactive_query_timeout_ms, 30_000);
+        // Older settings still load: the removed vibrancy flag is ignored, and settings saved
+        // before system following existed keep their chosen theme.
+        assert_eq!(settings.appearance.theme, AppTheme::VercelDark);
+        assert!(!settings.appearance.follow_system);
     }
 
     #[test]

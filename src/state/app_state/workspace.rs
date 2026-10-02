@@ -3,7 +3,7 @@
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use gpui::Context;
+use gpui_kit::Context;
 
 use crate::state::{AppEvent, WindowState};
 use uuid::Uuid;
@@ -34,7 +34,7 @@ impl AppState {
         }
     }
 
-    pub fn set_workspace_window_bounds(&mut self, bounds: gpui::WindowBounds) {
+    pub fn set_workspace_window_bounds(&mut self, bounds: gpui_kit::WindowBounds) {
         let window_state = WindowState::from_bounds(bounds);
         if self.workspace.window_state.as_ref() != Some(&window_state) {
             self.workspace.window_state = Some(window_state);
@@ -103,11 +103,19 @@ impl AppState {
                         }
                         self.current_view = View::Transfer;
                     }
+                    TabKey::Compare(_) => {
+                        self.current_view = View::Compare;
+                    }
                     TabKey::Forge(key) => {
                         self.apply_restored_forge_selection(connection_id, &key);
                     }
+                    // References tabs are not persisted, so one can never be restored here.
+                    TabKey::References(_) | TabKey::Relations(_) => {}
                     TabKey::AgentActivity => {
                         self.current_view = View::AgentActivity;
+                    }
+                    TabKey::Tasks => {
+                        self.current_view = View::Tasks;
                     }
                     TabKey::Connections => {
                         self.current_view = View::Connections;

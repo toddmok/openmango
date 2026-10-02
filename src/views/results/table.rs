@@ -1,14 +1,14 @@
 use std::collections::BTreeSet;
 use std::rc::Rc;
 
-use gpui::prelude::FluentBuilder;
-use gpui::*;
-use gpui_component::ActiveTheme as _;
-use gpui_component::input::{Input, InputState};
-use gpui_component::menu::{PopupMenu, PopupMenuItem};
-use gpui_component::switch::Switch;
-use gpui_component::table::{Column, ColumnSort, TableDelegate, TableState};
-use gpui_component::{Icon, IconName, Sizable as _};
+use gpui_kit::component::ActiveTheme as _;
+use gpui_kit::component::input::{Input, InputState};
+use gpui_kit::component::menu::{PopupMenu, PopupMenuItem};
+use gpui_kit::component::switch::Switch;
+use gpui_kit::component::table::{Column, ColumnSort, TableDelegate, TableState};
+use gpui_kit::component::{Icon, IconName, Sizable as _};
+use gpui_kit::prelude::FluentBuilder;
+use gpui_kit::*;
 use mongodb::bson::{Bson, Document};
 
 use crate::views::documents::export::{
@@ -91,6 +91,14 @@ impl ResultTableSelection {
     }
 }
 
+/// A right-clicked cell, by displayed row and field name, so a column move or a sort can't point
+/// it at another field.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ContextTarget {
+    row: usize,
+    key: String,
+}
+
 pub type ResultCellEditCallback = Rc<dyn Fn(usize, String, &mut Window, &mut App)>;
 pub type ResultBoolEditCallback = Rc<dyn Fn(usize, String, bool, &mut Window, &mut App)>;
 
@@ -105,6 +113,9 @@ pub struct ResultTableDelegate {
     database: String,
     collection: String,
     inline_editor: Option<(usize, String, Entity<InputState>)>,
+    /// The cell under the last right-click. The kit's row context menu does not say which column
+    /// was clicked, so every cell records itself, and the menu trusts it only for the same row.
+    context_target: Option<ContextTarget>,
 }
 
 impl ResultTableDelegate {
@@ -120,6 +131,7 @@ impl ResultTableDelegate {
             database: String::new(),
             collection: String::new(),
             inline_editor: None,
+            context_target: None,
         }
     }
 
@@ -138,6 +150,7 @@ impl ResultTableDelegate {
         self.database = database;
         self.collection = collection;
         self.selection.clear();
+        self.context_target = None;
     }
 
     pub fn select_all(&mut self) {
@@ -215,8 +228,8 @@ impl TableDelegate for ResultTableDelegate {
         self.documents.len()
     }
 
-    fn column(&self, column: usize, _cx: &App) -> &Column {
-        &self.table_cols.column_defs[column]
+    fn column(&self, column: usize, _cx: &App) -> Column {
+        self.table_cols.column_def(column).clone()
     }
 
     fn perform_sort(
@@ -246,6 +259,7 @@ impl TableDelegate for ResultTableDelegate {
         }
         (self.source_rows, self.documents) = rows.into_iter().unzip();
         self.selection.clear();
+        self.context_target = None;
         self.table_cols.rebuild_column_defs();
         cx.notify();
     }
@@ -280,9 +294,114 @@ impl TableDelegate for ResultTableDelegate {
         &mut self,
         row: usize,
         column: usize,
+        window: &mut Window,
+        cx: &mut Context<TableState<Self>>,
+    ) -> impl IntoElement {
+        // Every kind of cell (value, Boolean switch, inline editor, missing field) records itself
+        // on right-click, so the menu never acts on a cell clicked earlier.
+        let key = self.table_cols.columns.get(column).map(|column| column.key.clone());
+        let _ = window;
+        let content = self.render_cell_content(row, column, cx);
+        div()
+            .size_full()
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |table, _, _, _| {
+                    table.delegate_mut().context_target =
+                        key.clone().map(|key| ContextTarget { row, key });
+                }),
+            )
+            .child(content)
+    }
+
+    fn render_empty(
+        &mut self,
         _window: &mut Window,
         cx: &mut Context<TableState<Self>>,
     ) -> impl IntoElement {
+        div()
+            .size_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .text_sm()
+            .text_color(cx.theme().muted_foreground)
+            .child("No documents returned")
+    }
+
+    fn context_menu(
+        &mut self,
+        row: usize,
+        mut menu: PopupMenu,
+        window: &mut Window,
+        cx: &mut Context<TableState<Self>>,
+    ) -> PopupMenu {
+        let formats = [
+            ResultCopyFormat::Json,
+            ResultCopyFormat::ExcelHeaders,
+            ResultCopyFormat::ExcelNoHeaders,
+            ResultCopyFormat::CsvHeaders,
+            ResultCopyFormat::CsvNoHeaders,
+        ];
+        let table = cx.entity();
+        let copy_menu = PopupMenu::build(window, cx, move |mut submenu, _window, _cx| {
+            for format in formats {
+                let table = table.clone();
+                submenu = submenu.item(PopupMenuItem::new(format.label()).on_click(
+                    move |_, _window, cx| {
+                        let text = table.read(cx).delegate().copy_text(format);
+                        cx.write_to_clipboard(ClipboardItem::new_string(text));
+                    },
+                ));
+            }
+            submenu
+        });
+        menu = menu.item(PopupMenuItem::submenu("Copy", copy_menu).icon(Icon::new(IconName::Copy)));
+
+        if let Some((source_row, key)) = self.nested_edit_target(row) {
+            let on_edit = self.on_edit.clone();
+            menu = menu.separator().item(
+                PopupMenuItem::new("Edit Value…")
+                    .on_click(move |_, window, cx| on_edit(source_row, key.clone(), window, cx)),
+            );
+        }
+        menu
+    }
+
+    fn move_column(
+        &mut self,
+        column: usize,
+        to: usize,
+        _window: &mut Window,
+        cx: &mut Context<TableState<Self>>,
+    ) {
+        self.apply_column_move(column, to);
+        self.table_cols.rebuild_column_defs();
+        cx.notify();
+    }
+}
+
+impl ResultTableDelegate {
+    /// The document or array cell "Edit Value…" opens for a context menu on `row`: only the cell
+    /// that was right-clicked, and only if it is in this row.
+    fn nested_edit_target(&self, row: usize) -> Option<(usize, String)> {
+        let target = self.context_target.as_ref().filter(|target| target.row == row)?;
+        let document = self.documents.get(row)?;
+        let editable = self.editable
+            && document.contains_key("_id")
+            && target.key != "_id"
+            && crate::bson::DottedPath::new(&[crate::bson::PathSegment::Key(target.key.clone())])
+                .is_ok()
+            && matches!(document.get(&target.key), Some(Bson::Document(_) | Bson::Array(_)));
+        editable.then(|| (self.source_row(row).unwrap_or(row), target.key.clone()))
+    }
+
+    fn render_cell_content(
+        &mut self,
+        row: usize,
+        column: usize,
+        cx: &mut Context<TableState<Self>>,
+    ) -> AnyElement {
         let Some(value) = self.cell_value(row, column).cloned() else {
             return div().text_xs().text_color(cx.theme().muted_foreground).into_any_element();
         };
@@ -343,81 +462,6 @@ impl TableDelegate for ResultTableDelegate {
             })
             .child(cell_renderer::render_cell(&value, row, column, cx))
             .into_any_element()
-    }
-
-    fn render_empty(
-        &mut self,
-        _window: &mut Window,
-        cx: &mut Context<TableState<Self>>,
-    ) -> impl IntoElement {
-        div()
-            .size_full()
-            .flex()
-            .items_center()
-            .justify_center()
-            .text_sm()
-            .text_color(cx.theme().muted_foreground)
-            .child("No documents returned")
-    }
-
-    fn context_menu(
-        &mut self,
-        row: usize,
-        selected_column: Option<usize>,
-        mut menu: PopupMenu,
-        window: &mut Window,
-        cx: &mut Context<TableState<Self>>,
-    ) -> PopupMenu {
-        let formats = [
-            ResultCopyFormat::Json,
-            ResultCopyFormat::ExcelHeaders,
-            ResultCopyFormat::ExcelNoHeaders,
-            ResultCopyFormat::CsvHeaders,
-            ResultCopyFormat::CsvNoHeaders,
-        ];
-        let table = cx.entity();
-        let copy_menu = PopupMenu::build(window, cx, move |mut submenu, _window, _cx| {
-            for format in formats {
-                let table = table.clone();
-                submenu = submenu.item(PopupMenuItem::new(format.label()).on_click(
-                    move |_, _window, cx| {
-                        let text = table.read(cx).delegate().copy_text(format);
-                        cx.write_to_clipboard(ClipboardItem::new_string(text));
-                    },
-                ));
-            }
-            submenu
-        });
-        menu = menu.item(PopupMenuItem::submenu("Copy", copy_menu).icon(Icon::new(IconName::Copy)));
-
-        if self.editable
-            && self.documents.get(row).is_some_and(|document| document.contains_key("_id"))
-            && let Some(column) = selected_column
-            && let Some(key) = self.table_cols.columns.get(column).map(|column| column.key.clone())
-            && key != "_id"
-            && crate::bson::DottedPath::new(&[crate::bson::PathSegment::Key(key.clone())]).is_ok()
-            && matches!(self.cell_value(row, column), Some(Bson::Document(_) | Bson::Array(_)))
-        {
-            let on_edit = self.on_edit.clone();
-            let source_row = self.source_row(row).unwrap_or(row);
-            menu = menu.separator().item(
-                PopupMenuItem::new("Edit Value…")
-                    .on_click(move |_, window, cx| on_edit(source_row, key.clone(), window, cx)),
-            );
-        }
-        menu
-    }
-
-    fn move_column(
-        &mut self,
-        column: usize,
-        to: usize,
-        _window: &mut Window,
-        cx: &mut Context<TableState<Self>>,
-    ) {
-        self.apply_column_move(column, to);
-        self.table_cols.rebuild_column_defs();
-        cx.notify();
     }
 }
 
@@ -483,6 +527,39 @@ mod tests {
             ),
             "1,Ada\n2,Lin\n"
         );
+    }
+
+    #[test]
+    fn edit_value_targets_only_the_cell_right_clicked_in_that_row() {
+        use super::ContextTarget;
+        let mut delegate =
+            ResultTableDelegate::new(Rc::new(|_, _, _, _| {}), Rc::new(|_, _, _, _, _| {}));
+        delegate.refresh_data(
+            vec![doc! { "_id": 1, "nested": { "a": 2 }, "flag": true }, doc! { "_id": 2 }],
+            true,
+            "test".into(),
+            "people".into(),
+        );
+        let target = |row: usize, key: &str| Some(ContextTarget { row, key: key.into() });
+
+        delegate.context_target = target(0, "nested");
+        assert_eq!(delegate.nested_edit_target(0), Some((0, "nested".to_string())));
+        // A Boolean cell, not a document: no Edit Value, and never the earlier nested field.
+        delegate.context_target = target(0, "flag");
+        assert_eq!(delegate.nested_edit_target(0), None);
+        // A missing field in another row, and a menu on a row other than the one clicked.
+        delegate.context_target = target(1, "nested");
+        assert_eq!(delegate.nested_edit_target(1), None);
+        delegate.context_target = target(0, "nested");
+        assert_eq!(delegate.nested_edit_target(1), None);
+        // New data forgets the target.
+        delegate.refresh_data(
+            vec![doc! { "_id": 3, "nested": { "b": 1 } }],
+            true,
+            "test".into(),
+            "people".into(),
+        );
+        assert_eq!(delegate.nested_edit_target(0), None);
     }
 
     #[test]

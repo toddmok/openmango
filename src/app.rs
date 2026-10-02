@@ -1,5 +1,6 @@
 mod actions;
-mod dialogs;
+pub mod background;
+pub(crate) mod dialogs;
 mod menus;
 mod root;
 pub(crate) mod search;

@@ -1,12 +1,13 @@
+use gpui_kit::component::button::ButtonVariants as _;
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use gpui::prelude::FluentBuilder as _;
-use gpui::*;
-use gpui_component::ActiveTheme as _;
-use gpui_component::WindowExt as _;
-use gpui_component::dialog::Dialog;
-use gpui_component::scroll::ScrollableElement as _;
+use gpui_kit::component::ActiveTheme as _;
+use gpui_kit::component::WindowExt as _;
+use gpui_kit::component::dialog::Dialog;
+use gpui_kit::component::scroll::ScrollableElement as _;
+use gpui_kit::prelude::FluentBuilder as _;
+use gpui_kit::*;
 use uuid::Uuid;
 
 use crate::components::{Button, ConnectionIdentity, connection_identity_badge};
@@ -122,10 +123,13 @@ pub fn request_connection_write(
         // Keep this arm synchronous: protected-write authorization is granted immediately before
         // the callback and revoked immediately after it returns.
         WriteRequestDecision::Confirm => {
+            // No wording of its own: say what is about to happen and where, not "Confirm" and
+            // "Continue", which name neither.
             let confirmation = confirmation.unwrap_or_else(|| WriteConfirmation {
-                title: "Confirm Production write".into(),
-                message: format!("{operation}."),
-                confirm_label: "Continue".into(),
+                title: format!("{operation} on a Production connection?"),
+                message: "This connection is marked Production, so writes to it are confirmed."
+                    .into(),
+                confirm_label: "Write to Production".into(),
                 destructive: true,
             });
             let confirmation = WriteConfirmation {
@@ -206,7 +210,7 @@ fn close_dialog_and_restore_focus(
 ) {
     window.close_dialog(cx);
     if let Some(previous_focus) = previous_focus {
-        window.defer(cx, move |window, _cx| window.focus(&previous_focus));
+        window.defer(cx, move |window, cx| window.focus(&previous_focus, cx));
     }
 }
 
@@ -314,8 +318,8 @@ fn open_confirm_dialog_boxed(
         if should_focus_cancel {
             dialog_state.update(cx, |state, _cx| state.focused_once = true);
             let cancel_focus = key_cancel_focus.clone();
-            window.defer(cx, move |window, _cx| {
-                window.focus(&cancel_focus);
+            window.defer(cx, move |window, cx| {
+                window.focus(&cancel_focus, cx);
             });
         }
 
@@ -365,10 +369,9 @@ fn open_confirm_dialog_boxed(
     });
 }
 
-// GPUI's test-support feature is enabled only for the macOS test target in Cargo.toml.
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(test)]
 mod tests {
-    use gpui::{AppContext as _, Context, IntoElement, Render, TestAppContext, Window, div};
+    use gpui_kit::{AppContext as _, Context, IntoElement, Render, TestAppContext, Window, div};
 
     use crate::models::SavedConnection;
     use crate::state::AppState;
@@ -381,7 +384,7 @@ mod tests {
         }
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn ordinary_write_authorization_defers_the_requesting_entity_callback(cx: &mut TestAppContext) {
         let (view, cx) = cx.add_window_view(|_, _| Counter(0));
         let connection = SavedConnection::new("Development".into(), "mongodb://localhost".into());

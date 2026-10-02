@@ -1,8 +1,8 @@
 //! Shared utilities for document dialogs.
 
-use gpui::*;
-use gpui_component::button::{Button as MenuButton, ButtonCustomVariant, ButtonVariants};
-use gpui_component::{ActiveTheme as _, Sizable as _, Size, StyledExt as _, WindowExt as _};
+use gpui_kit::component::button::{Button as MenuButton, ButtonCustomVariant, ButtonVariants};
+use gpui_kit::component::{ActiveTheme as _, Sizable as _, Size, StyledExt as _};
+use gpui_kit::*;
 
 use crate::theme::{borders, spacing};
 
@@ -11,7 +11,6 @@ pub fn dropdown_variant(cx: &mut App) -> ButtonCustomVariant {
     ButtonCustomVariant::new(cx)
         .color(cx.theme().secondary)
         .foreground(cx.theme().foreground)
-        .border(cx.theme().sidebar_border)
         .hover(cx.theme().secondary_hover)
         .active(cx.theme().secondary_hover)
         .shadow(false)
@@ -45,18 +44,17 @@ pub fn styled_dropdown_button(
         .refine_style(&dropdown_style())
 }
 
-/// Creates an escape key subscription that closes the dialog.
-pub fn escape_key_subscription<V: 'static>(cx: &mut Context<V>) -> Subscription {
-    cx.intercept_keystrokes(move |event, window, cx| {
-        let key = event.keystroke.key.to_ascii_lowercase();
-        if key == "escape" {
-            window.close_dialog(cx);
-            cx.stop_propagation();
-        }
+/// The dialog's own error, shown above its buttons.
+pub fn dialog_error(
+    id: &'static str,
+    error_message: Option<&String>,
+) -> Option<crate::components::ErrorCallout> {
+    error_message.map(|error| {
+        crate::components::ErrorCallout::new(id, crate::error::ErrorReport::from_text(error))
     })
 }
 
-/// Returns the status text and color for dialog status display.
+/// Returns the status text and color for dialog status display. Errors use [`dialog_error`].
 pub fn status_text(
     error_message: Option<&String>,
     updating: bool,
@@ -64,8 +62,8 @@ pub fn status_text(
     default_label: &str,
     cx: &App,
 ) -> (String, Hsla) {
-    if let Some(error) = error_message {
-        (error.clone(), cx.theme().danger_foreground)
+    if error_message.is_some() {
+        (String::new(), cx.theme().muted_foreground)
     } else if updating {
         (updating_label.to_string(), cx.theme().muted_foreground)
     } else {

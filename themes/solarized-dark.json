@@ -1,15 +1,13 @@
 {
-  "$schema": "https://github.com/longbridge/gpui-component/raw/refs/heads/main/.theme-schema.json",
+  "$schema": "https://raw.githubusercontent.com/longbridge/gpui-kit/v0.6.0/.theme-schema.json",
   "name": "Solarized Dark",
   "author": "OpenMango",
   "themes": [
     {
       "name": "Solarized Dark",
       "mode": "dark",
-      "font.family": "JetBrainsMono Nerd Font",
-      "mono_font.family": "JetBrainsMono Nerd Font Mono",
-      "radius": 8,
-      "radius.lg": 8,
+      "font.family": "JetBrains Mono",
+      "mono_font.family": "JetBrains Mono",
       "shadow": false,
       "colors": {
         "background": "#002b36",

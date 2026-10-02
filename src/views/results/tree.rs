@@ -1,9 +1,9 @@
-use gpui::prelude::FluentBuilder as _;
-use gpui::*;
-use gpui_component::input::Input;
-use gpui_component::menu::{ContextMenuExt as _, PopupMenuItem};
-use gpui_component::switch::Switch;
-use gpui_component::{ActiveTheme as _, Icon, IconName, Sizable as _};
+use gpui_kit::component::input::Input;
+use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenuItem};
+use gpui_kit::component::switch::Switch;
+use gpui_kit::component::{ActiveTheme as _, Icon, IconName, Sizable as _};
+use gpui_kit::prelude::FluentBuilder as _;
+use gpui_kit::*;
 use mongodb::bson::Bson;
 
 use crate::bson::is_editable_value;
@@ -42,7 +42,7 @@ pub fn render_result_row(
         let toggle_node_id = node_id.clone();
         let on_toggle = on_toggle_node.clone();
         div()
-            .id(("result-row-chevron", ix))
+            .id("result-row-chevron")
             .w(px(14.0))
             .flex()
             .items_center()
@@ -94,7 +94,9 @@ pub fn render_result_row(
     };
 
     let row_element = div()
-        .id(("result-row", ix))
+        // Keyed by node, not position: expanding a folder inserts rows, and hover must not jump
+        // to whichever row slides into this slot. The chevron inside is scoped by this id.
+        .id((ElementId::from("result-row"), node_id.clone()))
         .flex()
         .items_center()
         .w_full()

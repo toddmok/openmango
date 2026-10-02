@@ -1,14 +1,15 @@
 //! Subview tabs rendering for collection header.
 
-use gpui::*;
-use gpui_component::Sizable as _;
-use gpui_component::tab::{Tab, TabBar};
+use gpui_kit::component::Sizable as _;
+use gpui_kit::component::tab::{Tab, TabBar};
+use gpui_kit::*;
 
 use crate::state::{AppCommands, AppState, CollectionSubview, SessionKey};
 use crate::theme::islands;
 
 /// Render the collection subview tabs.
 pub fn render_subview_tabs(
+    view: Entity<super::CollectionView>,
     state: Entity<AppState>,
     session_key: Option<SessionKey>,
     active_subview: CollectionSubview,
@@ -34,12 +35,15 @@ pub fn render_subview_tabs(
     }
 
     islands::tab_bar(TabBar::new("collection-subview-tabs"), &appearance)
-        .xsmall()
+        .small()
         .selected_index(active_subview.to_index())
         .on_click({
             let session_key = session_key.clone();
             let state_for_subview = state.clone();
             move |index, _window, cx| {
+                if !view.update(cx, |this, cx| this.finish_document_edit(cx)) {
+                    return;
+                }
                 let Some(session_key) = session_key.clone() else {
                     return;
                 };

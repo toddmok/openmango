@@ -145,6 +145,21 @@ pub fn label_from_template(template: &str) -> String {
     out
 }
 
+/// Byte offset of the first argument in the rendered completion template.
+pub fn cursor_from_template(template: &str) -> Option<usize> {
+    template
+        .match_indices('$')
+        .filter_map(|(offset, _)| {
+            let tail = &template[offset + 1..];
+            let tail = tail.strip_prefix('{').unwrap_or(tail);
+            let digits = tail.bytes().take_while(u8::is_ascii_digit).count();
+            let index = tail.get(..digits)?.parse::<u32>().ok()?;
+            Some((if index == 0 { u32::MAX } else { index }, offset))
+        })
+        .min_by_key(|(index, _)| *index)
+        .map(|(_, offset)| label_from_template(&template[..offset]).len())
+}
+
 pub const METHODS: &[&str] = &[
     "find",
     "findOne",
@@ -273,6 +288,29 @@ pub fn result_documents(printable: &serde_json::Value) -> Option<Vec<Document>> 
     }
 
     documents_from_json_value(printable)
+}
+
+/// The documents on one page of a paged result: a cursor page (`{ documents, cursorHasMore }`)
+/// or an array. Unlike [`result_documents`] an empty page is still a page, so a query that
+/// matches nothing shows "No documents" rather than its own wrapper as a document.
+pub fn paged_documents(printable: &serde_json::Value) -> Vec<Document> {
+    let items = printable
+        .get("documents")
+        .and_then(serde_json::Value::as_array)
+        .or_else(|| printable.as_array())
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    items
+        .iter()
+        .map(|item| match decode_extjson_node(item) {
+            Bson::Document(doc) => doc,
+            other => {
+                let mut doc = Document::new();
+                doc.insert("value", other);
+                doc
+            }
+        })
+        .collect()
 }
 
 fn documents_from_json_value(value: &serde_json::Value) -> Option<Vec<Document>> {
@@ -682,6 +720,23 @@ mod tests {
         let text = "db.stats()\n\n// comment\n";
         let (start, end) = statement_bounds(text, 2);
         assert_eq!(&text[start..end], "db.stats()\n");
+    }
+
+    #[test]
+    fn paged_documents_keep_an_empty_page_empty() {
+        // Control: the general decoder turns an empty cursor wrapper into one bogus document.
+        let empty = serde_json::json!({ "documents": [], "cursorHasMore": false });
+        assert_eq!(result_documents(&empty).map(|docs| docs.len()), Some(1));
+        assert!(paged_documents(&empty).is_empty());
+        assert!(paged_documents(&serde_json::json!([])).is_empty());
+
+        let page = serde_json::json!({
+            "documents": [{ "_id": { "$numberInt": "1" } }, { "$numberLong": "7" }],
+            "cursorHasMore": true,
+        });
+        let docs = paged_documents(&page);
+        assert_eq!(docs[0].get("_id"), Some(&Bson::Int32(1)));
+        assert_eq!(docs[1].get("value"), Some(&Bson::Int64(7)));
     }
 
     #[test]

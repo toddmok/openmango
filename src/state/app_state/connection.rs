@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 
 use anyhow::Result;
-use gpui::{App, AppContext as _, Context, Task};
+use gpui_kit::{App, AppContext as _, Context, Task};
 use uuid::Uuid;
 
 use super::AppState;
@@ -12,9 +12,10 @@ use crate::helpers::validate::{
     UriSecrets, extract_uri_secrets, inject_uri_secrets, strip_uri_secrets,
 };
 use crate::models::TreeNodeId;
-use crate::models::{ActiveConnection, SavedConnection};
+use crate::models::{ActiveConnection, CollectionDetail, SavedConnection};
 use crate::state::ActiveTab;
 use crate::state::AppCommands;
+use crate::state::SessionKey;
 use crate::state::View;
 use crate::state::events::AppEvent;
 
@@ -61,6 +62,53 @@ impl ConnectionSecrets {
 
 pub(crate) fn connection_secret_bundle_key(secret_id: Uuid) -> String {
     format!("{SECRET_BUNDLE_PREFIX}{secret_id}")
+}
+
+impl AppState {
+    /// For the background runner: reads the saved passwords of the connections `ids` into the
+    /// connection list, changing nothing in the keychain. The app loads them in
+    /// `AppRoot::hydrate_connection_secrets`, which also moves old entries to the current format.
+    /// A connection whose passwords can't be read goes without them, so its run fails signing
+    /// in and says so.
+    pub(crate) fn read_connection_secrets(
+        state: gpui_kit::Entity<Self>,
+        ids: &[Uuid],
+        cx: &mut App,
+    ) -> Task<()> {
+        let reads: Vec<_> = state
+            .read(cx)
+            .connections
+            .iter()
+            .filter(|connection| ids.contains(&connection.id))
+            .filter_map(|connection| {
+                let key = connection_secret_bundle_key(connection.secret_id?);
+                let read = KeyStore::read_conn(cx, connection.id, &key);
+                Some((connection.id, connection.name.clone(), read))
+            })
+            .collect();
+        cx.spawn(async move |cx| {
+            for (id, name, read) in reads {
+                let secrets = match read.await {
+                    Ok(Some(payload)) => {
+                        serde_json::from_str::<ConnectionSecrets>(&payload).map_err(Into::into)
+                    }
+                    Ok(None) => Err(anyhow::anyhow!("they aren't in the keychain")),
+                    Err(error) => Err(error),
+                };
+                match secrets {
+                    Ok(secrets) => cx.update(|cx| {
+                        state.update(cx, |app, _| {
+                            let connection = app.connections.iter_mut().find(|c| c.id == id);
+                            if let Some(connection) = connection {
+                                secrets.apply_to(connection);
+                            }
+                        })
+                    }),
+                    Err(error) => log::warn!("Couldn't read the passwords of {name}: {error:#}"),
+                }
+            }
+        })
+    }
 }
 
 fn write_conn_secret_bundle(cx: &App, connection: &SavedConnection) -> Task<Result<()>> {
@@ -115,6 +163,12 @@ impl AppState {
         self.conn.active.get(&connection_id)
     }
 
+    pub(crate) fn connection_needs_reconnect(&self, connection_id: Uuid) -> bool {
+        self.active_connection_by_id(connection_id)
+            .zip(self.connection_by_id(connection_id))
+            .is_some_and(|(active, saved)| connection_transport_changed(&active.config, saved))
+    }
+
     pub(crate) fn active_connection_mut(
         &mut self,
         connection_id: Uuid,
@@ -145,6 +199,42 @@ impl AppState {
         self.conn.active.get(&connection_id).map(|conn| conn.config.read_only).unwrap_or_else(
             || self.connection_by_id(connection_id).is_some_and(|connection| connection.read_only),
         )
+    }
+
+    /// What this session's namespace is when it is not a plain collection.
+    pub fn collection_detail(&self, key: &SessionKey) -> Option<&CollectionDetail> {
+        self.conn.active.get(&key.connection_id)?.collection_detail(&key.database, &key.collection)
+    }
+
+    /// The collection a view reads from. `Some` means the session is a view.
+    pub fn view_source(&self, key: &SessionKey) -> Option<&str> {
+        match self.collection_detail(key)? {
+            CollectionDetail::View { view_on, .. } => Some(view_on),
+            CollectionDetail::Timeseries => None,
+        }
+    }
+
+    /// Why a view refuses writes, naming where the change belongs. `None` when not a view.
+    pub fn view_read_only_reason(&self, key: &SessionKey) -> Option<String> {
+        self.view_source(key).map(|source| {
+            format!(
+                "{} is a view, so it is read-only. Make the change in {source}.",
+                key.collection
+            )
+        })
+    }
+
+    /// Why this session refuses writes: the connection forbids them, or the namespace is a
+    /// view. Two separate facts, so each keeps its own wording.
+    pub fn session_read_only_reason(&self, key: &SessionKey) -> Option<String> {
+        if self.connection_read_only(key.connection_id) {
+            return Some("Read-only connection: writes are disabled.".to_string());
+        }
+        self.view_read_only_reason(key)
+    }
+
+    pub fn session_read_only(&self, key: &SessionKey) -> bool {
+        self.connection_read_only(key.connection_id) || self.view_source(key).is_some()
     }
 
     pub fn connection_history_enabled(&self, connection_id: Uuid) -> bool {
@@ -331,7 +421,11 @@ impl AppState {
                 super::types::TabKey::Database(tab) => tab.connection_id == connection_id,
                 super::types::TabKey::Transfer(tab) => tab.connection_id == Some(connection_id),
                 super::types::TabKey::Forge(tab) => tab.connection_id == connection_id,
+                super::types::TabKey::References(tab) => tab.connection_id == connection_id,
+                super::types::TabKey::Relations(tab) => tab.connection_id == connection_id,
+                super::types::TabKey::Compare(_) => false,
                 super::types::TabKey::AgentActivity
+                | super::types::TabKey::Tasks
                 | super::types::TabKey::Connections
                 | super::types::TabKey::Settings
                 | super::types::TabKey::Changelog => false,
@@ -341,6 +435,24 @@ impl AppState {
 
         for index in indices.into_iter().rev() {
             self.close_tab(index, cx);
+        }
+
+        for tab in self.compare_tabs.values_mut() {
+            if tab
+                .results_config()
+                .sides
+                .iter()
+                .any(|side| side.connection_id == Some(connection_id))
+            {
+                if let Some(token) = &tab.cancellation {
+                    token.cancel();
+                }
+                if let Some(token) = &tab.sync.cancellation {
+                    token.cancel();
+                }
+                tab.detail_generation = tab.detail_generation.wrapping_add(1);
+                tab.detail_loading = false;
+            }
         }
 
         if let Some(tab) = self.tabs.preview.clone()
@@ -426,8 +538,10 @@ impl AppState {
             apply_agent_sharing_safety(existing, &mut connection);
         }
         connection.secret_id = Some(Uuid::new_v4());
+        let id = connection.id;
         self.finish_update_connection(connection, cx);
         self.sync_connection_secrets(rollback, cx);
+        self.resume_tasks_after_sign_in_fix(id);
     }
 
     pub fn set_connection_agent_shared(
@@ -461,6 +575,28 @@ impl AppState {
         }
         cx.emit(AppEvent::ConnectionUpdated);
         cx.notify();
+    }
+
+    /// Records a successful connect. Only the time changes: saving through `update_connection`
+    /// would give the connection a new keychain entry, and with it a new identity, which reads as
+    /// changed settings to task approvals and agent grants.
+    pub fn set_connection_last_connected(
+        &mut self,
+        connection_id: Uuid,
+        at: chrono::DateTime<chrono::Utc>,
+    ) {
+        let Some(connection) = self.connections.iter_mut().find(|item| item.id == connection_id)
+        else {
+            return;
+        };
+        connection.last_connected = Some(at);
+        // While credentials are being stored, that save writes the time too.
+        if !self.connections_persistence_blocked
+            && !self.connection_secret_sync_pending
+            && let Err(error) = self.config.save_connections(&self.connections)
+        {
+            log::warn!("Could not save when the connection was last used: {error}");
+        }
     }
 
     pub fn set_connection_agent_writable(
@@ -602,10 +738,8 @@ impl AppState {
 
     fn finish_update_connection(&mut self, connection: SavedConnection, cx: &mut Context<Self>) {
         let mut updated = false;
-        let mut transport_changed = false;
         for existing in &mut self.connections {
             if existing.id == connection.id {
-                transport_changed = connection_transport_changed(existing, &connection);
                 *existing = connection.clone();
                 updated = true;
                 break;
@@ -617,22 +751,6 @@ impl AppState {
             cx.emit(AppEvent::ConnectionAdded);
             cx.notify();
             return;
-        }
-
-        if let Some(active) = self.conn.active.get_mut(&connection.id) {
-            active.config = connection.clone();
-            if transport_changed {
-                self.connection_manager().disconnect(connection.id);
-                self.conn.active.remove(&connection.id);
-                self.reset_connection_runtime_state(connection.id, cx);
-                if self.conn.selected_connection == Some(connection.id) {
-                    self.current_view = View::Welcome;
-                    cx.emit(AppEvent::ViewChanged);
-                }
-                let event = AppEvent::Disconnected(connection.id);
-                self.update_status_from_event(&event);
-                cx.emit(event);
-            }
         }
 
         let event = AppEvent::ConnectionUpdated;
@@ -683,15 +801,35 @@ impl AppState {
                     result = Err(error);
                 }
             }
-            let _ = cx.update(|cx| {
+            cx.update(|cx| {
                 let connection_ids = state.update(cx, |state, cx| match result {
                     Ok(()) => match state.config.save_connections(&state.connections) {
                         Ok(()) => {
                             state.connection_secret_sync_pending = false;
+                            for (connection_id, _) in &candidate_bundles {
+                                if let Some(connection) =
+                                    state.connection_by_id(*connection_id).cloned()
+                                    && let Some(active) = state.conn.active.get_mut(connection_id)
+                                    && !connection_transport_changed(&active.config, &connection)
+                                {
+                                    active.config = connection;
+                                }
+                                cx.emit(AppEvent::ConnectionSaveFinished {
+                                    connection_id: *connection_id,
+                                    result: Ok(()),
+                                });
+                            }
+                            cx.notify();
                             state.cleanup_secret_bundles(stale_bundles, cx);
                             state.take_connections_waiting_for_secrets()
                         }
                         Err(error) => {
+                            for (connection_id, _) in &candidate_bundles {
+                                cx.emit(AppEvent::ConnectionSaveFinished {
+                                    connection_id: *connection_id,
+                                    result: Err(error.to_string()),
+                                });
+                            }
                             state.connection_secret_sync_pending = false;
                             state.connections_waiting_for_secret_sync.clear();
                             state.restore_connections_after_secret_failure(
@@ -705,6 +843,12 @@ impl AppState {
                         }
                     },
                     Err(error) => {
+                        for (connection_id, _) in &candidate_bundles {
+                            cx.emit(AppEvent::ConnectionSaveFinished {
+                                connection_id: *connection_id,
+                                result: Err(error.to_string()),
+                            });
+                        }
                         state.connection_secret_sync_pending = false;
                         state.connections_waiting_for_secret_sync.clear();
                         state.restore_connections_after_secret_failure(
@@ -731,8 +875,14 @@ impl AppState {
         candidate_bundles: &[(Uuid, Uuid)],
         cx: &mut Context<Self>,
     ) {
-        for (connection_id, _) in candidate_bundles {
-            if self.conn.active.remove(connection_id).is_some() {
+        for (connection_id, secret_id) in candidate_bundles {
+            if self
+                .conn
+                .active
+                .get(connection_id)
+                .is_some_and(|active| active.config.secret_id == Some(*secret_id))
+            {
+                self.conn.active.remove(connection_id);
                 self.connection_manager().disconnect(*connection_id);
                 self.reset_connection_runtime_state(*connection_id, cx);
                 cx.emit(AppEvent::Disconnected(*connection_id));
@@ -772,7 +922,7 @@ impl AppState {
                 }
             }
             if let Some(error) = first_error {
-                let _ = cx.update(|cx| {
+                cx.update(|cx| {
                     state.update(cx, |state, cx| {
                         state.report_secret_store_error(error, cx);
                     });
@@ -829,7 +979,7 @@ impl AppState {
                 }
             }
             if let Some(error) = first_error {
-                let _ = cx.update(|cx| {
+                cx.update(|cx| {
                     state.update(cx, |state, cx| {
                         state.report_secret_store_error(error, cx);
                     });

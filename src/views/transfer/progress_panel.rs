@@ -1,10 +1,10 @@
 //! Normalized progress UI for export, import, and copy operations.
 
-use gpui::prelude::FluentBuilder as _;
-use gpui::*;
-use gpui_component::progress::Progress;
-use gpui_component::spinner::Spinner;
-use gpui_component::{ActiveTheme as _, Icon, IconName, Sizable as _};
+use gpui_kit::component::progress::Progress;
+use gpui_kit::component::spinner::Spinner;
+use gpui_kit::component::{ActiveTheme as _, Icon, IconName, Sizable as _};
+use gpui_kit::prelude::FluentBuilder as _;
+use gpui_kit::*;
 use uuid::Uuid;
 
 use crate::connection::tools_available;
@@ -48,7 +48,7 @@ impl ProgressSnapshot {
         if runtime.cancellation_pending() {
             return Self {
                 state: ProgressState::Running,
-                title: "Cancelling transfer...".to_string(),
+                title: "Cancelling transfer…".to_string(),
                 detail: runtime.error_message.clone().unwrap_or_default(),
                 percentage: None,
                 errors,
@@ -56,9 +56,8 @@ impl ProgressSnapshot {
         }
 
         if let Some(error) = runtime.error_message.as_ref() {
-            let lower_error = error.to_ascii_lowercase();
-            let cancelled =
-                lower_error.contains("cancel") && !lower_error.contains("could not be confirmed");
+            // Cancelled means the user asked and the work really stopped, whatever the text says.
+            let cancelled = runtime.cancellation_requested && !runtime.cancellation_unconfirmed;
             if cancelled || runtime.is_running || errors.is_empty() {
                 return Self {
                     state: if cancelled { ProgressState::Cancelled } else { ProgressState::Failed },
@@ -267,8 +266,9 @@ pub(super) fn render_progress_status(
         ProgressState::Idle => div().into_any_element(),
     };
 
-    let progress_bar =
-        snapshot.percentage.map(|percentage| Progress::new().value(percentage).into_any_element());
+    let progress_bar = snapshot
+        .percentage
+        .map(|percentage| Progress::new("transfer-progress").value(percentage).into_any_element());
     let errors_expanded =
         transfer.runtime.database_progress.as_ref().is_some_and(|progress| progress.panel_expanded);
     let error_count = snapshot.errors.len();
@@ -352,7 +352,15 @@ pub(super) fn render_progress_status(
                         .child(snapshot.title),
                 )
                 .child(
-                    div().text_xs().text_color(cx.theme().muted_foreground).child(snapshot.detail),
+                    // A failure's reason is the part to read, so it isn't muted.
+                    div()
+                        .text_xs()
+                        .text_color(if matches!(snapshot.state, ProgressState::Failed) {
+                            cx.theme().foreground
+                        } else {
+                            cx.theme().muted_foreground
+                        })
+                        .child(snapshot.detail),
                 ),
         )
         .children(progress_bar)
@@ -622,13 +630,29 @@ mod tests {
 
         let snapshot = ProgressSnapshot::from_transfer(&transfer);
         assert_eq!(snapshot.state, ProgressState::Running);
-        assert_eq!(snapshot.title, "Cancelling transfer...");
+        assert_eq!(snapshot.title, "Cancelling transfer…");
+    }
+
+    #[test]
+    fn cancellation_comes_from_state_not_message_text() {
+        let mut transfer = TransferTabState::default();
+        transfer.runtime.has_started = true;
+        transfer.runtime.cancellation_requested = true;
+        transfer.runtime.error_message = Some("Import stopped".into());
+        assert_eq!(ProgressSnapshot::from_transfer(&transfer).state, ProgressState::Cancelled);
+
+        let mut failed = TransferTabState::default();
+        failed.runtime.has_started = true;
+        failed.runtime.error_message = Some("operation was cancelled by the server".into());
+        assert_eq!(ProgressSnapshot::from_transfer(&failed).state, ProgressState::Failed);
     }
 
     #[test]
     fn unconfirmed_bson_termination_is_a_failure() {
         let mut transfer = TransferTabState::default();
         transfer.runtime.has_started = true;
+        transfer.runtime.cancellation_requested = true;
+        transfer.runtime.cancellation_unconfirmed = true;
         transfer.runtime.error_message = Some(
             "BSON export cancellation requested, but mongodump termination could not be confirmed"
                 .into(),

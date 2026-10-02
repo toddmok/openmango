@@ -1,6 +1,8 @@
-use gpui::{App, AppContext as _, Entity};
+use gpui_kit::{App, AppContext as _, Entity};
 use uuid::Uuid;
 
+use crate::error::ErrorReport;
+use crate::models::CollectionDetail;
 use crate::state::{
     AppEvent, AppState, CollectionOverview, DatabaseKey, DatabaseStats, StatusMessage, View,
 };
@@ -14,14 +16,22 @@ impl AppCommands {
         database: String,
         collection: String,
         cx: &mut App,
+        on_done: impl FnOnce(Result<(), ErrorReport>, &mut App) + 'static,
     ) {
-        let Some(connection_id) = state.read(cx).selected_connection_id() else {
+        let connection_id = state.read(cx).selected_connection_id();
+        let Some(connection_id) =
+            connection_id.filter(|id| Self::ensure_writable(&state, Some(*id), cx))
+        else {
+            on_done(
+                Err(ErrorReport::new(
+                    "Couldn't create the database",
+                    "This connection doesn't allow writes right now.",
+                )),
+                cx,
+            );
             return;
         };
-        if !Self::ensure_writable(&state, Some(connection_id), cx) {
-            return;
-        }
-        Self::create_collection_authorized(state, connection_id, database, collection, cx);
+        Self::create_collection_authorized(state, connection_id, database, collection, cx, on_done);
     }
 
     /// Drop a database.
@@ -47,9 +57,9 @@ impl AppCommands {
         cx.spawn({
             let state = state.clone();
             let database = database.clone();
-            async move |cx: &mut gpui::AsyncApp| {
+            async move |cx: &mut gpui_kit::AsyncApp| {
                 let result: Result<(), crate::error::Error> = task.await;
-                let _ = cx.update(|cx| match result {
+                cx.update(|cx| match result {
                     Ok(()) => {
                         state.update(cx, |state, cx| {
                             if let Some(conn) = state.active_connection_mut(connection_id) {
@@ -143,12 +153,12 @@ impl AppCommands {
                     .map(|doc| DatabaseStats::from_document(&doc));
                 let collections_result =
                     manager.list_collection_specs(&client, &database).map(|specs| {
-                        let names = specs.iter().map(|spec| spec.name.clone()).collect::<Vec<_>>();
+                        let (names, details) = CollectionDetail::split_specs(&specs);
                         let collections = specs
                             .into_iter()
                             .map(CollectionOverview::from_spec)
                             .collect::<Vec<_>>();
-                        (names, collections)
+                        (names, details, collections)
                     });
 
                 (stats_result, collections_result)
@@ -158,12 +168,12 @@ impl AppCommands {
         cx.spawn({
             let state = state.clone();
             let database = database.clone();
-            async move |cx: &mut gpui::AsyncApp| {
+            async move |cx: &mut gpui_kit::AsyncApp| {
                 let (stats_result, collections_result) = task.await;
 
-                let _ = cx.update(|cx| {
+                cx.update(|cx| {
                     state.update(cx, |state, cx| {
-                        let mut status_message = None;
+                        let mut errors: Vec<ErrorReport> = Vec::new();
                         let mut loaded_collections = None;
                         {
                             let session = state.ensure_database_session(database_key.clone());
@@ -177,25 +187,31 @@ impl AppCommands {
                                 }
                                 Err(err) => {
                                     session.data.stats_error = Some(err.to_string());
-                                    status_message = Some(format!("Database stats failed: {err}"));
+                                    errors.push(ErrorReport::from_error(
+                                        "Couldn't load database stats",
+                                        &err,
+                                    ));
                                 }
                             }
 
                             match collections_result {
-                                Ok((names, collections)) => {
+                                Ok((names, details, collections)) => {
                                     session.data.collections = collections;
                                     session.data.collections_error = None;
                                     if let Some(conn) =
                                         state.active_connection_mut(database_key.connection_id)
                                     {
                                         conn.collections.insert(database.clone(), names.clone());
+                                        conn.collection_details.insert(database.clone(), details);
                                     }
                                     loaded_collections = Some(names);
                                 }
                                 Err(err) => {
                                     session.data.collections_error = Some(err.to_string());
-                                    status_message =
-                                        Some(format!("Database collections failed: {err}"));
+                                    errors.push(ErrorReport::from_error(
+                                        "Couldn't load collections",
+                                        &err,
+                                    ));
                                 }
                             }
                         }
@@ -206,8 +222,9 @@ impl AppCommands {
                             cx.emit(event);
                         }
 
-                        if let Some(message) = status_message {
-                            state.set_status_message(Some(StatusMessage::error(message)));
+                        // The database overview shows both errors in place.
+                        for report in errors {
+                            state.record_error(report);
                         }
 
                         cx.notify();

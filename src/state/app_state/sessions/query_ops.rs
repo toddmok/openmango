@@ -14,7 +14,7 @@ impl AppState {
         self.promote_preview_collection_tab(session_key);
         if let Some(session) = self.session_mut(session_key) {
             session.data.filter_raw = raw;
-            session.data.filter = filter;
+            session.data.set_filter(filter);
             session.data.page = 0;
             session.data.explain.mark_stale();
         }
@@ -25,7 +25,7 @@ impl AppState {
         self.promote_preview_collection_tab(session_key);
         if let Some(session) = self.session_mut(session_key) {
             session.data.filter_raw.clear();
-            session.data.filter = None;
+            session.data.set_filter(None);
             session.data.page = 0;
             session.data.explain.mark_stale();
         }
@@ -74,20 +74,6 @@ impl AppState {
         }
     }
 
-    pub fn set_query_options_open(&mut self, session_key: &SessionKey, open: bool) {
-        self.promote_preview_collection_tab(session_key);
-        let mut changed = false;
-        if let Some(session) = self.session_mut(session_key)
-            && session.view.query_options_open != open
-        {
-            session.view.query_options_open = open;
-            changed = true;
-        }
-        if changed {
-            self.update_workspace_session_view(session_key);
-        }
-    }
-
     pub fn set_filter_builder_open(&mut self, session_key: &SessionKey, open: bool) {
         if let Some(session) = self.session_mut(session_key) {
             session.view.filter_builder_open = open;
@@ -97,6 +83,12 @@ impl AppState {
     pub fn toggle_filter_builder_open(&mut self, session_key: &SessionKey) {
         if let Some(session) = self.session_mut(session_key) {
             session.view.filter_builder_open = !session.view.filter_builder_open;
+        }
+    }
+
+    pub fn set_query_options_open(&mut self, session_key: &SessionKey, open: bool) {
+        if let Some(session) = self.session_mut(session_key) {
+            session.view.query_options_open = open;
         }
     }
 

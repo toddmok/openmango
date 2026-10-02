@@ -2,9 +2,9 @@
 
 use std::collections::{HashMap, HashSet};
 
-use gpui::*;
-use gpui_component::ActiveTheme as _;
-use gpui_component::tree::TreeItem;
+use gpui_kit::component::ActiveTheme as _;
+use gpui_kit::component::tree::TreeItem;
+use gpui_kit::*;
 use mongodb::bson::{Bson, Document};
 
 use crate::bson::{
@@ -52,6 +52,7 @@ pub fn build_documents_tree(
             is_folder: !doc.is_empty(),
             is_editable: false,
             is_dirty: is_doc_dirty,
+            has_details: false,
             doc_key: doc_key.clone(),
             path: Vec::new(),
             value: None,
@@ -59,10 +60,8 @@ pub fn build_documents_tree(
         meta.insert(root_id.clone(), root_meta);
 
         let is_expanded = expanded_nodes.contains(&root_id);
-        let mut root = TreeItem::new(root_id.clone(), key_label)
-            .folder(!doc.is_empty())
-            .expanded(expanded_nodes.contains(&root_id))
-            .disabled(true);
+        let mut root =
+            TreeItem::new(root_id.clone(), key_label).expanded(expanded_nodes.contains(&root_id));
         if is_expanded {
             let children: Vec<TreeItem> = doc
                 .iter()
@@ -107,8 +106,7 @@ pub fn build_bson_tree_item(
     cx: &App,
 ) -> TreeItem {
     let node_id = path_to_id(doc_key, &path);
-    let is_folder = matches!(value, Bson::Document(_) | Bson::Array(_));
-    let has_children = match value {
+    let is_folder = match value {
         Bson::Document(doc) => !doc.is_empty(),
         Bson::Array(arr) => !arr.is_empty(),
         _ => false,
@@ -139,16 +137,14 @@ pub fn build_bson_tree_item(
             is_folder,
             is_editable,
             is_dirty,
+            has_details: crate::bson::has_value_details(value),
             doc_key: doc_key.clone(),
             path: path.clone(),
             value: if is_editable { Some(value.clone()) } else { None },
         },
     );
 
-    let mut item = TreeItem::new(node_id.clone(), key_label)
-        .folder(has_children)
-        .expanded(is_expanded)
-        .disabled(true);
+    let mut item = TreeItem::new(node_id.clone(), key_label).expanded(is_expanded);
 
     if is_expanded {
         match value {
@@ -227,5 +223,42 @@ pub fn flatten_tree_order(item: &TreeItem, order: &mut Vec<String>) {
         for child in &item.children {
             flatten_tree_order(child, order);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::{HashMap, HashSet};
+
+    use gpui_kit::AppContext as _;
+    use gpui_kit::component::tree::TreeState;
+    use mongodb::bson::doc;
+
+    use super::build_documents_tree;
+    use crate::bson::{DocumentKey, PathSegment, doc_root_id, path_to_id};
+    use crate::state::SessionDocument;
+
+    #[gpui_kit::test]
+    fn document_fields_remain_selectable_even_when_not_editable(cx: &mut gpui_kit::TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            let document = doc! { "_id": 1, "nested": { "name": "value" } };
+            let key = DocumentKey::from_document(&document, 0);
+            let id_field = path_to_id(&key, &[PathSegment::Key("_id".into())]);
+            let expanded = HashSet::from([
+                doc_root_id(&key),
+                path_to_id(&key, &[PathSegment::Key("nested".into())]),
+            ]);
+            let documents = [SessionDocument { key, doc: document }];
+            let (items, metadata, order) =
+                build_documents_tree(&documents, &HashMap::new(), &expanded, cx);
+            let tree = cx.new(|cx| TreeState::new(cx).items(items));
+            for index in 0..order.len() {
+                tree.update(cx, |tree, cx| tree.set_selected_index(Some(index), cx));
+                let entry = tree.read(cx).selected_entry().expect("selected document field");
+                assert!(!entry.is_disabled(), "Kit must be able to paint selection");
+            }
+            assert!(!metadata[&id_field].is_editable, "The root _id remains immutable");
+        });
     }
 }

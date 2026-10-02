@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
-use gpui::px;
-use gpui_component::table::{Column, ColumnSort};
+use gpui_kit::component::table::{Column, ColumnSort};
+use gpui_kit::px;
 use mongodb::bson::{Bson, Document};
 
 use crate::state::SessionDocument;
@@ -117,10 +117,6 @@ fn compute_column_width(key: String, sampled: &[&Bson]) -> TableColumnDef {
 
     let width = header_width.max(type_width).max(content_width).clamp(MIN_COL_WIDTH, MAX_COL_WIDTH);
     TableColumnDef { key, width }
-}
-
-pub fn build_column_defs(columns: &[TableColumnDef]) -> Vec<Column> {
-    build_column_defs_with_overrides(columns, &HashMap::new(), &None, &HashSet::new())
 }
 
 /// Build Column definitions, using saved widths, active sort, and pinned columns.

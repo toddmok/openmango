@@ -5,8 +5,9 @@ mod types;
 
 use std::sync::Arc;
 
-use gpui::*;
-use gpui_component::ActiveTheme as _;
+use gpui_kit::component::ActiveTheme as _;
+use gpui_kit::component::scroll::ScrollableElement as _;
+use gpui_kit::*;
 
 use crate::bson::get_bson_at_path;
 use crate::theme::spacing;
@@ -71,8 +72,14 @@ pub fn render_results_view<T: 'static>(
         return empty_state_view(ResultEmptyState::NoMatches, cx_ref).into_any_element();
     }
 
-    let list =
-        div().flex().flex_col().flex_1().min_w(px(0.0)).min_h(px(0.0)).overflow_hidden().child(
+    let list = div()
+        .flex()
+        .flex_col()
+        .flex_1()
+        .min_w(px(0.0))
+        .min_h(px(0.0))
+        .overflow_hidden()
+        .child(
             uniform_list(
                 "results-tree",
                 row_count,
@@ -118,8 +125,10 @@ pub fn render_results_view<T: 'static>(
                 }),
             )
             .flex_1()
-            .track_scroll(props.scroll_handle),
-        );
+            .track_scroll(&props.scroll_handle),
+        )
+        // The list scrolls itself; the bar reads the list's own handle.
+        .vertical_scrollbar(&props.scroll_handle);
 
     div()
         .flex()

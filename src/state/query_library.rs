@@ -509,10 +509,6 @@ impl QueryLibrary {
         self.saved.len() != len
     }
 
-    pub fn history_entry(&self, id: Uuid) -> Option<&QueryHistoryEntry> {
-        self.history.iter().find(|entry| entry.id == id)
-    }
-
     pub fn saved_query(&self, id: Uuid) -> Option<&SavedQuery> {
         self.saved.iter().find(|query| query.id == id)
     }
@@ -920,11 +916,7 @@ mod tests {
                 database: "app".into(),
                 collection: Some("users".into()),
                 content: QueryContent::Aggregation {
-                    stages: vec![PipelineStage {
-                        operator: "$match".into(),
-                        body: "{}".into(),
-                        enabled: true,
-                    }],
+                    stages: vec![PipelineStage::with("$match", "{}", true)],
                     selected_stage: Some(1),
                 },
             },

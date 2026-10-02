@@ -5,6 +5,10 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -14,71 +18,193 @@ env:
   CARGO_INCREMENTAL: 0
   CARGO_NET_RETRY: 10
   RUST_BACKTRACE: short
+  CARGO_HUSKY_DONT_INSTALL_HOOKS: "true"
 
 jobs:
   quality:
     runs-on: macos-latest
+    timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Install Bun
-        uses: oven-sh/setup-bun@v2
-
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Disable lld linker flags for CI
-        run: rm -f .cargo/config.toml
-
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: "1.4.2"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          # PRs restore main's cache; saving from PRs evicts it and cancelled runs save partial caches.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Format check
         run: cargo fmt --check
-
-      - name: Check
-        run: cargo check --release --features mimalloc
-
+      - name: Compile macOS app icon
+        run: bash ./scripts/build_app_icon.sh
       - name: Clippy
-        run: cargo clippy --release --features mimalloc -- -D warnings
-
+        run: cargo clippy --locked --release -- -D warnings
       - name: Verify Forge sidecar bundle
         run: ./scripts/check_mongosh_sidecar.sh
-
       - name: Run unit tests
-        run: cargo test --lib -- --test-threads=1
+        run: cargo test --locked --lib -- --test-threads=1
+
+  linux:
+    name: Linux (${{ matrix.arch }})
+    # Fork: only the macOS arm64 app is used, so other platforms don't build here.
+    if: github.repository != 'toddmok/openmango'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The same Ubuntu the released AppImages are built on; see linux-release.yml.
+          - runner: ubuntu-22.04
+            arch: x86_64
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-22.04-arm
+            arch: arm64
+            target: aarch64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: "1.4.2"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          # Not the cache built on Ubuntu 24.04.
+          key: ubuntu-22.04
+          # PRs restore main's cache; saving from PRs evicts it and cancelled runs save partial caches.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Install Linux dependencies
+        run: bash scripts/bootstrap_linux.sh --desktop-tests
+      - name: Format check
+        run: cargo fmt --check
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Run unit tests
+        # Debug profile: the integration-test seams in src/ are gated on cfg(debug_assertions).
+        run: cargo test --locked --lib -- --test-threads=1
+      - name: Verify bundled helper scripts
+        run: bash scripts/check_linux_tools.sh
+      - name: Verify Forge sidecar bundle
+        run: bash scripts/check_mongosh_sidecar.sh
+      - name: Package Linux preview
+        run: bash scripts/release_linux.sh '${{ matrix.target }}'
+      - name: Check packaged application and helpers
+        run: bash scripts/check_linux_package.sh 'dist/OpenMango-'*'-linux-${{ matrix.arch }}.AppImage' --database-tests
+      - name: Smoke-test packaged desktop session
+        run: python3 scripts/check_linux_gui.py 'dist/OpenMango-'*'-linux-${{ matrix.arch }}.AppImage' target/linux-gui.png
+      - name: Verify combined title bar on Xfce
+        env:
+          OPENMANGO_GUI_WINDOW_MANAGER: xfwm4
+        run: python3 scripts/check_linux_gui.py 'dist/OpenMango-'*'-linux-${{ matrix.arch }}.AppImage' target/linux-gui-xfce.png
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: Linux-preview-${{ matrix.arch }}
+          path: |
+            dist/OpenMango-*-linux-${{ matrix.arch }}.AppImage*
+            target/linux-gui.png
+            target/linux-gui.log
+            target/linux-gui-xfce.png
+            target/linux-gui-xfce.log
+          if-no-files-found: error
+          retention-days: 14
+
+  windows:
+    name: Windows (${{ matrix.arch }})
+    # Fork: only the macOS arm64 app is used, so other platforms don't build here.
+    if: github.repository != 'toddmok/openmango'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-2025
+            arch: x86_64
+          - runner: windows-11-arm
+            arch: arm64
+    defaults:
+      run:
+        shell: bash
+    env:
+      # Git Bash's perl cannot configure the vendored OpenSSL build.
+      OPENSSL_SRC_PERL: C:\Strawberry\perl\bin\perl.exe
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
+          components: clippy
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: "1.4.2"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          # PRs restore main's cache; saving from PRs evicts it and cancelled runs save partial caches.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Install Strawberry Perl
+        shell: pwsh
+        run: if (-not (Test-Path C:\Strawberry\perl\bin\perl.exe)) { choco install strawberryperl -y --no-progress }
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Run unit tests
+        run: cargo test --locked --lib -- --test-threads=1
+      # Packaging compiles the Forge sidecar, so no separate bundle check here.
+      - name: Package Windows preview
+        run: bash scripts/release_windows.sh
+      - name: Check installer, bundled tools, and launch
+        run: bash scripts/check_windows_package.sh dist/OpenMango-*-windows-${{ matrix.arch }}-setup.exe --launch
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: Windows-preview-${{ matrix.arch }}
+          path: dist/OpenMango-*-windows-${{ matrix.arch }}-setup.exe*
+          if-no-files-found: error
+          retention-days: 14
 
   integration-tests:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
-
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install Linux system deps for GPUI linking
         run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libxcb1-dev \
-            libxkbcommon-dev \
-            libxkbcommon-x11-dev
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Disable lld linker flags for CI
-        run: rm -f .cargo/config.toml
-
+          bash scripts/bootstrap_linux.sh
+          pkg-config --modversion fontconfig
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          # PRs restore main's cache; saving from PRs evicts it and cancelled runs save partial caches.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Verify Docker availability
         run: docker version
-
+      - name: Pull integration test images
+        run: |
+          for test_image in mongo:7.0 testcontainers/sshd:1.3.0; do
+            for pull_attempt in 1 2 3; do
+              if docker pull "$test_image"; then
+                break
+              fi
+              if [ "$pull_attempt" -eq 3 ]; then
+                exit 1
+              fi
+              sleep 5
+            done
+          done
       - name: Download MongoDB Database Tools
         run: ./scripts/download_tools.sh
-
+      - name: Build integration tests
+        # One invocation links all suites in parallel; the loop below then only runs them.
+        run: cargo test --locked --no-run --tests
       - name: Run integration tests
         run: |
           for test_file in tests/*_tests.rs; do
             test_name="$(basename "${test_file}" .rs)"
             echo "Running ${test_name}"
-            cargo test --test "${test_name}" -- --test-threads=1
+            cargo test --locked --test "${test_name}" -- --test-threads=1
           done

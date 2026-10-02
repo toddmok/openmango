@@ -1,4 +1,6 @@
-use mongodb::bson::{Bson, Document, oid::ObjectId};
+use mongodb::bson::{Bson, DateTime, Document, oid::ObjectId};
+
+use crate::bson::{parse_bson_from_relaxed_json, parse_edited_value};
 use regex::escape as regex_escape;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -79,15 +81,10 @@ pub enum ValueEditorKind {
     None,
     Single,
     List,
-    Toggle,
     Range,
 }
 
-impl ValueEditorKind {
-    pub fn is_multiline(&self) -> bool {
-        matches!(self, Self::List | Self::Range)
-    }
-}
+impl ValueEditorKind {}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FilterOperator {
@@ -137,11 +134,9 @@ impl FilterOperator {
 
     pub fn value_editor_kind(self, field_type: FieldType) -> ValueEditorKind {
         match self {
-            Self::Exists => ValueEditorKind::Toggle,
             Self::Between => ValueEditorKind::Range,
             Self::In | Self::Nin | Self::All => ValueEditorKind::List,
             Self::IsEmpty | Self::NotEmpty => ValueEditorKind::None,
-            Self::Eq | Self::Ne if field_type == FieldType::Boolean => ValueEditorKind::Toggle,
             Self::Eq | Self::Ne if field_type == FieldType::Null => ValueEditorKind::None,
             _ => ValueEditorKind::Single,
         }
@@ -179,13 +174,6 @@ impl Combinator {
         }
     }
 
-    pub fn short_label(self) -> &'static str {
-        match self {
-            Self::And => "$and",
-            Self::Or => "$or",
-        }
-    }
-
     pub fn toggle(self) -> Self {
         match self {
             Self::And => Self::Or,
@@ -200,7 +188,6 @@ pub enum ConditionValue {
     Empty,
     Scalar(String),
     List(Vec<String>),
-    Bool(bool),
     Range {
         start: String,
         end: String,
@@ -213,7 +200,6 @@ impl ConditionValue {
             Self::Empty => false,
             Self::Scalar(value) => !value.trim().is_empty(),
             Self::List(values) => values.iter().any(|value| !value.trim().is_empty()),
-            Self::Bool(_) => true,
             Self::Range { start, end } => !start.trim().is_empty() || !end.trim().is_empty(),
         }
     }
@@ -242,13 +228,6 @@ impl ConditionValue {
     pub fn list_mut(&mut self) -> Option<&mut Vec<String>> {
         match self {
             Self::List(values) => Some(values),
-            _ => None,
-        }
-    }
-
-    pub fn bool(&self) -> Option<bool> {
-        match self {
-            Self::Bool(value) => Some(*value),
             _ => None,
         }
     }
@@ -329,16 +308,13 @@ impl FilterCondition {
         }
 
         match self.value_editor_kind() {
-            ValueEditorKind::None | ValueEditorKind::Toggle => None,
+            ValueEditorKind::None => None,
             ValueEditorKind::Single => {
                 let raw = self.value.scalar().unwrap_or("").trim();
                 if raw.is_empty() {
                     return Some("Enter a value".to_string());
                 }
-                if self.parse_scalar(raw).is_none() {
-                    return Some(value_error_message(self.field_type).to_string());
-                }
-                None
+                self.parse_scalar(raw).err()
             }
             ValueEditorKind::List => {
                 let values = self
@@ -352,10 +328,7 @@ impl FilterCondition {
                 if values.is_empty() {
                     return Some("Add at least one value".to_string());
                 }
-                if values.iter().any(|value| self.parse_scalar(value).is_none()) {
-                    return Some(value_error_message(self.field_type).to_string());
-                }
-                None
+                values.iter().find_map(|value| self.parse_scalar(value).err())
             }
             ValueEditorKind::Range => {
                 let Some((start, end)) = self.value.range() else {
@@ -364,10 +337,7 @@ impl FilterCondition {
                 if start.trim().is_empty() || end.trim().is_empty() {
                     return Some("Enter both values".to_string());
                 }
-                if self.parse_scalar(start).is_none() || self.parse_scalar(end).is_none() {
-                    return Some(value_error_message(self.field_type).to_string());
-                }
-                None
+                self.parse_scalar(start).and(self.parse_scalar(end)).err()
             }
         }
     }
@@ -397,7 +367,6 @@ impl FilterCondition {
             | FilterOperator::Size => {
                 let key = self.operator.mongo_key()?;
                 let value = match self.operator {
-                    FilterOperator::Exists => Bson::Boolean(self.value.bool().unwrap_or(true)),
                     FilterOperator::Size => {
                         let raw = self.value.scalar().unwrap_or("");
                         raw.trim().parse::<i64>().ok().map(Bson::Int64)?
@@ -413,8 +382,8 @@ impl FilterCondition {
             FilterOperator::Between => {
                 let (start, end) = self.value.range()?;
                 let mut inner = Document::new();
-                inner.insert("$gte", self.parse_scalar(start.trim())?);
-                inner.insert("$lte", self.parse_scalar(end.trim())?);
+                inner.insert("$gte", self.parse_scalar(start.trim()).ok()?);
+                inner.insert("$lte", self.parse_scalar(end.trim()).ok()?);
                 let mut doc = Document::new();
                 doc.insert(field, inner);
                 Some(doc)
@@ -428,7 +397,7 @@ impl FilterCondition {
                     .iter()
                     .map(|value| value.trim())
                     .filter(|value| !value.is_empty())
-                    .filter_map(|value| self.parse_scalar(value))
+                    .filter_map(|value| self.parse_scalar(value).ok())
                     .collect::<Vec<_>>();
                 let mut inner = Document::new();
                 inner.insert(key, Bson::Array(values));
@@ -489,7 +458,6 @@ impl FilterCondition {
     pub fn scalar_display_value(&self) -> String {
         match &self.value {
             ConditionValue::Scalar(value) => value.clone(),
-            ConditionValue::Bool(value) => value.to_string(),
             ConditionValue::List(values) => values.join(", "),
             ConditionValue::Range { start, end } => format!("{start} -> {end}"),
             ConditionValue::Empty => String::new(),
@@ -498,49 +466,48 @@ impl FilterCondition {
 
     fn scalar_bson(&self) -> Option<Bson> {
         match self.value_editor_kind() {
-            ValueEditorKind::Toggle => Some(Bson::Boolean(self.value.bool().unwrap_or(true))),
             ValueEditorKind::None if self.field_type == FieldType::Null => Some(Bson::Null),
-            _ => self.parse_scalar(self.value.scalar()?.trim()),
+            _ => self.parse_scalar(self.value.scalar()?.trim()).ok(),
         }
     }
 
-    fn parse_scalar(&self, raw: &str) -> Option<Bson> {
+    /// Parses one typed value with the app-wide value contract (`parse_edited_value`), so a
+    /// value means the same here as in the document tree and the edit dialogs.
+    fn parse_scalar(&self, raw: &str) -> Result<Bson, String> {
+        let raw = raw.trim();
+        if self.operator == FilterOperator::Exists {
+            return parse_edited_value(&Bson::Boolean(true), raw);
+        }
         if raw.is_empty() && self.field_type != FieldType::Null {
-            return None;
+            return Err("Enter a value".to_string());
         }
 
         match self.field_type {
             FieldType::ObjectId => {
-                let cleaned = raw
-                    .trim_start_matches("ObjectId(\"")
-                    .trim_start_matches("ObjectId('")
-                    .trim_end_matches("\")")
-                    .trim_end_matches("')")
-                    .trim_matches('"')
-                    .trim_matches('\'');
-                ObjectId::parse_str(cleaned).ok().map(Bson::ObjectId)
+                parse_edited_value(&Bson::ObjectId(ObjectId::from_bytes([0; 12])), raw)
             }
-            FieldType::Number => {
-                if let Ok(value) = raw.parse::<i64>() {
-                    Some(Bson::Int64(value))
-                } else if let Ok(value) = raw.parse::<f64>() {
-                    Some(Bson::Double(value))
-                } else {
-                    None
-                }
+            FieldType::Number => parse_edited_value(&Bson::Int64(0), raw)
+                .or_else(|_| parse_edited_value(&Bson::Double(0.0), raw)),
+            FieldType::Boolean => parse_edited_value(&Bson::Boolean(true), raw),
+            FieldType::DateTime => {
+                parse_edited_value(&Bson::DateTime(DateTime::from_millis(0)), raw)
             }
-            FieldType::Boolean => match raw.to_ascii_lowercase().as_str() {
-                "true" | "1" | "yes" => Some(Bson::Boolean(true)),
-                "false" | "0" | "no" => Some(Bson::Boolean(false)),
-                _ => None,
-            },
-            FieldType::DateTime => parse_datetime(raw),
-            FieldType::Null => Some(Bson::Null),
-            FieldType::Array => crate::bson::parse_bson_from_relaxed_json(raw)
+            FieldType::Null => Ok(Bson::Null),
+            FieldType::Array => {
+                Ok(parse_bson_from_relaxed_json(raw)
+                    .unwrap_or_else(|_| Bson::String(raw.to_string())))
+            }
+            FieldType::Document => parse_bson_from_relaxed_json(raw)
+                .map_err(|_| "Enter a document like { status: \"active\" }".to_string()),
+            // A type the builder has no editor for (binary, UUID, timestamp) arrives as the
+            // Extended JSON `bson_value_to_input` wrote for it. Read it back as that type, or
+            // the filter compares a string of JSON and matches nothing. A wrapper that stays a
+            // document is not one of those, and everything else is text.
+            FieldType::Unknown if raw.starts_with('{') => Ok(parse_bson_from_relaxed_json(raw)
                 .ok()
-                .or_else(|| Some(Bson::String(raw.to_string()))),
-            FieldType::Document => crate::bson::parse_bson_from_relaxed_json(raw).ok(),
-            _ => Some(Bson::String(raw.to_string())),
+                .filter(|value| !matches!(value, Bson::Document(_)))
+                .unwrap_or_else(|| Bson::String(raw.to_string()))),
+            _ => Ok(Bson::String(raw.to_string())),
         }
     }
 }
@@ -583,7 +550,7 @@ impl FilterNode {
         }
     }
 
-    fn contains_node(&self, id: u64) -> bool {
+    pub(super) fn contains_node(&self, id: u64) -> bool {
         match self {
             Self::Condition(condition) => condition.id == id,
             Self::Group { id: group_id, children, .. } => {
@@ -774,10 +741,6 @@ impl FilterTree {
         }
     }
 
-    pub fn remove_condition(&mut self, id: u64) {
-        self.remove_node(id);
-    }
-
     pub fn duplicate_node(&mut self, id: u64) -> Option<u64> {
         let source = self.find_node(id)?.clone();
         let location = self.node_location(id)?;
@@ -844,16 +807,6 @@ impl FilterTree {
             child.collect_conditions(&mut out);
         }
         out
-    }
-
-    pub fn flat_conditions(&self) -> Vec<&FilterCondition> {
-        self.children
-            .iter()
-            .filter_map(|node| match node {
-                FilterNode::Condition(condition) => Some(condition),
-                _ => None,
-            })
-            .collect()
     }
 
     pub fn validation_error(&self) -> Option<String> {
@@ -1178,14 +1131,11 @@ fn parse_value_for(
 ) -> Result<ConditionValue, UnsupportedFilter> {
     match operator.value_editor_kind(field_type) {
         ValueEditorKind::None => Ok(ConditionValue::Empty),
-        ValueEditorKind::Toggle => match value {
-            Bson::Boolean(value) => Ok(ConditionValue::Bool(*value)),
-            Bson::Int32(value) if matches!(operator, FilterOperator::Exists) => {
-                Ok(ConditionValue::Bool(*value != 0))
-            }
-            Bson::Int64(value) if matches!(operator, FilterOperator::Exists) => {
-                Ok(ConditionValue::Bool(*value != 0))
-            }
+        // `$exists` also takes 1 and 0, which the builder shows as true and false.
+        ValueEditorKind::Single if operator == FilterOperator::Exists => match value {
+            Bson::Boolean(value) => Ok(ConditionValue::Scalar(value.to_string())),
+            Bson::Int32(value) => Ok(ConditionValue::Scalar((*value != 0).to_string())),
+            Bson::Int64(value) => Ok(ConditionValue::Scalar((*value != 0).to_string())),
             other => Err(unsupported(format!("Expected a boolean value, got `{other}`"))),
         },
         ValueEditorKind::Single => Ok(ConditionValue::Scalar(bson_value_to_input(value))),
@@ -1206,16 +1156,6 @@ pub fn drag_value_for(
 ) -> ConditionValue {
     match operator.value_editor_kind(field_type) {
         ValueEditorKind::None => ConditionValue::Empty,
-        ValueEditorKind::Toggle => match value {
-            Bson::Boolean(value) => ConditionValue::Bool(*value),
-            Bson::Int32(value) => ConditionValue::Bool(*value != 0),
-            Bson::Int64(value) => ConditionValue::Bool(*value != 0),
-            Bson::String(value) => ConditionValue::Bool(matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "true" | "1" | "yes"
-            )),
-            _ => ConditionValue::Bool(true),
-        },
         ValueEditorKind::Single => ConditionValue::Scalar(bson_value_to_input(value)),
         ValueEditorKind::List => match value {
             Bson::Array(values) => {
@@ -1237,7 +1177,7 @@ pub fn is_valid_value_for_field_type(field_type: FieldType, raw: &str) -> bool {
         operator: FilterOperator::Eq,
         value: ConditionValue::Scalar(raw.to_string()),
     };
-    condition.parse_scalar(raw.trim()).is_some()
+    condition.parse_scalar(raw.trim()).is_ok()
 }
 
 fn operator_from_key(key: &str) -> Option<FilterOperator> {
@@ -1296,26 +1236,6 @@ fn infer_type_from_value(field: &str, value: &Bson, operator: FilterOperator) ->
     }
 }
 
-fn parse_datetime(raw: &str) -> Option<Bson> {
-    let cleaned = raw
-        .trim_start_matches("ISODate(\"")
-        .trim_start_matches("Date(\"")
-        .trim_end_matches("\")")
-        .trim_matches('"');
-
-    chrono::DateTime::parse_from_rfc3339(cleaned)
-        .ok()
-        .map(|datetime| {
-            Bson::DateTime(mongodb::bson::DateTime::from_millis(datetime.timestamp_millis()))
-        })
-        .or_else(|| {
-            chrono::NaiveDate::parse_from_str(cleaned, "%Y-%m-%d").ok().map(|date| {
-                let datetime = date.and_hms_opt(0, 0, 0).unwrap().and_utc();
-                Bson::DateTime(mongodb::bson::DateTime::from_millis(datetime.timestamp_millis()))
-            })
-        })
-}
-
 fn bson_value_to_input(value: &Bson) -> String {
     match value {
         Bson::String(value) => value.clone(),
@@ -1324,12 +1244,7 @@ fn bson_value_to_input(value: &Bson) -> String {
         Bson::Double(value) => value.to_string(),
         Bson::Boolean(value) => value.to_string(),
         Bson::ObjectId(value) => value.to_hex(),
-        Bson::DateTime(value) => {
-            let millis = value.timestamp_millis();
-            chrono::DateTime::from_timestamp_millis(millis)
-                .map(|datetime| datetime.to_rfc3339())
-                .unwrap_or_else(|| millis.to_string())
-        }
+        Bson::DateTime(_) => crate::bson::bson_value_for_edit(value),
         Bson::RegularExpression(value) => value.pattern.clone(),
         Bson::Null => "null".to_string(),
         other => crate::bson::format_relaxed_json_value(&other.clone().into_relaxed_extjson()),
@@ -1391,13 +1306,13 @@ fn combine_documents(combinator: Combinator, parts: Vec<Document>) -> Document {
 fn default_value(field_type: FieldType, operator: FilterOperator) -> ConditionValue {
     match operator.value_editor_kind(field_type) {
         ValueEditorKind::None => ConditionValue::Empty,
+        ValueEditorKind::Single
+            if operator == FilterOperator::Exists || field_type == FieldType::Boolean =>
+        {
+            ConditionValue::Scalar("true".to_string())
+        }
         ValueEditorKind::Single => ConditionValue::Scalar(String::new()),
         ValueEditorKind::List => ConditionValue::List(Vec::new()),
-        ValueEditorKind::Toggle => {
-            let default =
-                matches!(operator, FilterOperator::Exists) || field_type == FieldType::Boolean;
-            ConditionValue::Bool(default)
-        }
         ValueEditorKind::Range => {
             ConditionValue::Range { start: String::new(), end: String::new() }
         }
@@ -1409,11 +1324,20 @@ fn coerce_value_for(
     field_type: FieldType,
     operator: FilterOperator,
 ) -> ConditionValue {
+    if operator == FilterOperator::Exists {
+        let flag = previous
+            .scalar()
+            .map(|value| value.trim().to_ascii_lowercase())
+            .filter(|value| value == "true" || value == "false");
+        return ConditionValue::Scalar(flag.unwrap_or_else(|| "true".to_string()));
+    }
     match operator.value_editor_kind(field_type) {
         ValueEditorKind::None => ConditionValue::Empty,
         ValueEditorKind::Single => match previous {
+            ConditionValue::Scalar(value) if value.trim().is_empty() => {
+                default_value(field_type, operator)
+            }
             ConditionValue::Scalar(value) => ConditionValue::Scalar(value),
-            ConditionValue::Bool(value) => ConditionValue::Scalar(value.to_string()),
             ConditionValue::List(values) => ConditionValue::Scalar(
                 values.into_iter().find(|value| !value.trim().is_empty()).unwrap_or_default(),
             ),
@@ -1437,14 +1361,6 @@ fn coerce_value_for(
             }
             _ => default_value(field_type, operator),
         },
-        ValueEditorKind::Toggle => match previous {
-            ConditionValue::Bool(value) => ConditionValue::Bool(value),
-            ConditionValue::Scalar(value) => {
-                let normalized = value.trim().to_ascii_lowercase();
-                ConditionValue::Bool(matches!(normalized.as_str(), "true" | "1" | "yes"))
-            }
-            _ => default_value(field_type, operator),
-        },
         ValueEditorKind::Range => match previous {
             ConditionValue::Range { start, end } => ConditionValue::Range { start, end },
             ConditionValue::Scalar(value) if !value.trim().is_empty() => {
@@ -1462,16 +1378,6 @@ fn coerce_value_for(
     }
 }
 
-fn value_error_message(field_type: FieldType) -> &'static str {
-    match field_type {
-        FieldType::ObjectId => "Enter a valid ObjectId",
-        FieldType::Number => "Enter a valid number",
-        FieldType::Boolean => "Choose true or false",
-        FieldType::DateTime => "Enter a valid date or ISO timestamp",
-        _ => "Enter a valid value",
-    }
-}
-
 fn unsupported(reason: impl Into<String>) -> UnsupportedFilter {
     UnsupportedFilter { reason: reason.into() }
 }
@@ -1483,6 +1389,28 @@ mod tests {
         FilterOperator, FilterTree,
     };
     use mongodb::bson::{Bson, doc};
+
+    /// The builder has no binary editor, so a dropped UUID is an Unknown-typed condition. It
+    /// must still filter on the binary value: as a string it matches nothing, with no error.
+    #[test]
+    fn a_dragged_uuid_filters_as_binary_not_as_text() {
+        let uuid = Bson::Binary(mongodb::bson::Binary {
+            subtype: mongodb::bson::spec::BinarySubtype::Uuid,
+            bytes: (0x00..0x10).collect(),
+        });
+        let mut condition = FilterCondition::new(1);
+        condition.field = "sessionId".to_string();
+        condition.set_field_type(FieldType::from_bson(&uuid));
+        condition.set_operator(FilterOperator::Eq);
+        condition.value = super::drag_value_for(condition.field_type, condition.operator, &uuid);
+        assert_eq!(condition.to_document(), Some(doc! { "sessionId": uuid }));
+
+        // Text a person typed into an Unknown field stays text, braces or not.
+        condition.value = ConditionValue::Scalar("{not json".to_string());
+        assert_eq!(condition.to_document(), Some(doc! { "sessionId": "{not json" }));
+        condition.value = ConditionValue::Scalar("{ a: 1 }".to_string());
+        assert_eq!(condition.to_document(), Some(doc! { "sessionId": "{ a: 1 }" }));
+    }
 
     #[test]
     fn string_contains_serializes_to_regex() {
@@ -1505,6 +1433,38 @@ mod tests {
             }
         });
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn values_are_typed_text_with_the_shared_value_contract() {
+        let mut exists = FilterCondition::new(1);
+        exists.field = "deleted_at".to_string();
+        exists.set_operator(FilterOperator::Exists);
+        assert_eq!(exists.value, ConditionValue::Scalar("true".to_string()));
+        exists.value = ConditionValue::Scalar("false".to_string());
+        assert_eq!(exists.to_document(), Some(doc! { "deleted_at": { "$exists": false } }));
+        exists.value = ConditionValue::Scalar("yes".to_string());
+        assert_eq!(exists.validation_error().as_deref(), Some("Enter true or false"));
+
+        let mut flag = FilterCondition::new(2);
+        flag.field = "is_active".to_string();
+        flag.set_field_type(FieldType::Boolean);
+        flag.value = ConditionValue::Scalar("FALSE".to_string());
+        assert_eq!(flag.to_document(), Some(doc! { "is_active": false }));
+
+        let mut created = FilterCondition::new(3);
+        created.field = "created_at".to_string();
+        created.set_field_type(FieldType::DateTime);
+        created.set_operator(FilterOperator::Gte);
+        created.value = ConditionValue::Scalar("ISODate(\"2024-01-31T00:00:00Z\")".to_string());
+        let day = mongodb::bson::DateTime::parse_rfc3339_str("2024-01-31T00:00:00Z").unwrap();
+        assert_eq!(created.to_document(), Some(doc! { "created_at": { "$gte": day } }));
+        created.value = ConditionValue::Scalar("2024-01-31".to_string());
+        assert_eq!(created.to_document(), Some(doc! { "created_at": { "$gte": day } }));
+
+        let tree = FilterTree::from_document(&doc! { "archived": { "$exists": 1 } }).unwrap();
+        let condition = tree.conditions().into_iter().next().expect("condition");
+        assert_eq!(condition.value, ConditionValue::Scalar("true".to_string()));
     }
 
     #[test]

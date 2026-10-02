@@ -1,51 +1,56 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use gpui::prelude::{FluentBuilder as _, InteractiveElement as _, StatefulInteractiveElement as _};
-use gpui::*;
-use gpui_component::ActiveTheme as _;
-use gpui_component::button::{Button, ButtonVariants as _};
-use gpui_component::input::Input;
-use gpui_component::menu::{ContextMenuExt, DropdownMenu as _, PopupMenu, PopupMenuItem};
-use gpui_component::scroll::ScrollableElement;
-use gpui_component::spinner::Spinner;
-use gpui_component::tooltip::Tooltip;
-use gpui_component::{Icon, IconName, Sizable as _};
+use gpui_kit::component::ActiveTheme as _;
+use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::input::Input;
+use gpui_kit::component::menu::{ContextMenuExt, DropdownMenu as _};
+use gpui_kit::component::scroll::ScrollableElement;
+use gpui_kit::component::spinner::Spinner;
+use gpui_kit::component::tooltip::Tooltip;
+use gpui_kit::component::{Icon, IconName, Sizable as _};
+use gpui_kit::prelude::{
+    FluentBuilder as _, InteractiveElement as _, StatefulInteractiveElement as _,
+};
+use gpui_kit::*;
 
-use crate::actions::model::ActionStatus;
-use crate::components::{ConnectionIdentity, ConnectionManager, connection_identity_badge};
+use crate::components::{ConnectionIdentity, connection_identity_tags};
 use crate::keyboard::{
     CloseSidebarSearch, CopyConnectionUri, CopySelectionName, CopyTreeItem, DeleteSelection,
-    DisconnectConnection, EditConnection, FindInSidebar, OpenActionBar, OpenForge, OpenSelection,
-    OpenSelectionPreview, PasteTreeItem, RenameCollection, TransferCopy, TransferExport,
-    TransferImport,
+    DisconnectConnection, EditConnection, FindInSidebar, OpenActionBar, OpenConnectionSwitcher,
+    OpenForge, OpenSelection, OpenSelectionInNewTab, OpenSelectionPreview, PasteTreeItem,
+    RenameCollection, TransferCopy, TransferExport, TransferImport,
 };
-use crate::models::TreeNodeId;
-use crate::state::{AppCommands, TransferMode};
+use crate::models::{CollectionDetail, TreeNodeId};
+use crate::state::TransferMode;
 use crate::theme::{borders, colors, islands, sizing, spacing};
 
 use super::super::menus::{build_collection_menu, build_connection_menu, build_database_menu};
-use super::super::sidebar_model::SidebarModel;
-use super::Sidebar;
+use super::{ROW_HEIGHT, Sidebar};
 
 impl Render for Sidebar {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let appearance = self.state.read(cx).settings.appearance.clone();
-        let command_palette_tooltip = window
-            .highest_precedence_binding_for_action(&OpenActionBar)
-            .map(|binding| {
-                let shortcut = binding
-                    .keystrokes()
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                format!("Command palette ({shortcut})")
-            })
+        let command_palette_tooltip = crate::keyboard::shortcut_label(window, &OpenActionBar)
+            .map(|shortcut| format!("Command palette ({shortcut})"))
             .unwrap_or_else(|| "Command palette".to_string());
+        let switcher_tooltip: SharedString =
+            crate::keyboard::shortcut_label(window, &OpenConnectionSwitcher)
+                .map(|shortcut| format!("Switch connection ({shortcut})"))
+                .unwrap_or_else(|| "Switch connection".to_string())
+                .into();
 
         let active_connections = self.cached_active.clone();
         let connecting_id = self.model.connecting_connection;
+        let connection_failures: Rc<HashMap<uuid::Uuid, String>> = Rc::new(
+            self.cached_connections
+                .iter()
+                .filter_map(|connection| {
+                    let failure = self.state.read(cx).connection_failure(connection.id)?;
+                    Some((connection.id, failure.to_string()))
+                })
+                .collect(),
+        );
         let connection_accents = Rc::new(
             self.cached_connections
                 .iter()
@@ -64,21 +69,13 @@ impl Render for Sidebar {
                 .collect::<HashMap<_, _>>(),
         );
 
-        let disconnected_connections: Vec<_> = self
-            .cached_connections
-            .iter()
-            .filter(|c| !active_connections.contains_key(&c.id))
-            .cloned()
-            .collect();
-        let pending_agent_actions = self
-            .state
-            .read(cx)
-            .action_broker()
-            .list_all()
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|action| action.status == ActionStatus::PendingApproval)
-            .count();
+        let pending_agent_actions = self.state.read(cx).pending_agent_actions();
+        let tasks_needing_attention = self.state.read(cx).tasks_needing_attention();
+        let tasks_tooltip = match tasks_needing_attention {
+            0 => "Tasks".to_string(),
+            1 => "Tasks (1 needs attention)".to_string(),
+            count => format!("Tasks ({count} need attention)"),
+        };
         let activity_tooltip = if pending_agent_actions == 0 {
             "Agent activity".to_string()
         } else {
@@ -87,32 +84,15 @@ impl Render for Sidebar {
 
         let state = self.state.clone();
         let state_for_add = state.clone();
+        let state_for_tasks = state.clone();
+        let state_for_empty = state.clone();
+        let has_saved_connections = !self.cached_connections.is_empty();
         let state_for_activity = state.clone();
-        let state_for_manager = state.clone();
-        let state_for_connect = state.clone();
         let state_for_tree = self.state.clone();
         let sidebar_entity = cx.entity();
         let scroll_handle = self.scroll_handle.clone();
 
-        // Sticky connection header (one-frame-delayed: uses index computed by previous processor run)
-        let sticky_info = self.sticky_connection_index.and_then(|idx| {
-            let entry = self.model.entries.get(idx)?;
-            let connection_id = entry.id.connection_id();
-            let is_connected = active_connections.contains_key(&connection_id);
-            let is_connecting = connecting_id == Some(connection_id);
-            let accent =
-                connection_accents.get(&connection_id).copied().unwrap_or(cx.theme().foreground);
-            let identity = connection_identities.get(&connection_id).cloned();
-            Some((
-                idx,
-                entry.label.clone(),
-                connection_id,
-                is_connected,
-                is_connecting,
-                accent,
-                identity,
-            ))
-        });
+        let sticky_rows = self.sticky_rows(cx);
 
         let search_query = self.search_state.read(cx).value().to_string();
         let search_results = if self.model.search_open {
@@ -137,8 +117,8 @@ impl Render for Sidebar {
             .track_focus(&self.focus_handle)
             .on_mouse_down(MouseButton::Left, {
                 let focus_handle = self.focus_handle.clone();
-                move |_, window, _cx| {
-                    window.focus(&focus_handle);
+                move |_, window, cx| {
+                    window.focus(&focus_handle, cx);
                 }
             })
             .on_key_down({
@@ -159,6 +139,9 @@ impl Render for Sidebar {
             }))
             .on_action(cx.listener(|this, _: &OpenSelectionPreview, window, cx| {
                 this.handle_open_preview(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &OpenSelectionInNewTab, window, cx| {
+                this.handle_open_in_new_tab(window, cx);
             }))
             .on_action(cx.listener(|this, _: &EditConnection, window, cx| {
                 this.handle_edit_connection(window, cx);
@@ -203,21 +186,24 @@ impl Render for Sidebar {
                 this.close_search(window, cx);
             }))
             .child(
-                // Header with "+" button
+                // Keep management actions visible when the sidebar is narrow.
                 div()
                     .flex()
+                    .flex_wrap()
+                    .gap(spacing::xs())
                     .items_center()
                     .justify_between()
                     .px(spacing::md())
-                    .h(sizing::header_height())
+                    .py(spacing::xs())
+                    .min_h(sizing::header_height())
                     .border_b_1()
                     .border_color(islands::panel_border(&appearance, cx))
                     .child(
-                        div()
-                            .text_xs()
-                            .font_weight(FontWeight::NORMAL)
-                            .text_color(cx.theme().secondary_foreground)
-                            .child("CONNECTIONS"),
+                        Button::new("connection-switcher-btn").ghost().small()
+                            .label("Connections").dropdown_caret(true).tooltip(switcher_tooltip.clone())
+                            .on_click(|_, window, cx| {
+                                window.dispatch_action(Box::new(OpenConnectionSwitcher), cx);
+                            }),
                     )
                     .child(
                         div()
@@ -234,51 +220,31 @@ impl Render for Sidebar {
                                         window.dispatch_action(Box::new(OpenActionBar), cx);
                                     }),
                             )
-                            .child({
-                                let sidebar_entity = sidebar_entity.clone();
-                                // Connect dropdown button
-                                Button::new("connect-dropdown-btn")
-                                    .icon(Icon::new(IconName::Globe).xsmall())
-                                    .ghost()
-                                    .xsmall()
-                                    .tooltip("Connect saved connection")
-                                    .dropdown_menu(move |mut menu: PopupMenu, _window, _cx| {
-                                        if disconnected_connections.is_empty() {
-                                            menu = menu.item(
-                                                PopupMenuItem::new("All connected").disabled(true),
-                                            );
-                                        } else {
-                                            for conn in &disconnected_connections {
-                                                let conn_id = conn.id;
-                                                let state = state_for_connect.clone();
-                                                let sidebar_entity = sidebar_entity.clone();
-                                                menu = menu.item(
-                                                    PopupMenuItem::new(conn.name.clone())
-                                                        .on_click(move |_, _window, cx| {
-                                                            sidebar_entity.update(cx, |sidebar, cx| {
-                                                                sidebar.expand_connection_and_refresh(conn_id, cx);
-                                                            });
-                                                            AppCommands::connect(
-                                                                state.clone(),
-                                                                conn_id,
-                                                                cx,
-                                                            );
-                                                        }),
-                                                );
-                                            }
-                                        }
-                                        menu
-                                    })
-                            })
                             .child(
                                 Button::new("add-connection-btn")
                                     .icon(Icon::new(IconName::Plus).xsmall())
                                     .ghost()
                                     .xsmall()
-                                    .tooltip("Add connection")
+                                    .label("New")
+                                    .tooltip("New connection")
                                     .on_click(move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
                                         Sidebar::open_add_dialog(state_for_add.clone(), window, cx);
                                     }),
+                            )
+                            .child(
+                                div()
+                                    .relative()
+                                    .child(
+                                        Button::new("tasks-btn")
+                                            .icon(crate::views::compare::app_icon("list-checks").xsmall())
+                                            .ghost()
+                                            .xsmall()
+                                            .tooltip(tasks_tooltip)
+                                            .on_click(move |_: &ClickEvent, _window: &mut Window, cx: &mut App| {
+                                                state_for_tasks.update(cx, |state, cx| state.open_tasks_tab(cx));
+                                            }),
+                                    )
+                                    .children(count_badge(tasks_needing_attention, cx)),
                             )
                             .child(
                                 div()
@@ -295,41 +261,7 @@ impl Render for Sidebar {
                                                 });
                                             }),
                                     )
-                                    .when(pending_agent_actions > 0, |button| {
-                                        let label = if pending_agent_actions > 9 {
-                                            "9+".to_string()
-                                        } else {
-                                            pending_agent_actions.to_string()
-                                        };
-                                        button.child(
-                                            div()
-                                                .absolute()
-                                                .top(px(-3.0))
-                                                .right(px(-4.0))
-                                                .min_w(px(14.0))
-                                                .h(px(14.0))
-                                                .px(px(3.0))
-                                                .flex()
-                                                .items_center()
-                                                .justify_center()
-                                                .rounded_full()
-                                                .bg(cx.theme().danger)
-                                                .text_size(px(9.0))
-                                                .font_weight(FontWeight::SEMIBOLD)
-                                                .text_color(cx.theme().danger_foreground)
-                                                .child(label),
-                                        )
-                                    }),
-                            )
-                            .child(
-                                Button::new("manage-connections-btn")
-                                    .icon(Icon::new(IconName::Settings).xsmall())
-                                    .ghost()
-                                    .xsmall()
-                                    .tooltip("Manage connections")
-                                    .on_click(move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
-                                        ConnectionManager::open(state_for_manager.clone(), window, cx);
-                                    }),
+                                    .children(count_badge(pending_agent_actions, cx)),
                             )
                     ),
             )
@@ -445,9 +377,14 @@ impl Render for Sidebar {
                                     .into_any_element()
                             } else {
                                 div()
+                                    .id("sidebar-search-results")
                                     .flex()
                                     .flex_col()
                                     .gap(px(2.0))
+                                    // Bounded, so a broad query cannot push the tree off screen.
+                                    .max_h(px(320.0))
+                                    .overflow_y_scroll()
+                                    .track_scroll(&self.search_scroll_handle)
                                     .children(search_results.iter().enumerate().map(|(ix, result)| {
                                         let result = result.clone();
                                         let title = result.title.clone();
@@ -457,6 +394,7 @@ impl Render for Sidebar {
                                         let is_selected = self.model.search_selected == Some(ix);
                                         div()
                                             .flex()
+                                            .flex_shrink_0()
                                             .items_center()
                                             .justify_between()
                                             .px(spacing::sm())
@@ -529,7 +467,9 @@ impl Render for Sidebar {
                             .flex()
                             .flex_col()
                             .flex_1()
-                            .overflow_y_scrollbar()
+                            .min_h_0()
+                            // The list scrolls itself; the bar reads the list's own handle.
+                            .vertical_scrollbar(&scroll_handle)
                             .child(if self.model.entries.is_empty() {
                         div()
                             .flex()
@@ -542,16 +482,44 @@ impl Render for Sidebar {
                             .child(
                                 div()
                                     .text_sm()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child("No active connections"),
+                                    .text_color(cx.theme().foreground)
+                                    .child(if has_saved_connections {
+                                        "No open connections"
+                                    } else {
+                                        "No connections yet"
+                                    }),
                             )
                             .child(
                                 div()
                                     .text_xs()
                                     .text_color(cx.theme().muted_foreground)
                                     .text_center()
-                                    .child("Use the connect button or Cmd+K to connect"),
+                                    .child(if has_saved_connections {
+                                        "Open a saved connection to browse its databases."
+                                    } else {
+                                        "Add a MongoDB connection to browse its databases."
+                                    }),
                             )
+                            .child(div().mt(spacing::xs()).child(if has_saved_connections {
+                                Button::new("sidebar-open-connection")
+                                    .outline()
+                                    .small()
+                                    .label("Open connection")
+                                    .tooltip(switcher_tooltip.clone())
+                                    .on_click(|_, window, cx| {
+                                        window.dispatch_action(Box::new(OpenConnectionSwitcher), cx);
+                                    })
+                            } else {
+                                let state = state_for_empty.clone();
+                                Button::new("sidebar-new-connection")
+                                    .outline()
+                                    .small()
+                                    .icon(Icon::new(IconName::Plus).xsmall())
+                                    .label("New connection")
+                                    .on_click(move |_, window, cx| {
+                                        Sidebar::open_add_dialog(state.clone(), window, cx);
+                                    })
+                            }))
                             .into_any_element()
                     } else {
                         // Extract theme colors before the processor closure to avoid
@@ -569,12 +537,12 @@ impl Render for Sidebar {
                             let sidebar_entity = sidebar_entity.clone();
                             let connection_accents = connection_accents.clone();
                             let connection_identities = connection_identities.clone();
+                            let connection_failures = connection_failures.clone();
                             cx.processor(
                                 move |sidebar,
                                       visible_range: std::ops::Range<usize>,
                                       _window,
                                       cx| {
-                                    let visible_start = visible_range.start;
                                     let mut items = Vec::with_capacity(visible_range.len());
                                     let connecting_id = connecting_id;
 
@@ -587,7 +555,7 @@ impl Render for Sidebar {
                                         let is_folder = entry.is_folder;
                                         let is_expanded = entry.is_expanded;
                                         let label = entry.label.clone();
-                                        let label_for_menu = label.clone();
+                                        let label_for_menu = label.to_string();
 
                                         let is_connection = node_id.is_connection();
                                         let is_database = node_id.is_database();
@@ -604,41 +572,64 @@ impl Render for Sidebar {
                                         } else {
                                             theme_primary
                                         };
+                                        let is_connected = active_connections.contains_key(&connection_id);
                                         let is_connecting =
                                             is_connection && connecting_id == Some(connection_id);
                                         let is_loading_db =
                                             is_database && sidebar.model.loading_databases.contains(&node_id);
 
-                                        let db_name =
-                                            node_id.database_name().map(|db| db.to_string());
-                                        let node_kind = if is_connection {
-                                            "Connection"
-                                        } else if is_database {
-                                            "Database"
-                                        } else {
-                                            "Collection"
+                                        let detail = node_id
+                                            .database_name()
+                                            .zip(node_id.collection_name())
+                                            .and_then(|(database, collection)| {
+                                                active_connections
+                                                    .get(&connection_id)?
+                                                    .collection_detail(database, collection)
+                                            });
+                                        let is_view =
+                                            matches!(detail, Some(CollectionDetail::View { .. }));
+                                        let is_timeseries =
+                                            matches!(detail, Some(CollectionDetail::Timeseries));
+                                        let is_system = is_collection
+                                            && crate::models::is_system_collection(&label);
+                                        let row_tooltip = match detail {
+                                            Some(CollectionDetail::View { view_on, .. }) => {
+                                                format!("View: {label} · on {view_on}, read-only")
+                                            }
+                                            Some(CollectionDetail::Timeseries) => {
+                                                format!("Time series: {label}")
+                                            }
+                                            None if is_connection => format!("Connection: {label}"),
+                                            None if is_database => format!("Database: {label}"),
+                                            None if is_system => {
+                                                format!("System collection: {label}")
+                                            }
+                                            None => format!("Collection: {label}"),
                                         };
                                         let selected =
                                             sidebar.model.selected_tree_id.as_ref() == Some(&node_id);
                                         let menu_focus = sidebar.focus_handle.clone();
                                         let row_focus = menu_focus.clone();
 
+                                        // Keyed by node, not position: hover and an open menu stay
+                                        // with their row when rows above it come and go.
                                         let row = div()
-                                            .id(("sidebar-row", ix))
+                                            .id(&node_id)
+                                            .group("sidebar-row")
                                             .flex()
                                             .items_center()
                                             .w_full()
                                             .overflow_hidden()
                                             .gap(px(4.0))
                                             .pl(px(8.0 + 12.0 * depth as f32))
-                                            .py(px(2.0))
+                                            .h(ROW_HEIGHT)
                                             .on_click({
                                                 let node_id = node_id.clone();
                                                 let sidebar_entity = sidebar_entity.clone();
                                                 move |_event: &ClickEvent,
                                                       window: &mut Window,
                                                       cx: &mut App| {
-                                                    window.focus(&row_focus);
+                                                    window.focus(&row_focus, cx);
                                                     cx.stop_propagation();
 
                                                     sidebar_entity.update(cx, |sidebar, cx| {
@@ -659,7 +650,7 @@ impl Render for Sidebar {
                                                 }
                                             })
                                             .border_l_2()
-                                            .border_color(gpui::transparent_black())
+                                            .border_color(gpui_kit::transparent_black())
                                             .when(!selected, |s| {
                                                 s.hover(|s| s.bg(theme_list_hover))
                                             })
@@ -669,92 +660,43 @@ impl Render for Sidebar {
                                                     .hover(|s| s.bg(theme_list_active))
                                             })
                                             .cursor_pointer()
-                                            .tooltip({
-                                                let tooltip = format!(
-                                                    "{node_kind}: {label}. Press Enter to open, Arrow keys to navigate."
-                                                );
-                                                move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx)
+                                            .tooltip(move |window, cx| {
+                                                Tooltip::new(row_tooltip.clone()).build(window, cx)
                                             })
                                             // Chevron for expandable items — single-click to toggle
                                             .when(is_folder, |this| {
                                                 let chevron_node_id = node_id.clone();
                                                 let chevron_sidebar = sidebar_entity.clone();
-                                                let chevron_state = state_clone.clone();
-                                                let chevron_db = db_name.clone();
-                                                let chevron_connection_id = connection_id;
-                                                let chevron_is_connection = is_connection;
-                                                let chevron_is_database = is_database;
-                                                let chevron_is_loading = is_loading_db;
                                                 this.child(
                                                     div()
-                                                        .id(("chevron", ix))
+                                                        .id("chevron")
                                                         .flex()
+                                                        .flex_shrink_0()
                                                         .items_center()
                                                         .justify_center()
                                                         .size(px(18.0))
-                                                        .rounded(px(4.0))
+                                                        .rounded(crate::theme::borders::radius_sm())
                                                         .cursor_pointer()
                                                         .hover(|s| s.bg(theme_foreground.opacity(0.1)))
                                                         .tooltip({
-                                                            let action = if is_expanded { "Collapse" } else { "Expand" };
-                                                            let tooltip = format!("{action} {label}");
-                                                            move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx)
+                                                            let label = label.clone();
+                                                            move |window, cx| {
+                                                                let action = if is_expanded { "Collapse" } else { "Expand" };
+                                                                Tooltip::new(format!("{action} {label}")).build(window, cx)
+                                                            }
                                                         })
-                                                        .on_mouse_down(MouseButton::Left, move |_event, _window, cx| {
+                                                        // Toggles on press, not release, so it answers at once.
+                                                        // Option-click closes the whole subtree.
+                                                        .on_mouse_down(MouseButton::Left, move |event, _window, cx| {
                                                             cx.stop_propagation();
-
-                                                            let currently_expanded = chevron_sidebar
-                                                                .update(cx, |sidebar, _cx| {
-                                                                    sidebar.model.expanded_nodes.contains(&chevron_node_id)
-                                                                });
-                                                            let should_expand = !currently_expanded;
                                                             chevron_sidebar.update(cx, |sidebar, cx| {
-                                                                if should_expand {
-                                                                    sidebar.model.expanded_nodes.insert(chevron_node_id.clone());
-                                                                } else {
-                                                                    sidebar.model.expanded_nodes.remove(&chevron_node_id);
-                                                                }
-                                                                sidebar.persist_expanded_nodes(cx);
-                                                                sidebar.refresh_tree(cx);
+                                                                sidebar.set_node_expanded(
+                                                                    &chevron_node_id,
+                                                                    !is_expanded,
+                                                                    event.modifiers.alt,
+                                                                    cx,
+                                                                );
                                                             });
-
-                                                            // For connections: connect if not connected
-                                                            if chevron_is_connection && should_expand {
-                                                                let is_connected = chevron_state.read(cx)
-                                                                    .active_connection_by_id(chevron_connection_id)
-                                                                    .is_some();
-                                                                if !is_connected {
-                                                                    AppCommands::connect(
-                                                                        chevron_state.clone(),
-                                                                        chevron_connection_id,
-                                                                        cx,
-                                                                    );
-                                                                }
-                                                            }
-
-                                                            // For databases: load collections if needed
-                                                            if chevron_is_database && should_expand && !chevron_is_loading
-                                                                && let Some(ref db) = chevron_db
-                                                            {
-                                                                let should_load = chevron_state
-                                                                    .read(cx)
-                                                                    .active_connection_by_id(chevron_connection_id)
-                                                                    .is_some_and(|conn| {
-                                                                        !conn.collections.contains_key(db)
-                                                                    });
-                                                                if should_load {
-                                                                    chevron_sidebar.update(cx, |sidebar, cx| {
-                                                                        sidebar.model.loading_databases.insert(chevron_node_id.clone());
-                                                                        cx.notify();
-                                                                    });
-                                                                    AppCommands::load_collections(
-                                                                        chevron_state.clone(),
-                                                                        chevron_connection_id,
-                                                                        db.clone(),
-                                                                        cx,
-                                                                    );
-                                                                }
-                                                            }
                                                         })
                                                         .child(
                                                             Icon::new(if is_expanded {
@@ -769,14 +711,59 @@ impl Render for Sidebar {
                                             })
                                             // Spacer for non-folders (align with chevron)
                                             .when(!is_folder, |this| {
-                                                this.child(div().w(sizing::icon_sm()))
+                                                // A connection row keeps the chevron's width while it
+                                                // connects, so its name does not shift once it opens.
+                                                this.child(div().flex_shrink_0().w(if is_connection {
+                                                    px(18.0)
+                                                } else {
+                                                    sizing::icon_sm()
+                                                }))
                                             })
                                             // Connection: server icon (green)
                                             .when(is_connection, |this| {
+                                                // The spinner takes the icon's slot, so the row never reflows.
                                                 this.child(
-                                                    Icon::new(IconName::Globe)
+                                                    div()
+                                                        .flex()
+                                                        .flex_shrink_0()
+                                                        .items_center()
+                                                        .justify_center()
                                                         .size(sizing::icon_md())
-                                                        .text_color(connection_accent.unwrap_or(theme_primary)),
+                                                        .child(if is_connecting {
+                                                            Spinner::new()
+                                                                .with_size(sizing::icon_sm())
+                                                                .color(theme_muted_foreground)
+                                                                .into_any_element()
+                                                        } else if let Some(failure) = connection_failures
+                                                            .get(&connection_id)
+                                                            .filter(|_| !is_connected)
+                                                        {
+                                                            // The last attempt failed; say why on hover.
+                                                            let tooltip = SharedString::from(format!(
+                                                                "Couldn't connect. {failure}"
+                                                            ));
+                                                            div()
+                                                                .id("connection-failure")
+                                                                .child(
+                                                                    Icon::new(IconName::TriangleAlert)
+                                                                        .size(sizing::icon_md())
+                                                                        .text_color(cx.theme().danger),
+                                                                )
+                                                                .tooltip(move |window, cx| {
+                                                                    gpui_kit::component::tooltip::Tooltip::new(tooltip.clone())
+                                                                        .build(window, cx)
+                                                                })
+                                                                .into_any_element()
+                                                        } else {
+                                                            Icon::new(IconName::Globe)
+                                                                .size(sizing::icon_md())
+                                                                .text_color(if is_connected {
+                                                                    connection_accent.unwrap_or(theme_primary)
+                                                                } else {
+                                                                    theme_muted_foreground
+                                                                })
+                                                                .into_any_element()
+                                                        }),
                                                 )
                                             })
                                             // Database: dashboard icon (blue)
@@ -787,13 +774,26 @@ impl Render for Sidebar {
                                                         .text_color(theme_info),
                                                 )
                                             })
-                                            // Collection: braces icon (amber)
+                                            // The kind rides on the icon, not on a tree level: braces
+                                            // for a collection, an eye for a view, a chart for time
+                                            // series. Server-internal namespaces are muted.
                                             .when(is_collection, |this| {
-                                                this.child(
-                                                    Icon::new(IconName::Braces)
-                                                        .size(sizing::icon_md())
-                                                        .text_color(theme_warning),
-                                                )
+                                                let icon = if is_view {
+                                                    Icon::new(IconName::Eye)
+                                                } else if is_timeseries {
+                                                    Icon::new(crate::assets::AppIcon::ChartLine)
+                                                } else {
+                                                    Icon::new(crate::assets::AppIcon::Braces)
+                                                };
+                                                // One color for every namespace: blue already means
+                                                // "database", so the glyph alone carries the kind.
+                                                this.child(icon.size(sizing::icon_md()).text_color(
+                                                    if is_system {
+                                                        theme_muted_foreground
+                                                    } else {
+                                                        theme_warning
+                                                    },
+                                                ))
                                             })
                                             // Label
                                             .child(
@@ -801,23 +801,54 @@ impl Render for Sidebar {
                                                     .flex_1()
                                                     .min_w(px(0.0))
                                                     .text_sm()
-                                                    .text_color(if selected {
+                                                    .text_color(if is_system {
+                                                        theme_muted_foreground
+                                                    } else if selected {
                                                         theme_foreground
                                                     } else {
                                                         theme_secondary_foreground
                                                     })
+                                                    .when(is_system, |label| label.italic())
                                                     .truncate()
                                                     .child(label.clone()),
                                             )
                                             .when_some(
                                                 is_connection.then_some(connection_identity).flatten(),
                                                 |this, identity| {
-                                                    this.child(connection_identity_badge(
-                                                        identity, false, cx,
-                                                    ))
+                                                    this.child(connection_identity_tags(identity, cx))
                                                 },
                                             )
-                                            .when(is_connecting || is_loading_db, |this| {
+                                            .when(is_connection && !is_connecting, |row| {
+                                                let state = state_clone.clone();
+                                                // Actions stay out of the way until the row is hovered or
+                                                // selected; the context menu and shortcuts reach them too.
+                                                row.child(
+                                                    div()
+                                                        .flex_shrink_0()
+                                                        .when(!selected, |slot| {
+                                                            slot.invisible()
+                                                                .group_hover("sidebar-row", |style| style.visible())
+                                                        })
+                                                        .child(
+                                                            Button::new(format!("connection-menu-{connection_id}"))
+                                                                .ghost()
+                                                                .xsmall()
+                                                                .icon(IconName::Ellipsis)
+                                                                .tooltip("Connection actions")
+                                                                .accessibility_label(format!("Actions for {label}"))
+                                                                .dropdown_menu(move |menu, window, cx| {
+                                                                    build_connection_menu(
+                                                                        menu,
+                                                                        state.clone(),
+                                                                        connection_id,
+                                                                        window,
+                                                                        cx,
+                                                                    )
+                                                                }),
+                                                        ),
+                                                )
+                                            })
+                                            .when(is_loading_db, |this| {
                                                 this.child(Spinner::new().xsmall())
                                             });
 
@@ -834,9 +865,7 @@ impl Render for Sidebar {
                                                         build_connection_menu(
                                                             menu,
                                                             state.clone(),
-                                                            sidebar_entity.clone(),
                                                             connection_id,
-                                                            connecting_id,
                                                             window,
                                                             cx,
                                                         )
@@ -881,86 +910,114 @@ impl Render for Sidebar {
                                         items.push(row);
                                     }
 
-                                    // Compute sticky connection header
-                                    sidebar.sticky_connection_index =
-                                        if !sidebar.model.entries.is_empty()
-                                            && visible_start > 0
-                                        {
-                                            SidebarModel::find_parent_connection_index(
-                                                &sidebar.model.entries,
-                                                visible_start,
-                                            )
-                                            .filter(|&idx| idx < visible_start)
-                                        } else {
-                                            None
-                                        };
-
                                     items
                                 },
                             )
                         })
-                        .flex_grow()
+                        .flex_grow(1.0)
                         .size_full()
-                        .track_scroll(scroll_handle)
-                        .with_sizing_behavior(ListSizingBehavior::Auto)
+                        .track_scroll(&scroll_handle)
                         .into_any_element()
                     }),
                     )
-                    // Sticky connection header overlay
-                    .when_some(sticky_info, |this, (idx, label, _connection_id, _is_connected, _is_connecting, accent, identity)| {
-                        let scroll_handle = self.scroll_handle.clone();
-                        let sidebar_entity = sidebar_entity.clone();
+                    // Pinned ancestors: the connection, then the database, of the rows under them.
+                    .when(!sticky_rows.is_empty(), |this| {
                         let sticky_bg = opaque_color(cx.theme().sidebar);
                         let sticky_hover_bg = opaque_color(cx.theme().list_hover);
                         this.child(
                             div()
-                                .id("sticky-connection-header")
                                 .absolute()
                                 .top_0()
                                 .left_0()
                                 .right_0()
                                 .flex()
-                                .items_center()
-                                .gap(px(4.0))
-                                .pl(px(8.0))
-                                .py(px(2.0))
+                                .flex_col()
                                 .bg(sticky_bg)
                                 .border_b_1()
                                 .border_color(cx.theme().border)
-                                .cursor_pointer()
-                                .hover(move |s| s.bg(sticky_hover_bg))
-                                .tooltip({
-                                    let label = label.clone();
-                                    move |window, cx| {
-                                        Tooltip::new(format!("Jump to connection: {label}"))
-                                            .build(window, cx)
-                                    }
-                                })
-                                .on_click(move |_: &ClickEvent, _window: &mut Window, cx: &mut App| {
-                                    scroll_handle.scroll_to_item(idx, gpui::ScrollStrategy::Top);
-                                    sidebar_entity.update(cx, |_sidebar, cx| {
-                                        cx.notify();
-                                    });
-                                })
-                                // Globe icon
-                                .child(
-                                    Icon::new(IconName::Globe)
-                                        .size(sizing::icon_md())
-                                        .text_color(accent),
-                                )
-                                // Label
-                                .child(
-                                    div()
-                                        .flex_1()
-                                        .min_w(px(0.0))
-                                        .text_sm()
-                                        .text_color(cx.theme().foreground)
-                                        .truncate()
-                                        .child(label),
-                                )
-                                .when_some(identity, |header, identity| {
-                                    header.child(connection_identity_badge(&identity, false, cx))
-                                }),
+                                .children(sticky_rows.iter().filter_map(|&ix| {
+                                    let entry = self.model.entries.get(ix)?;
+                                    let connection_id = entry.id.connection_id();
+                                    let is_connection = entry.id.is_connection();
+                                    let label = entry.label.clone();
+                                    let depth = entry.depth;
+                                    let scroll_handle = self.scroll_handle.clone();
+                                    let sidebar_entity = sidebar_entity.clone();
+                                    Some(
+                                        div()
+                                            .id((ElementId::from("sticky-row"), entry.id.to_tree_id()))
+                                            .flex()
+                                            .items_center()
+                                            .h(ROW_HEIGHT)
+                                            .gap(px(4.0))
+                                            // Same leading as a list row, so the label does not
+                                            // shift sideways as its row slides under the pin.
+                                            .border_l_2()
+                                            .border_color(gpui_kit::transparent_black())
+                                            .pl(px(8.0 + 12.0 * depth as f32))
+                                            .cursor_pointer()
+                                            .hover(move |s| s.bg(sticky_hover_bg))
+                                            .tooltip({
+                                                let label = label.clone();
+                                                move |window, cx| {
+                                                    Tooltip::new(format!("Jump to {label}"))
+                                                        .build(window, cx)
+                                                }
+                                            })
+                                            .on_click(move |_, _window, cx| {
+                                                scroll_handle.scroll_to_item_with_offset(
+                                                    ix,
+                                                    ScrollStrategy::Top,
+                                                    depth,
+                                                );
+                                                sidebar_entity.update(cx, |_, cx| cx.notify());
+                                            })
+                                            .child(
+                                                div()
+                                                    .flex()
+                                                    .flex_shrink_0()
+                                                    .items_center()
+                                                    .justify_center()
+                                                    .size(px(18.0))
+                                                    .child(
+                                                        Icon::new(IconName::ChevronDown)
+                                                            .size(sizing::icon_sm())
+                                                            .text_color(cx.theme().muted_foreground),
+                                                    ),
+                                            )
+                                            .child(if is_connection {
+                                                Icon::new(IconName::Globe)
+                                                    .size(sizing::icon_md())
+                                                    .text_color(
+                                                        connection_accents
+                                                            .get(&connection_id)
+                                                            .copied()
+                                                            .unwrap_or(cx.theme().primary),
+                                                    )
+                                            } else {
+                                                Icon::new(IconName::LayoutDashboard)
+                                                    .size(sizing::icon_md())
+                                                    .text_color(cx.theme().info)
+                                            })
+                                            .child(
+                                                div()
+                                                    .flex_1()
+                                                    .min_w(px(0.0))
+                                                    .text_sm()
+                                                    .text_color(cx.theme().foreground)
+                                                    .truncate()
+                                                    .child(label),
+                                            )
+                                            .when_some(
+                                                connection_identities
+                                                    .get(&connection_id)
+                                                    .filter(|_| is_connection),
+                                                |row, identity| {
+                                                    row.child(connection_identity_tags(identity, cx))
+                                                },
+                                            ),
+                                    )
+                                })),
                         )
                     })
                     // Typeahead query indicator
@@ -1010,4 +1067,26 @@ impl Render for Sidebar {
 fn opaque_color(mut color: Hsla) -> Hsla {
     color.a = 1.0;
     color
+}
+
+/// A small red count on a sidebar button, like "3" or "9+".
+fn count_badge(count: usize, cx: &App) -> Option<Div> {
+    (count > 0).then(|| {
+        div()
+            .absolute()
+            .top(px(-3.0))
+            .right(px(-4.0))
+            .min_w(px(14.0))
+            .h(px(14.0))
+            .px(px(3.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded_full()
+            .bg(cx.theme().danger)
+            .text_size(px(9.0))
+            .font_weight(FontWeight::SEMIBOLD)
+            .text_color(cx.theme().danger_foreground)
+            .child(if count > 9 { "9+".to_string() } else { count.to_string() })
+    })
 }

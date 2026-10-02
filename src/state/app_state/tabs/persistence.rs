@@ -19,9 +19,20 @@ impl AppState {
             (Some(conn_id), TabKey::Database(key)) => key.connection_id == conn_id,
             (Some(conn_id), TabKey::Transfer(key)) => key.connection_id == Some(conn_id),
             (Some(conn_id), TabKey::Forge(key)) => key.connection_id == conn_id,
+            (_, TabKey::Compare(_)) => true,
+            // A references tab holds an answer about one document, which may not be there next
+            // session. Restoring it would mean re-running the queries to say the same thing.
+            (_, TabKey::References(_)) => false,
+            // ponytail: the canvas is one click from the database tab, so it is not restored.
+            // Persist it if people start treating it as a place they live in.
+            (_, TabKey::Relations(_)) => false,
             (
                 _,
-                TabKey::AgentActivity | TabKey::Connections | TabKey::Settings | TabKey::Changelog,
+                TabKey::AgentActivity
+                | TabKey::Tasks
+                | TabKey::Connections
+                | TabKey::Settings
+                | TabKey::Changelog,
             ) => false,
             _ => false,
         };
@@ -63,7 +74,10 @@ impl AppState {
         // Persist AI panel state at workspace level
         self.workspace.ai_panel_open = self.ai_chat.panel_open;
         self.workspace.ai_draft_input = self.ai_chat.draft_input.replace(['\n', '\r'], " ");
-        self.workspace.ai_entries = self.ai_chat.entries.clone();
+        // The conversation itself goes to the assistant's encrypted store; the workspace keeps
+        // only the name of it.
+        self.workspace.ai_conversation_id = self.ai_chat.conversation_id;
+        self.ai_chat.save_conversation();
 
         self.update_workspace_selection();
     }
@@ -76,19 +90,24 @@ impl AppState {
         let workspace_tabs = self.workspace.open_tabs.clone();
         let mut restored_tabs: Vec<TabKey> = Vec::new();
         let mut restored_meta: Vec<(SessionKey, WorkspaceTab)> = Vec::new();
-        let mut restored_active_tab = None;
-        for (workspace_index, tab) in workspace_tabs.iter().enumerate() {
-            let restored_index = restored_tabs.len();
+        // Which restored tab each saved tab became, so the saved active index still points at
+        // the right tab when the same collection was open in two of them.
+        let mut restored_index: Vec<Option<usize>> = Vec::with_capacity(workspace_tabs.len());
+        for (saved_index, tab) in workspace_tabs.iter().enumerate() {
+            let before = restored_tabs.len();
             match tab.kind {
                 WorkspaceTabKind::Collection => {
                     if tab.collection.is_empty() {
                         continue;
                     }
                     if databases.contains(&tab.database) {
-                        let key = SessionKey::new(
+                        // A distinct view per saved tab, so two tabs on one collection restore
+                        // as two tabs rather than collapsing into one.
+                        let key = SessionKey::with_instance(
                             connection_id,
                             tab.database.clone(),
                             tab.collection.clone(),
+                            self.allocate_session_instance(),
                         );
                         restored_tabs.push(TabKey::Collection(key.clone()));
                         restored_meta.push((key, tab.clone()));
@@ -105,13 +124,8 @@ impl AppState {
                     // skip pushing as a tab.
                     self.ai_chat.panel_open = true;
                     self.ai_chat.draft_input = tab.ai_draft_input.replace(['\n', '\r'], " ");
-                    self.ai_chat.entries = tab.resolved_ai_entries();
                     self.ai_chat.is_loading = false;
                     self.ai_chat.last_error = None;
-                    if self.ai_chat.entries.len() > 200 {
-                        let extra = self.ai_chat.entries.len().saturating_sub(200);
-                        self.ai_chat.entries.drain(0..extra);
-                    }
                 }
                 WorkspaceTabKind::Transfer => {
                     let mut transfer_state = tab.transfer.clone().unwrap_or_default();
@@ -135,6 +149,29 @@ impl AppState {
                     self.transfer_tabs.insert(id, transfer_state);
                     restored_tabs.push(TabKey::Transfer(key));
                 }
+                WorkspaceTabKind::Compare => {
+                    if let Some(id) = self.compare_restored.get(&saved_index) {
+                        // A closed eager-restored tab stays closed; edits and running scans survive.
+                        if let Some(tab) = self.compare_tabs.get(id) {
+                            restored_tabs.push(TabKey::Compare(
+                                crate::state::compare::CompareTabKey {
+                                    id: *id,
+                                    connection_id: tab.config.sides[0].connection_id,
+                                },
+                            ));
+                        }
+                    } else {
+                        let config = tab.compare.clone().unwrap_or_default();
+                        let id = Uuid::new_v4();
+                        let key = crate::state::compare::CompareTabKey {
+                            id,
+                            connection_id: config.sides[0].connection_id,
+                        };
+                        self.compare_tabs
+                            .insert(id, crate::state::compare::CompareTabState::new(config));
+                        restored_tabs.push(TabKey::Compare(key));
+                    }
+                }
                 WorkspaceTabKind::Forge => {
                     if databases.contains(&tab.database) {
                         let id = Uuid::new_v4();
@@ -152,12 +189,11 @@ impl AppState {
                     }
                 }
             }
-
-            if restored_tabs.len() > restored_index
-                && self.workspace.active_tab == Some(workspace_index)
-            {
-                restored_active_tab = Some(restored_index);
-            }
+            restored_index.push(if restored_tabs.len() > before {
+                Some(restored_tabs.len() - 1)
+            } else {
+                None
+            });
         }
 
         // Restore workspace-level AI state (new format).
@@ -165,7 +201,16 @@ impl AppState {
         if !self.ai_chat.panel_open {
             self.ai_chat.panel_open = self.workspace.ai_panel_open;
             self.ai_chat.draft_input = self.workspace.ai_draft_input.replace(['\n', '\r'], " ");
-            self.ai_chat.entries = self.workspace.ai_entries.clone();
+            self.ai_chat.conversation_id = self.workspace.ai_conversation_id;
+            self.ai_chat.entries = match (&self.ai_chat.memory, self.ai_chat.conversation_id) {
+                (Some(memory), Some(id)) => {
+                    memory.load_timeline(&id.to_string()).unwrap_or_else(|error| {
+                        log::warn!("Could not read the stored conversation: {error}");
+                        Vec::new()
+                    })
+                }
+                _ => Vec::new(),
+            };
             self.ai_chat.is_loading = false;
             self.ai_chat.last_error = None;
             if self.ai_chat.entries.len() > 200 {
@@ -174,9 +219,23 @@ impl AppState {
             }
         }
 
-        self.tabs.open = restored_tabs;
+        for tab in &self.tabs.open {
+            if matches!(tab, TabKey::Compare(_)) && !restored_tabs.contains(tab) {
+                restored_tabs.push(tab.clone());
+            }
+        }
+        self.compare_restored.clear();
+        self.tabs.open = restored_tabs.clone();
         self.tabs.preview = None;
         self.tabs.dirty.clear();
+        // Tabs are replaced wholesale, so nothing can navigate back into the previous set.
+        // Navigation history is per-run state and is not persisted.
+        self.tabs.history.clear();
+
+        let active_tab = self
+            .workspace
+            .active_tab
+            .and_then(|index| restored_index.get(index).copied().flatten());
 
         for (key, tab) in restored_meta.iter() {
             let session = self.ensure_session(key.clone());
@@ -190,7 +249,7 @@ impl AppState {
             session.view.stats_open = matches!(restored_subview, CollectionSubview::Stats);
             restore_filter_option(&tab.filter_raw, &tab.filter_compiled_raw, |raw, doc| {
                 session.data.filter_raw = raw;
-                session.data.filter = doc;
+                session.data.set_filter(doc);
             });
             restore_doc_option(&tab.sort_raw, |raw, doc| {
                 session.data.sort_raw = raw;
@@ -220,7 +279,7 @@ impl AppState {
             }
         }
 
-        restored_active_tab
+        active_tab
     }
 
     fn build_workspace_tab(&self, tab: &TabKey) -> WorkspaceTab {
@@ -280,6 +339,7 @@ impl AppState {
                     collection: key.collection.clone(),
                     kind: WorkspaceTabKind::Collection,
                     transfer: None,
+                    compare: None,
                     filter_raw,
                     filter_compiled_raw,
                     sort_raw,
@@ -290,8 +350,6 @@ impl AppState {
                     forge_content: String::new(),
                     ai_panel_open: false,
                     ai_draft_input: String::new(),
-                    ai_entries: Vec::new(),
-                    ai_messages: Vec::new(),
                     table_column_widths,
                     table_column_order,
                     table_pinned_columns,
@@ -303,6 +361,7 @@ impl AppState {
                 collection: String::new(),
                 kind: WorkspaceTabKind::Database,
                 transfer: None,
+                compare: None,
                 filter_raw: String::new(),
                 filter_compiled_raw: String::new(),
                 sort_raw: String::new(),
@@ -313,8 +372,6 @@ impl AppState {
                 forge_content: String::new(),
                 ai_panel_open: false,
                 ai_draft_input: String::new(),
-                ai_entries: Vec::new(),
-                ai_messages: Vec::new(),
                 table_column_widths: HashMap::new(),
                 table_column_order: Vec::new(),
                 table_pinned_columns: HashSet::new(),
@@ -327,6 +384,7 @@ impl AppState {
                     collection: transfer.config.source_collection.clone(),
                     kind: WorkspaceTabKind::Transfer,
                     transfer: Some(transfer),
+                    compare: None,
                     filter_raw: String::new(),
                     filter_compiled_raw: String::new(),
                     sort_raw: String::new(),
@@ -337,14 +395,17 @@ impl AppState {
                     forge_content: String::new(),
                     ai_panel_open: false,
                     ai_draft_input: String::new(),
-                    ai_entries: Vec::new(),
-                    ai_messages: Vec::new(),
                     table_column_widths: HashMap::new(),
                     table_column_order: Vec::new(),
                     table_pinned_columns: HashSet::new(),
                     table_hidden_columns: HashSet::new(),
                 }
             }
+            TabKey::Compare(key) => WorkspaceTab {
+                kind: WorkspaceTabKind::Compare,
+                compare: self.compare_tabs.get(&key.id).map(|tab| tab.config.clone()),
+                ..Default::default()
+            },
             TabKey::Forge(key) => {
                 let content = self
                     .forge_tabs
@@ -360,6 +421,7 @@ impl AppState {
                         .unwrap_or_default(),
                     kind: WorkspaceTabKind::Forge,
                     transfer: None,
+                    compare: None,
                     filter_raw: String::new(),
                     filter_compiled_raw: String::new(),
                     sort_raw: String::new(),
@@ -370,21 +432,26 @@ impl AppState {
                     forge_content: content,
                     ai_panel_open: false,
                     ai_draft_input: String::new(),
-                    ai_entries: Vec::new(),
-                    ai_messages: Vec::new(),
                     table_column_widths: HashMap::new(),
                     table_column_order: Vec::new(),
                     table_pinned_columns: HashSet::new(),
                     table_hidden_columns: HashSet::new(),
                 }
             }
-            TabKey::AgentActivity | TabKey::Connections | TabKey::Settings | TabKey::Changelog => {
-                // Utility tabs are not persisted in workspace
+            TabKey::References(_)
+            | TabKey::Relations(_)
+            | TabKey::AgentActivity
+            | TabKey::Tasks
+            | TabKey::Connections
+            | TabKey::Settings
+            | TabKey::Changelog => {
+                // Utility and result tabs are not persisted in workspace
                 WorkspaceTab {
                     database: String::new(),
                     collection: String::new(),
                     kind: WorkspaceTabKind::Database, // Placeholder, won't be saved
                     transfer: None,
+                    compare: None,
                     filter_raw: String::new(),
                     filter_compiled_raw: String::new(),
                     sort_raw: String::new(),
@@ -395,8 +462,6 @@ impl AppState {
                     forge_content: String::new(),
                     ai_panel_open: false,
                     ai_draft_input: String::new(),
-                    ai_entries: Vec::new(),
-                    ai_messages: Vec::new(),
                     table_column_widths: HashMap::new(),
                     table_column_order: Vec::new(),
                     table_pinned_columns: HashSet::new(),
@@ -440,7 +505,17 @@ impl AppState {
                     self.workspace.selected_collection =
                         self.forge_tabs.get(&key.id).and_then(|state| state.collection.clone());
                 }
+                TabKey::References(key) => {
+                    self.workspace.selected_database = Some(key.database.clone());
+                    self.workspace.selected_collection = Some(key.collection.clone());
+                }
+                TabKey::Relations(key) => {
+                    self.workspace.selected_database = Some(key.database.clone());
+                    self.workspace.selected_collection = None;
+                }
+                TabKey::Compare(_) => {}
                 TabKey::AgentActivity
+                | TabKey::Tasks
                 | TabKey::Connections
                 | TabKey::Settings
                 | TabKey::Changelog => {
@@ -693,7 +768,7 @@ mod tests {
 
         let tab = &state.workspace.open_tabs[0];
         assert_eq!(tab.filter_raw, "status:active");
-        assert_eq!(tab.filter_compiled_raw, "{status: \"active\"}");
+        assert_eq!(tab.filter_compiled_raw, "{ status: \"active\" }");
     }
 
     #[test]
@@ -706,6 +781,7 @@ mod tests {
             collection: "col".to_string(),
             kind: WorkspaceTabKind::Collection,
             transfer: None,
+            compare: None,
             filter_raw: "status:active".to_string(),
             filter_compiled_raw: "{status: \"active\"}".to_string(),
             sort_raw: String::new(),
@@ -716,8 +792,6 @@ mod tests {
             forge_content: String::new(),
             ai_panel_open: false,
             ai_draft_input: String::new(),
-            ai_entries: Vec::new(),
-            ai_messages: Vec::new(),
             table_column_widths: HashMap::new(),
             table_column_order: Vec::new(),
             table_pinned_columns: HashSet::new(),
@@ -725,7 +799,9 @@ mod tests {
         });
 
         let _active = state.restore_tabs_from_workspace(conn_id, &["db".to_string()]);
-        let session = SessionKey::new(conn_id, "db", "col");
+        let TabKey::Collection(session) = state.open_tabs()[0].clone() else {
+            panic!("a collection tab should restore");
+        };
         let data = state.session_data(&session).expect("session should restore");
 
         assert_eq!(data.filter_raw, "status:active");
@@ -741,17 +817,26 @@ mod tests {
         state.conn.selected_database = Some("db".to_string());
         state.conn.selected_collection = Some("col".to_string());
 
+        // The conversation travels through the assistant's store, not the workspace file: both
+        // sides share one store, as they do in the app.
+        let memory = crate::ai::memory::ChatMemory::in_memory().expect("memory");
+        state.ai_chat.memory = Some(memory.clone());
         state.ai_chat.panel_open = true;
         state.ai_chat.draft_input = "draft question".to_string();
+        state.ai_chat.conversation_id = Some(Uuid::new_v4());
         state.ai_chat.begin_turn("hello");
 
         state.update_workspace_tabs();
-        // AI state is now persisted at workspace level, not as a tab
         assert!(state.workspace.ai_panel_open);
         assert_eq!(state.workspace.ai_draft_input, "draft question");
+        assert_eq!(state.workspace.ai_conversation_id, state.ai_chat.conversation_id);
+
+        let saved = serde_json::to_string(&state.workspace).expect("workspace json");
+        assert!(!saved.contains("hello"), "the question must not be written to the workspace file");
 
         let mut restored = AppState::new();
-        restored.workspace = state.workspace.clone();
+        restored.ai_chat.memory = Some(memory);
+        restored.workspace = serde_json::from_str(&saved).expect("workspace");
         let _active = restored.restore_tabs_from_workspace(conn_id, &["db".to_string()]);
         assert!(restored.ai_chat.panel_open);
         assert_eq!(restored.ai_chat.draft_input, "draft question");
@@ -771,6 +856,7 @@ mod tests {
             collection: "col".to_string(),
             kind: WorkspaceTabKind::Ai,
             transfer: None,
+            compare: None,
             filter_raw: String::new(),
             filter_compiled_raw: String::new(),
             sort_raw: String::new(),
@@ -781,8 +867,6 @@ mod tests {
             forge_content: String::new(),
             ai_panel_open: true,
             ai_draft_input: "old draft".to_string(),
-            ai_entries: Vec::new(),
-            ai_messages: Vec::new(),
             table_column_widths: HashMap::new(),
             table_column_order: Vec::new(),
             table_pinned_columns: HashSet::new(),
@@ -794,5 +878,50 @@ mod tests {
         assert!(state.tabs.open.is_empty());
         assert!(state.ai_chat.panel_open);
         assert_eq!(state.ai_chat.draft_input, "old draft");
+    }
+
+    /// Serde fills the rest; only the fields a restore reads are worth stating here.
+    fn saved_collection_tab(collection: &str, filter_raw: &str) -> WorkspaceTab {
+        serde_json::from_value(serde_json::json!({
+            "database": "db",
+            "collection": collection,
+            "kind": "Collection",
+            "filter_raw": filter_raw,
+            "filter_compiled_raw": "",
+        }))
+        .expect("a collection tab")
+    }
+
+    #[test]
+    fn two_saved_tabs_on_one_collection_restore_as_two_views() {
+        let mut state = AppState::new();
+        let conn_id = Uuid::new_v4();
+        state.conn.selected_connection = Some(conn_id);
+        state.workspace.open_tabs = vec![
+            saved_collection_tab("col", "{ a: 1 }"),
+            saved_collection_tab("other", ""),
+            saved_collection_tab("col", "{ b: 2 }"),
+        ];
+        state.workspace.active_tab = Some(2);
+
+        let active = state.restore_tabs_from_workspace(conn_id, &["db".to_string()]);
+
+        assert_eq!(state.open_tabs().len(), 3);
+        let keys: Vec<SessionKey> = state
+            .open_tabs()
+            .iter()
+            .map(|tab| match tab {
+                TabKey::Collection(key) => key.clone(),
+                _ => panic!("only collection tabs were saved"),
+            })
+            .collect();
+        assert_ne!(keys[0], keys[2], "two tabs on one collection are two views");
+        assert_eq!(state.session_data(&keys[0]).unwrap().filter_raw, "{ a: 1 }");
+        assert_eq!(
+            state.session_data(&keys[2]).unwrap().filter_raw,
+            "{ b: 2 }",
+            "each tab keeps its own filter"
+        );
+        assert_eq!(active, Some(2), "the saved active tab is still the third one");
     }
 }

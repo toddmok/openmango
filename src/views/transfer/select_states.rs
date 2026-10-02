@@ -1,8 +1,8 @@
 //! Select state initialization and management for transfer view.
 
-use gpui::*;
-use gpui_component::input::{InputEvent, InputState};
-use gpui_component::select::{SearchableVec, SelectEvent, SelectItem, SelectState};
+use gpui_kit::component::input::{InputEvent, InputState};
+use gpui_kit::component::select::{SearchableVec, SelectEvent, SelectItem, SelectState};
+use gpui_kit::*;
 use uuid::Uuid;
 
 use crate::components::{ConnectionIdentity, connection_identity_badge};
@@ -12,10 +12,12 @@ use super::TransferView;
 
 /// Custom SelectItem for connections (stores UUID + display name).
 #[derive(Clone, Debug)]
-pub(super) struct ConnectionItem {
+pub(crate) struct ConnectionItem {
     pub id: Uuid,
     pub name: SharedString,
     pub identity: ConnectionIdentity,
+    /// Listed although closed; picking it opens the connection.
+    pub closed: bool,
 }
 
 impl SelectItem for ConnectionItem {
@@ -26,7 +28,25 @@ impl SelectItem for ConnectionItem {
     }
 
     fn render(&self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
-        connection_identity_badge(&self.identity, true, cx)
+        use gpui_kit::component::ActiveTheme as _;
+        use gpui_kit::prelude::FluentBuilder as _;
+        div()
+            .w_full()
+            .min_w_0()
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap(crate::theme::spacing::sm())
+            .child(connection_identity_badge(&self.identity, true, cx))
+            .when(self.closed, |row| {
+                row.child(
+                    div()
+                        .flex_shrink_0()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child("Not connected"),
+                )
+            })
     }
 
     fn value(&self) -> &Self::Value {
@@ -319,7 +339,7 @@ impl TransferView {
 
         let export_path_input_state = cx.new(|cx| {
             let mut input_state =
-                InputState::new(window, cx).placeholder("Select folder or enter path...");
+                InputState::new(window, cx).placeholder("Select folder or enter path…");
             input_state.set_value(current_file_path, window, cx);
             input_state
         });
@@ -340,13 +360,13 @@ impl TransferView {
         };
 
         let dest_db_input_state = cx.new(|cx| {
-            let mut input_state = InputState::new(window, cx).placeholder("Database name...");
+            let mut input_state = InputState::new(window, cx).placeholder("Database name…");
             input_state.set_value(current_dest_database, window, cx);
             input_state
         });
 
         let dest_coll_input_state = cx.new(|cx| {
-            let mut input_state = InputState::new(window, cx).placeholder("Collection name...");
+            let mut input_state = InputState::new(window, cx).placeholder("Collection name…");
             input_state.set_value(current_dest_collection, window, cx);
             input_state
         });

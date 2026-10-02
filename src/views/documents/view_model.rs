@@ -4,10 +4,10 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 
-use gpui::*;
-use gpui_component::input::{InputEvent, InputState, NumberInputEvent, StepAction};
-use gpui_component::table::TableState;
-use gpui_component::tree::{TreeItem, TreeState};
+use gpui_kit::component::input::{InputEvent, InputState};
+use gpui_kit::component::table::TableState;
+use gpui_kit::component::tree::{TreeItem, TreeState};
+use gpui_kit::*;
 use mongodb::bson::{Bson, Document};
 
 use crate::bson::{DocumentKey, PathSegment, bson_value_for_edit, parse_edited_value};
@@ -18,7 +18,6 @@ use crate::views::documents::node_meta::NodeMeta;
 use crate::views::documents::table::aggregation_table_delegate::AggregationTableDelegate;
 use crate::views::documents::table::document_table_delegate::DocumentTableDelegate;
 use crate::views::documents::tree::document_tree::build_documents_tree;
-use crate::views::documents::types::InlineEditor;
 
 use super::CollectionView;
 
@@ -41,10 +40,8 @@ pub struct DocumentViewModel {
     tree_order: Arc<[String]>,
     tree_cache: HashMap<SessionKey, CachedTreeState>,
     cache_epoch: u64,
-    inline_editor_state: Option<InlineEditor>,
-    inline_editor_subscription: Option<Subscription>,
+    inline_editor_state: Option<Entity<InputState>>,
     inline_value_subscription: Option<Subscription>,
-    inline_blur_subscription: Option<Subscription>,
     editing_node_id: Option<String>,
     editing_doc_key: Option<DocumentKey>,
     editing_path: Vec<PathSegment>,
@@ -88,9 +85,7 @@ impl DocumentViewModel {
             tree_cache: HashMap::new(),
             cache_epoch: 0,
             inline_editor_state: None,
-            inline_editor_subscription: None,
             inline_value_subscription: None,
-            inline_blur_subscription: None,
             editing_node_id: None,
             editing_doc_key: None,
             editing_path: Vec::new(),
@@ -129,12 +124,8 @@ impl DocumentViewModel {
         self.editing_node_id.clone()
     }
 
-    pub fn inline_state(&self) -> Option<InlineEditor> {
+    pub fn inline_state(&self) -> Option<Entity<InputState>> {
         self.inline_editor_state.clone()
-    }
-
-    pub fn set_inline_bool(&mut self, value: bool) {
-        self.inline_editor_state = Some(InlineEditor::Bool(value));
     }
 
     pub fn current_session(&self) -> Option<SessionKey> {
@@ -195,7 +186,6 @@ impl DocumentViewModel {
             self.tree_items = Arc::from(Vec::<TreeItem>::new());
             self.tree_order = Arc::from(Vec::<String>::new());
             self.inline_editor_state = None;
-            self.inline_editor_subscription = None;
             self.clear_inline_edit();
         } else {
             self.reset_view_state(cx);
@@ -260,7 +250,6 @@ impl DocumentViewModel {
         self.tree_items = Arc::from(Vec::<TreeItem>::new());
         self.tree_order = Arc::from(Vec::<String>::new());
         self.inline_editor_state = None;
-        self.inline_editor_subscription = None;
         self.clear_inline_edit();
 
         self.tree_state.update(cx, |tree, cx| {
@@ -289,7 +278,7 @@ impl DocumentViewModel {
             self.tree_order = cached.order;
 
             self.tree_state.update(cx, |tree, cx| {
-                tree.set_items_shared(cached.items, cx);
+                tree.set_items(cached.items.to_vec(), cx);
                 tree.set_selected_index(cached.selected_index, cx);
             });
             let items = self.tree_order.len();
@@ -312,15 +301,14 @@ impl DocumentViewModel {
             .as_ref()
             .and_then(|id| order.iter().position(|entry| entry == id));
 
-        // Share a single allocation between the view-model copy (used for
-        // caching) and the tree widget instead of deep-cloning the whole tree.
+        // Cache only the materialized nodes; descendants are built when expanded.
         let items: Arc<[TreeItem]> = Arc::from(items);
         self.node_meta = Arc::new(meta);
         self.tree_items = items.clone();
         self.tree_order = Arc::from(order);
 
         self.tree_state.update(cx, |tree, cx| {
-            tree.set_items_shared(items, cx);
+            tree.set_items(items.to_vec(), cx);
             tree.set_selected_index(selected_index, cx);
         });
         let items = self.tree_order.len();
@@ -350,9 +338,7 @@ impl DocumentViewModel {
         self.editing_original = None;
         self.editing_draft_before = None;
         self.inline_editor_state = None;
-        self.inline_editor_subscription = None;
         self.inline_value_subscription = None;
-        self.inline_blur_subscription = None;
     }
 
     pub fn begin_inline_edit(
@@ -366,7 +352,23 @@ impl DocumentViewModel {
         if !meta.is_editable {
             return;
         }
-        self.inline_editor_subscription = None;
+        if self.editing_node_id.is_some() {
+            self.commit_inline_edit(state, cx);
+            if self.editing_node_id.is_some() {
+                return;
+            }
+        }
+        if let Some(reason) = self
+            .current_session
+            .as_ref()
+            .and_then(|key| state.read(cx).document_field_edit_restriction(key))
+        {
+            state.update(cx, |state, cx| {
+                state.set_status_message(Some(crate::state::StatusMessage::error(reason)));
+                cx.notify();
+            });
+            return;
+        }
         let value = meta.value.as_ref();
         if let Some(Bson::String(text)) = value
             && (text.contains('\n') || text.contains('\r'))
@@ -386,68 +388,13 @@ impl DocumentViewModel {
             );
             return;
         }
-        let mut focus_state: Option<Entity<InputState>> = None;
-        let editor = match value {
-            Some(Bson::Boolean(current)) => InlineEditor::Bool(*current),
-            Some(Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_)) => {
-                let state = cx.new(|cx| InputState::new(window, cx));
-                if let Some(value) = value.map(bson_value_for_edit) {
-                    state.update(cx, |state, cx| {
-                        state.set_value(value, window, cx);
-                    });
-                }
-                focus_state = Some(state.clone());
-                let is_float = matches!(value, Some(Bson::Double(_)));
-                let subscription =
-                    cx.subscribe_in(&state, window, move |_view, state, event, window, cx| {
-                        let NumberInputEvent::Step(step) = event;
-                        let step = *step;
-                        let current = state.read(cx).value().to_string();
-                        let next = if is_float {
-                            let value = current.parse::<f64>().unwrap_or(0.0);
-                            let delta = match step {
-                                StepAction::Increment => 1.0,
-                                StepAction::Decrement => -1.0,
-                            };
-                            (value + delta).to_string()
-                        } else {
-                            let value = current.parse::<i64>().unwrap_or(0);
-                            let delta = match step {
-                                StepAction::Increment => 1,
-                                StepAction::Decrement => -1,
-                            };
-                            (value + delta).to_string()
-                        };
-                        state.update(cx, |input, cx| {
-                            input.set_value(next, window, cx);
-                        });
-                    });
-                self.inline_editor_subscription = Some(subscription);
-                InlineEditor::Number(state)
-            }
-            _ => {
-                let placeholder = match value {
-                    Some(Bson::DateTime(_)) => Some("2024-01-01T00:00:00Z"),
-                    Some(Bson::ObjectId(_)) => Some("507f1f77bcf86cd799439011"),
-                    Some(Bson::Null) => Some("null"),
-                    _ => None,
-                };
-                let state = cx.new(|cx| {
-                    let mut state = InputState::new(window, cx);
-                    if let Some(text) = placeholder {
-                        state = state.placeholder(text);
-                    }
-                    state
-                });
-                if let Some(value) = value.map(bson_value_for_edit) {
-                    state.update(cx, |state, cx| {
-                        state.set_value(value, window, cx);
-                    });
-                }
-                focus_state = Some(state.clone());
-                InlineEditor::Text(state)
-            }
-        };
+        // Every editable type uses the same text input and the same parsing contract:
+        // see `parse_edited_value`.
+        let placeholder = value.map(crate::bson::value_input_placeholder).unwrap_or_default();
+        let input = cx.new(|cx| InputState::new(window, cx).placeholder(placeholder));
+        if let Some(text) = value.map(bson_value_for_edit) {
+            input.update(cx, |input, cx| input.set_value(text, window, cx));
+        }
 
         self.editing_node_id = Some(node_id);
         self.editing_doc_key = Some(meta.doc_key.clone());
@@ -464,33 +411,18 @@ impl DocumentViewModel {
             });
         }
 
-        self.inline_editor_state = Some(editor);
-        if let Some(input) = &focus_state {
-            let app_state = state.clone();
-            let value_sub =
-                cx.subscribe_in(input, window, move |view, _state, event, _window, cx| {
-                    if matches!(event, InputEvent::Change) {
-                        view.view_model.sync_inline_edit_draft(&app_state, cx);
-                    }
-                });
-            self.inline_value_subscription = Some(value_sub);
-
-            let app_state = state.clone();
-            let blur_sub =
-                cx.subscribe_in(input, window, move |view, _state, event, _window, cx| {
-                    if matches!(event, InputEvent::Blur) {
-                        view.view_model.commit_inline_edit(&app_state, cx);
-                        cx.notify();
-                    }
-                });
-            self.inline_blur_subscription = Some(blur_sub);
-        }
-        if let Some(input) = focus_state {
-            let focus = input.read(cx).focus_handle(cx);
-            window.defer(cx, move |window, _cx| {
-                window.focus(&focus);
-            });
-        }
+        let app_state = state.clone();
+        self.inline_value_subscription =
+            Some(cx.subscribe_in(&input, window, move |view, _state, event, _window, cx| {
+                if matches!(event, InputEvent::Change) {
+                    view.view_model.sync_inline_edit_draft(&app_state, cx);
+                }
+            }));
+        let focus = input.read(cx).focus_handle(cx);
+        self.inline_editor_state = Some(input);
+        window.defer(cx, move |window, cx| {
+            window.focus(&focus, cx);
+        });
     }
 
     fn inline_edited_value(&self, cx: &App) -> Result<Bson, String> {
@@ -502,13 +434,18 @@ impl DocumentViewModel {
             .inline_editor_state
             .as_ref()
             .ok_or_else(|| "Inline editor is unavailable".to_string())?;
-        match (editor, original) {
-            (InlineEditor::Bool(value), Bson::Boolean(_)) => Ok(Bson::Boolean(*value)),
-            (InlineEditor::Text(state), _) | (InlineEditor::Number(state), _) => {
-                parse_edited_value(original, state.read(cx).value().as_ref())
-            }
-            _ => Err("Unsupported inline editor state".to_string()),
-        }
+        parse_edited_value(original, editor.read(cx).value().as_ref())
+    }
+
+    pub fn inline_edit_error(&self, cx: &App) -> Option<String> {
+        self.inline_editor_state.as_ref()?;
+        self.inline_edited_value(cx).err()
+    }
+
+    pub fn inline_input_focused(&self, window: &Window, cx: &App) -> bool {
+        self.inline_editor_state
+            .as_ref()
+            .is_some_and(|input| input.read(cx).focus_handle(cx).is_focused(window))
     }
 
     pub(crate) fn sync_inline_edit_draft(
@@ -598,6 +535,14 @@ impl DocumentViewModel {
                 if let Some(session_key) = self.current_session.clone() {
                     state.update(cx, |state, cx| {
                         state.set_invalid_inline_edit(session_key, true);
+                        // The row shows this under the field being edited.
+                        state.record_error(
+                            crate::error::ErrorReport::new(
+                                "Invalid field value",
+                                crate::error::sentence(&err.to_string()),
+                            )
+                            .kind(crate::error::ErrorKind::Validation),
+                        );
                         cx.notify();
                     });
                 }
@@ -657,10 +602,8 @@ impl DocumentViewModel {
         });
 
         // Subscribe to table events for row selection and double-click.
-        let state_clone = state.clone();
-        let view_clone = view.clone();
         cx.subscribe_in(&table_state, window, move |cv, ts, event, window, cx| {
-            use gpui_component::table::TableEvent;
+            use gpui_kit::component::table::TableEvent;
             match event {
                 TableEvent::SelectRow(row_ix) => {
                     let row_ix = *row_ix;
@@ -686,14 +629,7 @@ impl DocumentViewModel {
                     let session_key = cv.view_model.current_session();
                     let doc_key = ts.read(cx).delegate().document_key(row_ix);
                     if let (Some(sk), Some(dk)) = (session_key, doc_key) {
-                        CollectionView::open_document_json_editor(
-                            view_clone.clone(),
-                            state_clone.clone(),
-                            sk,
-                            dk,
-                            window,
-                            cx,
-                        );
+                        cv.open_document_json(sk, dk, window, cx);
                     }
                 }
                 TableEvent::ColumnWidthsChanged(widths) => {
@@ -805,6 +741,12 @@ impl DocumentViewModel {
         self.table_generation = None;
     }
 
+    /// Drop every cached tree. Their rows hold formatted text, which a display setting such as
+    /// the date zone makes stale without the session's data changing.
+    pub fn clear_tree_cache(&mut self) {
+        self.tree_cache.clear();
+    }
+
     // ── Aggregation table ────────────────────────────────────────────
 
     pub fn agg_table_state(&self) -> Option<&Entity<TableState<AggregationTableDelegate>>> {
@@ -830,7 +772,7 @@ impl DocumentViewModel {
 
         let state_clone = state.clone();
         cx.subscribe_in(&agg_table, window, move |cv, ts, event, _window, cx| {
-            use gpui_component::table::TableEvent;
+            use gpui_kit::component::table::TableEvent;
             match event {
                 TableEvent::ColumnWidthsChanged(widths) => {
                     let col_widths: HashMap<String, f32> = {
@@ -891,8 +833,13 @@ impl DocumentViewModel {
         let Some(session) = state_ref.session(&session_key) else {
             return;
         };
-        let run_gen =
-            session.data.aggregation.run_generation.load(std::sync::atomic::Ordering::Relaxed);
+        // Keyed by the results allocation: edits bump the run generation but keep results.
+        let run_gen = session
+            .data
+            .aggregation
+            .results
+            .as_ref()
+            .map_or(0, |results| std::sync::Arc::as_ptr(results) as u64);
         let gen_changed =
             self.agg_table_generation != Some(run_gen) || self.agg_table_state.is_none();
 
@@ -931,8 +878,67 @@ impl DocumentViewModel {
         if let Some(ref state) = self.col_visibility_search {
             return state.clone();
         }
-        let state = cx.new(|cx| InputState::new(window, cx).placeholder("Search columns..."));
+        let state = cx.new(|cx| InputState::new(window, cx).placeholder("Search columns…"));
         self.col_visibility_search = Some(state.clone());
         state
+    }
+}
+
+#[cfg(test)]
+mod inline_edit_tests {
+    use gpui_kit::AppContext as _;
+    use gpui_kit::component::input::InputState;
+    use mongodb::bson::{Bson, doc};
+
+    use super::CollectionView;
+    use crate::bson::{DocumentKey, PathSegment, path_to_id};
+    use crate::state::{AppState, SessionDocument, SessionKey};
+
+    #[gpui_kit::test]
+    fn cancel_restores_the_prior_draft_without_losing_other_field_changes(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        cx.update(gpui_kit::init);
+        let cx = cx.add_empty_window();
+        cx.update(|window, cx| {
+            let key = SessionKey::new(uuid::Uuid::new_v4(), "db", "collection");
+            let original = doc! { "_id": 1, "enabled": false, "name": "original" };
+            let document = DocumentKey::from_document(&original, 0);
+            let previous = doc! { "_id": 1, "enabled": false, "name": "staged" };
+            let state = cx.new(|_| AppState::new());
+            state.update(cx, |state, _| {
+                let session = state.ensure_session(key.clone());
+                session.data.index_by_key.insert(document.clone(), 0);
+                session.data.items.push(SessionDocument { key: document.clone(), doc: original });
+                state.set_draft(&key, document.clone(), previous.clone());
+            });
+            let view = cx.new(|cx| CollectionView::new(state.clone(), cx));
+            let input = cx.new(|cx| InputState::new(window, cx));
+            input.update(cx, |input, cx| input.set_value("true", window, cx));
+            view.update(cx, |view, cx| {
+                let model = &mut view.view_model;
+                let path = vec![PathSegment::Key("enabled".into())];
+                model.current_session = Some(key.clone());
+                model.editing_node_id = Some(path_to_id(&document, &path));
+                model.editing_doc_key = Some(document.clone());
+                model.editing_path = path;
+                model.editing_original = Some(Bson::Boolean(false));
+                model.editing_draft_before = Some(previous.clone());
+                model.inline_editor_state = Some(input.clone());
+                model.sync_inline_edit_draft(&state, cx);
+                assert!(
+                    state
+                        .read(cx)
+                        .session_draft(&key, &document)
+                        .unwrap()
+                        .get_bool("enabled")
+                        .unwrap()
+                );
+                model.cancel_inline_edit(&state, cx);
+                assert_eq!(state.read(cx).session_draft(&key, &document), Some(previous));
+                assert!(model.editing_node_id().is_none());
+                assert!(!state.read(cx).session_has_invalid_edit(&key));
+            });
+        });
     }
 }

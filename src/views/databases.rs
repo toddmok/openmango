@@ -1,10 +1,13 @@
-use gpui::*;
-use gpui_component::ActiveTheme as _;
-use gpui_component::Sizable as _;
-use gpui_component::scroll::ScrollableElement;
-use gpui_component::spinner::Spinner;
+use gpui_kit::component::ActiveTheme as _;
+use gpui_kit::component::Disableable as _;
+use gpui_kit::component::Sizable as _;
+use gpui_kit::component::button::ButtonVariants as _;
+use gpui_kit::component::scroll::ScrollableElement;
+use gpui_kit::component::spinner::Spinner;
+use gpui_kit::*;
 
-use crate::components::{Button, request_preview_collection};
+use crate::components::{Button, ErrorCallout, request_preview_collection};
+use crate::error::ErrorReport;
 use crate::helpers::{format_bytes, format_number};
 use crate::state::{
     AppCommands, AppEvent, AppState, CollectionOverview, DatabaseKey, DatabaseStats, View,
@@ -96,7 +99,7 @@ impl Render for DatabaseView {
         let state = self.state.clone();
         let refresh_button = Button::new("refresh-db")
             .ghost()
-            .compact()
+            .xsmall()
             .label("Refresh")
             .disabled(database_key.is_none())
             .on_click({
@@ -110,7 +113,7 @@ impl Render for DatabaseView {
                 }
             });
         let transfer_button = Button::new("open-transfer-db")
-            .compact()
+            .xsmall()
             .label("Transfer")
             .disabled(database_key.is_none())
             .on_click({
@@ -163,6 +166,7 @@ impl Render for DatabaseView {
                 state.clone(),
                 cx,
             ))
+            .child(Self::render_relations_section(&database_name, state.clone(), cx))
             .child(Self::render_collections_section(
                 collections,
                 collections_loading,
@@ -217,37 +221,36 @@ impl DatabaseView {
 
         if stats_loading {
             row = row.child(Spinner::new().small()).child(
-                div().text_sm().text_color(cx.theme().muted_foreground).child("Loading stats..."),
+                div().text_sm().text_color(cx.theme().muted_foreground).child("Loading stats…"),
             );
             return section.child(row).into_any_element();
         }
 
-        if let Some(_error) = stats_error {
-            row = row
+        if let Some(error) = stats_error {
+            let retry = Button::new("retry-db-stats")
+                .xsmall()
+                .label("Retry")
+                .disabled(database_key.is_none())
+                .on_click({
+                    let state = state.clone();
+                    let key = database_key.clone();
+                    move |_: &ClickEvent, _window: &mut Window, cx: &mut App| {
+                        let Some(key) = key.clone() else {
+                            return;
+                        };
+                        AppCommands::reload_database(state.clone(), key, cx);
+                    }
+                });
+            return section
                 .child(
-                    div()
-                        .text_sm()
-                        .text_color(cx.theme().danger_foreground)
-                        .child("Database stats failed. See banner for details."),
+                    ErrorCallout::new(
+                        "db-stats-error",
+                        ErrorReport::from_message("Couldn't load database stats", &error),
+                    )
+                    .action(retry)
+                    .state(state.clone()),
                 )
-                .child(
-                    Button::new("retry-db-stats")
-                        .ghost()
-                        .compact()
-                        .label("Retry")
-                        .disabled(database_key.is_none())
-                        .on_click({
-                            let state = state.clone();
-                            let key = database_key.clone();
-                            move |_: &ClickEvent, _window: &mut Window, cx: &mut App| {
-                                let Some(key) = key.clone() else {
-                                    return;
-                                };
-                                AppCommands::reload_database(state.clone(), key, cx);
-                            }
-                        }),
-                );
-            return section.child(row).into_any_element();
+                .into_any_element();
         }
 
         let Some(stats) = stats else {
@@ -269,6 +272,152 @@ impl DatabaseView {
         section.child(row).into_any_element()
     }
 
+    /// What this database's fields point at, and a way to find out.
+    ///
+    /// It lives here because inference is a database-wide read: it samples every collection and
+    /// asks each one's neighbours, so the database is the scope that matches the work.
+    #[allow(clippy::too_many_arguments)]
+    fn render_relations_section(
+        database_name: &str,
+        state: Entity<AppState>,
+        cx: &App,
+    ) -> AnyElement {
+        let state_ref = state.read(cx);
+        let known = state_ref.relation_count(database_name);
+        // Another database's search still blocks this one, so say whose it is.
+        let run = state_ref.inference_run().filter(|run| run.database == database_name).cloned();
+        let last_run = state_ref
+            .inference_summary()
+            .filter(|summary| summary.database == database_name)
+            .cloned();
+        let last_line = last_run.as_ref().map(|summary| summary.line());
+        // Worth copying only when there is something to read beyond the counts.
+        // Only when something actually failed. Fields that matched nothing are explained by
+        // the summary line itself, and a copy button for them was debugging scaffolding.
+        let report = last_run
+            .filter(|summary| !summary.failed_collections.is_empty())
+            .map(|summary| summary.report());
+        let busy_elsewhere = state_ref.inference_run().is_some() && run.is_none();
+
+        let mut row = div()
+            .flex()
+            .items_center()
+            .gap(spacing::lg())
+            .px(spacing::lg())
+            .py(spacing::sm())
+            .bg(cx.theme().tab_bar)
+            .border_1()
+            .border_color(cx.theme().border)
+            .rounded(borders::radius_sm());
+
+        row = match &run {
+            Some(run) => row
+                .child(Spinner::new().small())
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .text_sm()
+                        .text_color(cx.theme().muted_foreground)
+                        .truncate()
+                        .child(format!(
+                            "Reading {} — {} of {} collections, {} relations found{}",
+                            run.collection,
+                            format_number(run.done as u64 + 1),
+                            format_number(run.total as u64),
+                            format_number(run.found as u64),
+                            if run.failed > 0 {
+                                format!(", {} could not be read", run.failed)
+                            } else {
+                                String::new()
+                            },
+                        )),
+                )
+                .child(Button::new("cancel-inference").ghost().xsmall().label("Stop").on_click({
+                    let state = state.clone();
+                    move |_: &ClickEvent, _window: &mut Window, cx: &mut App| {
+                        AppCommands::cancel_inference(&state, cx);
+                    }
+                })),
+            None => row
+                .child(stat_cell("Known relations", format_number(known as u64), cx))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        // What the last search could not do is worth more than what it did: a
+                        // small number with no explanation is the thing that wastes time.
+                        .child(if let Some(line) = last_line {
+                            line
+                        } else if known == 0 {
+                            "Nothing is known yet. Inferring reads a sample of every collection \
+                             and confirms each guess against the data."
+                                .to_string()
+                        } else {
+                            "Cmd+click an ObjectId to follow it, or an _id to see what points \
+                             at it."
+                                .to_string()
+                        }),
+                )
+                .child(
+                    // The picture has a tab of its own: a canvas wants the whole window, and
+                    // this one clips rather than scrolls.
+                    Button::new("open-relations-canvas")
+                        .ghost()
+                        .xsmall()
+                        .label("Open canvas")
+                        .disabled(known == 0)
+                        .on_click({
+                            let state = state.clone();
+                            let database = database_name.to_string();
+                            move |_: &ClickEvent, _window: &mut Window, cx: &mut App| {
+                                state.update(cx, |state, cx| {
+                                    state.open_relations_tab(database.clone(), cx);
+                                });
+                            }
+                        }),
+                )
+                .children(report.map(|report| {
+                    Button::new("copy-inference-report")
+                        .ghost()
+                        .xsmall()
+                        .label("Copy details")
+                        .tooltip("Copy the fields this search could not place")
+                        .on_click(move |_: &ClickEvent, _window: &mut Window, cx: &mut App| {
+                            cx.write_to_clipboard(ClipboardItem::new_string(report.clone()));
+                        })
+                }))
+                .child(
+                    Button::new("infer-relations-db")
+                        .xsmall()
+                        .label(if known == 0 { "Infer relations" } else { "Infer again" })
+                        .disabled(busy_elsewhere)
+                        .on_click({
+                            let state = state.clone();
+                            let database = database_name.to_string();
+                            move |_: &ClickEvent, _window: &mut Window, cx: &mut App| {
+                                AppCommands::infer_relations_for_database(
+                                    state.clone(),
+                                    database.clone(),
+                                    cx,
+                                );
+                            }
+                        }),
+                ),
+        };
+
+        div()
+            .flex()
+            .flex_col()
+            .gap(spacing::sm())
+            .px(spacing::lg())
+            .pt(spacing::lg())
+            .child(div().text_xs().text_color(cx.theme().muted_foreground).child("Relations"))
+            .child(row)
+            .into_any_element()
+    }
     fn render_collections_section(
         collections: Vec<CollectionOverview>,
         collections_loading: bool,
@@ -286,12 +435,19 @@ impl DatabaseView {
             .min_h(px(0.0))
             .overflow_hidden()
             .gap(spacing::sm())
-            .px(spacing::lg())
+            // No side padding here: the table below is the scroll owner and has to reach the
+            // panel edges, or its scrollbar and the header's rule float inside the panel. The
+            // caption and the state messages carry the inset themselves.
             .pt(spacing::lg())
             .pb(spacing::lg());
 
-        section = section
-            .child(div().text_xs().text_color(cx.theme().muted_foreground).child("Collections"));
+        section = section.child(
+            div()
+                .px(spacing::lg())
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .child("Collections"),
+        );
 
         if collections_loading {
             return section
@@ -300,46 +456,39 @@ impl DatabaseView {
                         .flex()
                         .items_center()
                         .gap(spacing::sm())
+                        .px(spacing::lg())
                         .child(Spinner::new().small())
                         .child(
                             div()
                                 .text_sm()
                                 .text_color(cx.theme().muted_foreground)
-                                .child("Loading collections..."),
+                                .child("Loading collections…"),
                         ),
                 )
                 .into_any_element();
         }
 
-        if let Some(_error) = collections_error {
+        if let Some(error) = collections_error {
+            let retry = Button::new("retry-db-collections").xsmall().label("Retry").on_click({
+                let state = state.clone();
+                let database_key = database_key.clone();
+                move |_: &ClickEvent, _window: &mut Window, cx: &mut App| {
+                    let Some(key) = database_key.clone() else {
+                        return;
+                    };
+                    AppCommands::reload_database(state.clone(), key, cx);
+                }
+            });
             return section
                 .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(spacing::sm())
-                        .child(
-                            div()
-                                .text_sm()
-                                .text_color(cx.theme().danger_foreground)
-                                .child("Collections failed. See banner for details."),
+                    div().px(spacing::lg()).child(
+                        ErrorCallout::new(
+                            "db-collections-error",
+                            ErrorReport::from_message("Couldn't load collections", &error),
                         )
-                        .child(
-                            Button::new("retry-db-collections")
-                                .ghost()
-                                .compact()
-                                .label("Retry")
-                                .on_click({
-                                    let state = state.clone();
-                                    let database_key = database_key.clone();
-                                    move |_: &ClickEvent, _window: &mut Window, cx: &mut App| {
-                                        let Some(key) = database_key.clone() else {
-                                            return;
-                                        };
-                                        AppCommands::reload_database(state.clone(), key, cx);
-                                    }
-                                }),
-                        ),
+                        .action(retry)
+                        .state(state.clone()),
+                    ),
                 )
                 .into_any_element();
         }
@@ -348,6 +497,7 @@ impl DatabaseView {
             return section
                 .child(
                     div()
+                        .px(spacing::lg())
                         .text_sm()
                         .text_color(cx.theme().muted_foreground)
                         .child("No collections yet. Use the sidebar menu to create one."),

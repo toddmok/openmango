@@ -1,6 +1,10 @@
 use chrono::{DateTime, Utc};
-use mongodb::bson::Document;
+use gpui_kit::UniformListScrollHandle;
+use std::collections::HashSet;
+use std::sync::Arc;
 use uuid::Uuid;
+
+use crate::state::SessionDocument;
 
 pub use super::logic::{Suggestion, SuggestionKind};
 
@@ -19,6 +23,7 @@ pub struct ForgeRunOutput {
     pub started_at: DateTime<Utc>,
     pub code_preview: String,
     pub raw_lines: Vec<String>,
+    pub evaluation_lines: Vec<String>,
     pub error: Option<String>,
     pub last_print_line: Option<String>,
     pub result_origin: Option<ResultOrigin>,
@@ -72,9 +77,18 @@ impl ResultOrigin {
 pub struct ResultPage {
     pub id: Uuid,
     pub label: String,
-    pub docs: Vec<Document>,
+    pub documents: Arc<Vec<SessionDocument>>,
     pub pinned: bool,
+    pub print_run: Option<u64>,
+    pub expanded_nodes: HashSet<String>,
+    pub scroll: UniformListScrollHandle,
     pub origin: ResultOrigin,
+    /// Set when the sidecar keeps the full result and this page is one slice of it.
+    pub paging: Option<super::mongosh::ResultPaging>,
+    /// The session the paged result lives in, for fetching another page.
+    pub paging_session: Option<Uuid>,
+    /// A page request is in flight; the pager is disabled until it lands.
+    pub paging_busy: bool,
 }
 
 #[cfg(test)]

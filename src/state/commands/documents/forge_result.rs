@@ -1,4 +1,4 @@
-use gpui::{App, AppContext as _, Entity, Task};
+use gpui_kit::{App, AppContext as _, Entity, Task};
 use mongodb::bson::Bson;
 use uuid::Uuid;
 

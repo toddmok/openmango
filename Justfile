@@ -1,21 +1,33 @@
 # OpenMango Development Commands
 
 # Development
-dev:
+# SHOW_NOTES=1 just dev opens What's New with the unreleased notes; SHOW_NOTES=0.3.0 a release's.
+dev: _daily-sweep
     cargo run
 
-debug:
+debug: _daily-sweep
     RUST_LOG=debug cargo run
 
-watch:
-    bacon run
+# Cargo auto-cleans only ~/.cargo, not target/ (rust-lang/cargo#13136), so use cargo-sweep:
+# drop artifacts from uninstalled toolchains and anything not rebuilt in 30 days.
+sweep:
+    cargo sweep --installed
+    cargo sweep --time 30
+
+# Like Cargo's own cache cleaning: at most once a day, skipped when cargo-sweep is missing.
+_daily-sweep:
+    #!/usr/bin/env bash
+    command -v cargo-sweep >/dev/null || exit 0
+    [[ -n "$(find target/.last-sweep -mtime -1 2>/dev/null)" ]] && exit 0
+    just sweep >/dev/null 2>&1 || true
+    mkdir -p target && touch target/.last-sweep
 
 # Quality
 lint:
     cargo clippy --all-targets -- -D warnings
 
 lint-release:
-    cargo clippy --release --features mimalloc -- -D warnings
+    cargo clippy --release -- -D warnings
 
 fmt:
     cargo fmt
@@ -26,18 +38,16 @@ fmt-check:
 check:
     cargo check
 
-check-release:
-    cargo check --release --features mimalloc
-
 # Build
 build:
     cargo build
 
 release:
-    cargo build --release --features mimalloc
+    cargo build --release
 
-bundle:
-    cargo bundle --release --features mimalloc
+# Compile the macOS app icon (requires Xcode 26 or newer)
+app-icon:
+    bash ./scripts/build_app_icon.sh
 
 # Testing
 test:
@@ -60,7 +70,29 @@ clean:
     cargo clean
 
 # CI checks (matches GitHub Actions quality job; integration-tests still require Docker)
-ci: fmt-check check-release lint-release check-sidecar unit-test
+ci: fmt-check lint-release check-sidecar unit-test
+
+# macOS additionally validates the platform-specific app icon.
+ci-macos: ci app-icon
+
+# Run these inside Linux (a VM or container also works).
+bootstrap-linux:
+    bash ./scripts/bootstrap_linux.sh
+
+package-linux:
+    bash ./scripts/release_linux.sh
+
+# Run in Git Bash on Windows.
+package-windows:
+    bash ./scripts/release_windows.sh
+
+# Cut a release: bump version, rotate CHANGELOG, open the release PR
+prepare-release VERSION:
+    bash ./scripts/prepare_release.sh {{VERSION}}
+
+# After the release PR merges: tag main and push the tag (starts the Release workflow)
+tag-release VERSION:
+    bash ./scripts/prepare_release.sh {{VERSION}} --tag
 
 # All checks before commit
 precommit: ci test

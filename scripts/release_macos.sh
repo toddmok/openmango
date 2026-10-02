@@ -11,9 +11,10 @@ TARGET="${1:-}"
 
 DIST_DIR="$ROOT_DIR/dist"
 APP_DIR="$DIST_DIR/${APP_NAME}.app"
-ICON_ICNS="$ROOT_DIR/assets/logo/openmango.icns"
+ICON_DIR="$ROOT_DIR/target/app-icon"
 
 mkdir -p "$DIST_DIR"
+bash "$ROOT_DIR/scripts/build_app_icon.sh" "$ICON_DIR"
 
 if [[ -n "$TARGET" ]]; then
     rustup target add "$TARGET"
@@ -70,13 +71,38 @@ if [[ -f "$ROOT_DIR/THIRD_PARTY_NOTICES" ]]; then
     cp "$ROOT_DIR/THIRD_PARTY_NOTICES" "$APP_DIR/Contents/Resources/"
 fi
 
-HAS_ICON=false
-if [[ -f "$ICON_ICNS" ]]; then
-    cp "$ICON_ICNS" "$APP_DIR/Contents/Resources/openmango.icns"
-    HAS_ICON=true
-else
-    echo "Warning: $ICON_ICNS not found. App will use the default icon."
-fi
+cp "$ICON_DIR/Assets.car" "$ICON_DIR/openmango.icns" "$APP_DIR/Contents/Resources/"
+
+# The launch agent that runs due tasks while OpenMango is closed. The app registers it with
+# SMAppService only when a task asks to; until then it does nothing.
+mkdir -p "$APP_DIR/Contents/Library/LaunchAgents"
+cat > "$APP_DIR/Contents/Library/LaunchAgents/${BUNDLE_ID}.tasks.plist" <<EOF_AGENT
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>${BUNDLE_ID}.tasks</string>
+    <key>BundleProgram</key>
+    <string>Contents/MacOS/${APP_NAME}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>Contents/MacOS/${APP_NAME}</string>
+        <string>--run-due-tasks</string>
+    </array>
+    <key>StartInterval</key>
+    <integer>900</integer>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>AssociatedBundleIdentifiers</key>
+    <array>
+        <string>${BUNDLE_ID}</string>
+    </array>
+</dict>
+</plist>
+EOF_AGENT
 
 cat > "$APP_DIR/Contents/Info.plist" <<EOF2
 <?xml version="1.0" encoding="UTF-8"?>
@@ -99,19 +125,11 @@ cat > "$APP_DIR/Contents/Info.plist" <<EOF2
     <string>11.0</string>
     <key>NSHighResolutionCapable</key>
     <true/>
-EOF2
-
-if [[ "$HAS_ICON" == true ]]; then
-cat >> "$APP_DIR/Contents/Info.plist" <<EOF2
-    <key>CFBundleIconFile</key>
-    <string>openmango</string>
-EOF2
-fi
-
-cat >> "$APP_DIR/Contents/Info.plist" <<EOF2
 </dict>
 </plist>
 EOF2
+
+/usr/libexec/PlistBuddy -c "Merge '$ICON_DIR/icon-info.plist'" "$APP_DIR/Contents/Info.plist"
 
 SIGNING_IDENTITY="${MACOS_SIGNING_IDENTITY:-}"
 if [[ -n "$SIGNING_IDENTITY" ]]; then
@@ -160,7 +178,7 @@ if [[ "$SIGNING_IDENTITY" != "-" && -n "${APPLE_API_KEY_ID:-}" && -n "${APPLE_AP
         --key "$NOTARY_KEY_PATH" \
         --key-id "$APPLE_API_KEY_ID" \
         --issuer "$APPLE_API_ISSUER_ID" \
-        --wait
+        --wait --timeout 30m
     echo "Stapling notarization ticket..."
     xcrun stapler staple "$APP_DIR"
     # Re-create zip with stapled app

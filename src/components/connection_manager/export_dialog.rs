@@ -1,13 +1,16 @@
 //! Export connections dialog.
 
-use gpui::prelude::FluentBuilder as _;
-use gpui::*;
-use gpui_component::ActiveTheme as _;
-use gpui_component::WindowExt as _;
-use gpui_component::checkbox::Checkbox;
-use gpui_component::dialog::Dialog;
-use gpui_component::input::{Input, InputState};
-use gpui_component::scroll::ScrollableElement;
+use gpui_kit::component::ActiveTheme as _;
+use gpui_kit::component::Selectable as _;
+use gpui_kit::component::Sizable as _;
+use gpui_kit::component::WindowExt as _;
+use gpui_kit::component::button::ButtonVariants as _;
+use gpui_kit::component::checkbox::Checkbox;
+use gpui_kit::component::dialog::Dialog;
+use gpui_kit::component::input::{Input, InputState};
+use gpui_kit::component::scroll::ScrollableElement;
+use gpui_kit::prelude::FluentBuilder as _;
+use gpui_kit::*;
 
 use crate::components::file_picker::{FileFilter, FilePickerMode, open_file_dialog_async};
 use crate::components::{Button, cancel_button};
@@ -82,7 +85,7 @@ impl Render for ExportDialogState {
                             .child({
                                 let view = view.clone();
                                 Button::new("toggle-all-export")
-                                    .compact()
+                                    .xsmall()
                                     .ghost()
                                     .label(if all_selected { "Deselect All" } else { "Select All" })
                                     .on_click(move |_, _, cx| {
@@ -238,13 +241,13 @@ fn mode_button(
     current: ExportMode,
     view: Entity<ExportDialogState>,
 ) -> Button {
-    let is_active = current == target;
-    let mut btn = Button::new(SharedString::new_static(label)).compact().label(label);
-    if is_active {
-        btn = btn.active_style(gpui::hsla(0.0, 0.0, 0.25, 1.0));
-    } else {
-        btn = btn.ghost();
-    }
+    // The chosen mode is the button's selected state, which every theme styles; a fixed gray
+    // vanished on the light ones.
+    let btn = Button::new(SharedString::new_static(label))
+        .xsmall()
+        .label(label)
+        .ghost()
+        .selected(current == target);
     btn.on_click(move |_, _, cx| {
         view.update(cx, |this, cx| {
             this.mode = target;
@@ -267,11 +270,13 @@ pub fn open_export_dialog(state: Entity<AppState>, window: &mut Window, cx: &mut
     window.open_dialog(cx, {
         let dialog_state = dialog_state.clone();
         move |dialog: Dialog, _window: &mut Window, _cx: &mut App| {
-            dialog.title("Export Connections").w(px(520.0)).child(dialog_state.clone()).footer({
+            dialog.title("Export connections").w(px(520.0)).child(dialog_state.clone()).footer({
                 let dialog_state = dialog_state.clone();
-                move |_ok, _cancel, _window, _cx| {
-                    vec![cancel_button("cancel-export"), render_export_button(dialog_state.clone())]
-                }
+
+                gpui_kit::component::dialog::DialogFooter::new().children(vec![
+                    cancel_button("cancel-export"),
+                    render_export_button(dialog_state.clone()),
+                ])
             })
         }
     });
@@ -302,18 +307,20 @@ fn render_export_button(dialog_state: Entity<ExportDialogState>) -> AnyElement {
                 let pw = ds.passphrase_state.read(cx).value().to_string();
                 let confirm = ds.confirm_state.read(cx).value().to_string();
                 if pw.is_empty() {
-                    app_state.update(cx, |state, _cx| {
+                    app_state.update(cx, |state, cx| {
                         state.set_status_message(Some(StatusMessage::error(
                             "Passphrase is required for encrypted export",
                         )));
+                        cx.notify();
                     });
                     return;
                 }
                 if pw != confirm {
-                    app_state.update(cx, |state, _cx| {
+                    app_state.update(cx, |state, cx| {
                         state.set_status_message(Some(StatusMessage::error(
                             "Passphrases do not match",
                         )));
+                        cx.notify();
                     });
                     return;
                 }
@@ -326,10 +333,11 @@ fn render_export_button(dialog_state: Entity<ExportDialogState>) -> AnyElement {
                 match connection_io::build_export(&chosen, current_mode, passphrase.as_deref()) {
                     Ok(f) => f,
                     Err(e) => {
-                        app_state.update(cx, |state, _cx| {
+                        app_state.update(cx, |state, cx| {
                             state.set_status_message(Some(StatusMessage::error(format!(
                                 "Export failed: {e}"
                             ))));
+                            cx.notify();
                         });
                         return;
                     }
@@ -338,10 +346,11 @@ fn render_export_button(dialog_state: Entity<ExportDialogState>) -> AnyElement {
             let json = match serde_json::to_string_pretty(&export_file) {
                 Ok(j) => j,
                 Err(e) => {
-                    app_state.update(cx, |state, _cx| {
+                    app_state.update(cx, |state, cx| {
                         state.set_status_message(Some(StatusMessage::error(format!(
                             "Serialization failed: {e}"
                         ))));
+                        cx.notify();
                     });
                     return;
                 }
@@ -360,16 +369,17 @@ fn render_export_button(dialog_state: Entity<ExportDialogState>) -> AnyElement {
 
                 if let Some(path) = path {
                     if let Err(e) = std::fs::write(&path, &json) {
-                        let _ = cx.update(|cx| {
-                            app_state.update(cx, |state, _cx| {
+                        cx.update(|cx| {
+                            app_state.update(cx, |state, cx| {
                                 state.set_status_message(Some(StatusMessage::error(format!(
                                     "Failed to write file: {e}"
                                 ))));
+                                cx.notify();
                             });
                         });
                         return;
                     }
-                    let _ = cx.update(|cx| {
+                    cx.update(|cx| {
                         app_state.update(cx, |state, _cx| {
                             state.set_status_message(Some(StatusMessage::info(format!(
                                 "Exported {count} connection{}",

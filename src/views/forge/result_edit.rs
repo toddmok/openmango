@@ -1,9 +1,10 @@
-use gpui::prelude::FluentBuilder as _;
-use gpui::*;
-use gpui_component::ActiveTheme as _;
-use gpui_component::WindowExt as _;
-use gpui_component::dialog::Dialog;
-use gpui_component::input::{Input, InputEvent, InputState};
+use gpui_kit::component::ActiveTheme as _;
+use gpui_kit::component::WindowExt as _;
+use gpui_kit::component::button::ButtonVariants as _;
+use gpui_kit::component::dialog::Dialog;
+use gpui_kit::component::input::{Editor, EditorState, InputEvent, InputState};
+use gpui_kit::prelude::FluentBuilder as _;
+use gpui_kit::*;
 use mongodb::bson::Bson;
 use uuid::Uuid;
 
@@ -109,8 +110,9 @@ impl ForgeView {
             .get(self.state.output.result_page_index)
             .ok_or_else(|| "The result page is no longer available.".to_string())?;
         let document = page
-            .docs
+            .documents
             .get(doc_index)
+            .map(|document| &document.doc)
             .ok_or_else(|| "The result document is no longer available.".to_string())?;
         let id = document
             .get("_id")
@@ -164,7 +166,7 @@ impl ForgeView {
         let focus = input.read(cx).focus_handle(cx);
         self.state.output.result_inline_edit = Some(ResultInlineEdit { target, input });
         self.state.output.result_inline_subscription = Some(subscription);
-        window.defer(cx, move |window, _cx| window.focus(&focus));
+        window.defer(cx, move |window, cx| window.focus(&focus, cx));
         cx.notify();
     }
 
@@ -270,7 +272,7 @@ impl ForgeView {
                     let view = view.clone();
                     async move |cx: &mut AsyncApp| {
                         let result = task.await;
-                        let _ = cx.update(|cx| {
+                        cx.update(|cx| {
                             view.update(cx, |view, cx| match result {
                                 Ok(true) => view.finish_result_edit(target, replacement, cx),
                                 Ok(false) => view.set_result_edit_status(
@@ -308,7 +310,8 @@ impl ForgeView {
             .result_pages
             .iter()
             .find(|page| page.id == target.page_id && page.origin == target.origin)
-            .and_then(|page| page.docs.get(target.doc_index))
+            .and_then(|page| page.documents.get(target.doc_index))
+            .map(|document| &document.doc)
             .is_some_and(|document| {
                 document.get("_id") == Some(&target.id)
                     && get_bson_at_path(document, &target.path) == Some(&target.expected)
@@ -335,7 +338,10 @@ impl ForgeView {
                 .result_pages
                 .iter_mut()
                 .find(|page| page.id == target.page_id && page.origin == target.origin)
-                .and_then(|page| page.docs.get_mut(target.doc_index))
+                .and_then(|page| {
+                    std::sync::Arc::make_mut(&mut page.documents).get_mut(target.doc_index)
+                })
+                .map(|document| &mut document.doc)
                 .is_some_and(|document| {
                     document.get("_id") == Some(&target.id)
                         && get_bson_at_path(document, &target.path) == Some(&target.expected)
@@ -370,7 +376,7 @@ impl ForgeView {
 struct ResultValueDialog {
     view: Entity<ForgeView>,
     target: ResultEditTarget,
-    input: Entity<InputState>,
+    input: Entity<EditorState>,
     error: Option<String>,
 }
 
@@ -379,8 +385,8 @@ impl ResultValueDialog {
         let value = format_relaxed_json_value(&target.expected.clone().into_canonical_extjson());
         let dialog_view = cx.new(|cx| {
             let input = cx.new(|cx| {
-                InputState::new(window, cx)
-                    .code_editor("json")
+                EditorState::new(window, cx)
+                    .language("json")
                     .line_number(true)
                     .searchable(true)
                     .soft_wrap(false)
@@ -440,10 +446,10 @@ impl Render for ResultValueDialog {
                     .border_1()
                     .border_color(cx.theme().border)
                     .rounded(px(4.0))
-                    .child(Input::new(&self.input).h_full()),
+                    .child(Editor::new(&self.input).h_full()),
             )
             .when_some(self.error.clone(), |element, error| {
-                element.child(div().text_sm().text_color(cx.theme().danger_foreground).child(error))
+                element.child(div().text_sm().text_color(cx.theme().danger).child(error))
             })
             .child(
                 div()

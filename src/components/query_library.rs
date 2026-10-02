@@ -1,18 +1,21 @@
+use gpui_kit::component::Disableable as _;
+use gpui_kit::component::Sizable as _;
+use gpui_kit::component::button::ButtonVariants as _;
 use std::cell::Cell;
 use std::rc::Rc;
 
 use chrono::{DateTime, Local, Utc};
-use gpui::prelude::FluentBuilder as _;
-use gpui::*;
-use gpui_component::ActiveTheme as _;
-use gpui_component::WindowExt as _;
-use gpui_component::dialog::Dialog;
-use gpui_component::input::{Input, InputEvent, InputState};
-use gpui_component::scroll::ScrollableElement;
+use gpui_kit::component::ActiveTheme as _;
+use gpui_kit::component::WindowExt as _;
+use gpui_kit::component::dialog::Dialog;
+use gpui_kit::component::input::{Input, InputEvent, InputState};
+use gpui_kit::component::scroll::ScrollableElement;
+use gpui_kit::prelude::FluentBuilder as _;
+use gpui_kit::*;
 use uuid::Uuid;
 
 use crate::components::file_picker::{FileFilter, FilePickerMode, open_file_dialog_async};
-use crate::components::{Button, ConnectionIdentity, connection_identity_badge};
+use crate::components::{Button, ConnectionIdentity, busy_label, connection_identity_badge};
 use crate::helpers::query_library_io;
 use crate::keyboard::RunForgeAll;
 use crate::state::{
@@ -235,7 +238,7 @@ impl QueryLibraryDialog {
             }
             let size = window.viewport_size();
             dialog
-                .title("Query Library")
+                .title("Query library")
                 .overlay_closable(true)
                 .w((size.width - px(160.0)).max(px(720.0)).min(px(1040.0)))
                 .h((size.height - px(180.0)).max(px(520.0)))
@@ -270,7 +273,7 @@ impl QueryLibraryDialog {
                     view.error = None;
                     cx.notify();
                 }
-                InputEvent::PressEnter { secondary } => {
+                InputEvent::PressEnter { secondary, .. } => {
                     view.activate_first(*secondary, window, cx);
                 }
                 _ => {}
@@ -585,7 +588,7 @@ impl QueryLibraryDialog {
                                         renamed: report.renamed,
                                     });
                                     let focus = this.import_focus.clone();
-                                    window.defer(cx, move |window, _cx| window.focus(&focus));
+                                    window.defer(cx, move |window, cx| window.focus(&focus, cx));
                                 }
                                 Err(error) => {
                                     this.error = Some(format!(
@@ -629,7 +632,7 @@ impl QueryLibraryDialog {
             }
             Err(error) => {
                 self.error = Some(error.to_string());
-                window.focus(&self.import_focus);
+                window.focus(&self.import_focus, cx);
             }
         }
         cx.notify();
@@ -718,7 +721,7 @@ impl QueryLibraryDialog {
             div()
                 .px(px(5.0))
                 .py(px(1.0))
-                .rounded(px(3.0))
+                .rounded(crate::theme::borders::radius_sm())
                 .bg(cx.theme().secondary)
                 .text_color(cx.theme().secondary_foreground)
                 .child("Global")
@@ -738,7 +741,7 @@ impl QueryLibraryDialog {
         let view = cx.entity();
         let confirming_delete = item.saved && self.confirm_delete == Some(item.id);
         let mut delete_button = Button::new(("query-delete", index))
-            .compact()
+            .xsmall()
             .ghost()
             .label(if confirming_delete { "Confirm delete" } else { "Delete" })
             .on_click({
@@ -845,7 +848,7 @@ impl QueryLibraryDialog {
                     .gap(spacing::xs())
                     .child(
                         Button::new(("query-restore", index))
-                            .compact()
+                            .xsmall()
                             .label("Restore")
                             .disabled(!applicable)
                             .tooltip(if applicable {
@@ -872,7 +875,7 @@ impl QueryLibraryDialog {
                     )
                     .child(
                         Button::new(("query-run", index))
-                            .compact()
+                            .xsmall()
                             .primary()
                             .label("Run")
                             .disabled(!applicable)
@@ -896,7 +899,7 @@ impl QueryLibraryDialog {
                     )
                     .when(!item.saved, |this| {
                         this.child(
-                            Button::new(("query-save", index)).compact().label("Save").on_click({
+                            Button::new(("query-save", index)).xsmall().label("Save").on_click({
                                 let view = view.clone();
                                 move |_, window, cx| {
                                     view.update(cx, |this, cx| {
@@ -922,7 +925,7 @@ impl QueryLibraryDialog {
                         let tags = item.tags.clone();
                         let scope = item.scope;
                         this.child(
-                            Button::new(("query-edit", index)).compact().label("Edit").on_click({
+                            Button::new(("query-edit", index)).xsmall().label("Edit").on_click({
                                 let view = view.clone();
                                 move |_, window, cx| {
                                     view.update(cx, |this, cx| {
@@ -943,7 +946,7 @@ impl QueryLibraryDialog {
                         )
                         .child(
                             Button::new(("query-update", index))
-                                .compact()
+                                .xsmall()
                                 .label("Update")
                                 .disabled(!applicable || !can_update)
                                 .tooltip("Replace this saved query with the current editor content")
@@ -967,7 +970,7 @@ impl QueryLibraryDialog {
                         )
                         .child(
                             Button::new(("query-duplicate", index))
-                                .compact()
+                                .xsmall()
                                 .label("Duplicate")
                                 .on_click({
                                     let view = view.clone();
@@ -984,7 +987,7 @@ impl QueryLibraryDialog {
                                 }),
                         )
                     })
-                    .child(Button::new(("query-copy", index)).compact().label("Copy").on_click({
+                    .child(Button::new(("query-copy", index)).xsmall().label("Copy").on_click({
                         let text = item.definition.content.copy_text();
                         move |_, _window, cx| {
                             cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
@@ -1012,7 +1015,7 @@ impl Render for QueryLibraryDialog {
         let view = cx.entity();
 
         let mut history_button = Button::new("query-library-history")
-            .compact()
+            .xsmall()
             .label(format!("History ({history_count})"))
             .on_click({
                 let view = view.clone();
@@ -1031,7 +1034,7 @@ impl Render for QueryLibraryDialog {
             history_button = history_button.primary();
         }
         let mut saved_button = Button::new("query-library-saved")
-            .compact()
+            .xsmall()
             .label(format!("Saved ({saved_count})"))
             .on_click({
                 let view = view.clone();
@@ -1050,7 +1053,7 @@ impl Render for QueryLibraryDialog {
         }
 
         let mut current_button =
-            Button::new("query-library-current").compact().label("Applicable here").on_click({
+            Button::new("query-library-current").xsmall().label("Applicable here").on_click({
                 let view = view.clone();
                 move |_, _window, cx| {
                     view.update(cx, |this, cx| {
@@ -1063,7 +1066,7 @@ impl Render for QueryLibraryDialog {
         if !self.show_all {
             current_button = current_button.primary();
         }
-        let mut all_button = Button::new("query-library-all").compact().label("All").on_click({
+        let mut all_button = Button::new("query-library-all").xsmall().label("All").on_click({
             let view = view.clone();
             move |_, _window, cx| {
                 view.update(cx, |this, cx| {
@@ -1085,7 +1088,7 @@ impl Render for QueryLibraryDialog {
             let connection_selected = self.edit_scope == SavedQueryScope::Connection;
             let global_selected = self.edit_scope == SavedQueryScope::Global;
             let mut connection_scope = Button::new("query-scope-connection")
-                .compact()
+                .xsmall()
                 .label(if connection_selected { "✓ This connection" } else { "This connection" })
                 .on_click({
                     let view = view.clone();
@@ -1097,7 +1100,7 @@ impl Render for QueryLibraryDialog {
                     }
                 });
             let mut global_scope = Button::new("query-scope-global")
-                .compact()
+                .xsmall()
                 .label(if global_selected { "✓ Global" } else { "Global" })
                 .tooltip("Available in any compatible editor")
                 .on_click({
@@ -1198,7 +1201,7 @@ impl Render for QueryLibraryDialog {
                         )
                         .child(
                             Button::new("query-name-save")
-                                .compact()
+                                .xsmall()
                                 .primary()
                                 .label("Save")
                                 .on_click({
@@ -1208,8 +1211,8 @@ impl Render for QueryLibraryDialog {
                                     }
                                 }),
                         )
-                        .child(
-                            Button::new("query-name-cancel").compact().label("Cancel").on_click({
+                        .child(Button::new("query-name-cancel").xsmall().label("Cancel").on_click(
+                            {
                                 let view = view.clone();
                                 move |_, window, cx| {
                                     view.update(cx, |this, cx| {
@@ -1219,8 +1222,8 @@ impl Render for QueryLibraryDialog {
                                         cx.notify();
                                     });
                                 }
-                            }),
-                        ),
+                            },
+                        )),
                 )
         });
 
@@ -1267,7 +1270,7 @@ impl Render for QueryLibraryDialog {
                         .gap(spacing::xs())
                         .child(
                             Button::new("query-import-confirm")
-                                .compact()
+                                .xsmall()
                                 .primary()
                                 .label("Import")
                                 .on_click({
@@ -1280,18 +1283,16 @@ impl Render for QueryLibraryDialog {
                                 }),
                         )
                         .child(
-                            Button::new("query-import-cancel").compact().label("Cancel").on_click(
-                                {
-                                    let view = view.clone();
-                                    move |_, window, cx| {
-                                        view.update(cx, |this, cx| {
-                                            this.pending_import = None;
-                                            this.focus_search(window, cx);
-                                            cx.notify();
-                                        });
-                                    }
-                                },
-                            ),
+                            Button::new("query-import-cancel").xsmall().label("Cancel").on_click({
+                                let view = view.clone();
+                                move |_, window, cx| {
+                                    view.update(cx, |this, cx| {
+                                        this.pending_import = None;
+                                        this.focus_search(window, cx);
+                                        cx.notify();
+                                    });
+                                }
+                            }),
                         ),
                 )
         });
@@ -1342,7 +1343,7 @@ impl Render for QueryLibraryDialog {
                         .child("Query text stays local and entries that may contain credentials are not recorded."),
                 )
                 .when(show_all_offer, |empty| {
-                    empty.child(Button::new("query-empty-show-all").compact().label("Show all").on_click({
+                    empty.child(Button::new("query-empty-show-all").xsmall().label("Show all").on_click({
                         let view = view.clone();
                         move |_, _window, cx| {
                             view.update(cx, |this, cx| {
@@ -1422,20 +1423,22 @@ impl Render for QueryLibraryDialog {
                     )
                     .when(self.mode == LibraryMode::Saved, |row| {
                         row.child(
-                            Button::new("query-library-import")
-                                .compact()
-                                .label(if self.file_busy { "Working…" } else { "Import…" })
-                                .disabled(self.file_busy)
-                                .on_click({
-                                    let view = view.clone();
-                                    move |_, window, cx| {
-                                        view.update(cx, |this, cx| this.start_import(window, cx));
-                                    }
-                                }),
+                            busy_label(
+                                Button::new("query-library-import"),
+                                gpui_kit::component::Size::XSmall,
+                                "Import…",
+                                self.file_busy,
+                            )
+                            .on_click({
+                                let view = view.clone();
+                                move |_, window, cx| {
+                                    view.update(cx, |this, cx| this.start_import(window, cx));
+                                }
+                            }),
                         )
                         .child(
                             Button::new("query-library-export")
-                                .compact()
+                                .xsmall()
                                 .label("Export all…")
                                 .disabled(self.file_busy || saved_count == 0)
                                 .tooltip("Export all saved queries as portable JSON")
@@ -1449,7 +1452,7 @@ impl Render for QueryLibraryDialog {
                     })
                     .child(
                         Button::new("query-save-current")
-                            .compact()
+                            .xsmall()
                             .label("Save current")
                             .disabled(!can_save_current)
                             .on_click({
@@ -1478,17 +1481,12 @@ impl Render for QueryLibraryDialog {
             .children(edit_panel)
             .children(import_panel)
             .when_some(self.error.clone(), |this, error| {
-                this.child(
-                    div()
-                        .px(spacing::md())
-                        .py(spacing::xs())
-                        .bg(cx.theme().danger.opacity(0.08))
-                        .border_b_1()
-                        .border_color(cx.theme().danger.opacity(0.35))
-                        .text_sm()
-                        .text_color(cx.theme().danger_foreground)
-                        .child(error),
-                )
+                this.child(div().px(spacing::md()).py(spacing::xs()).child(
+                    crate::components::ErrorCallout::new(
+                        "query-library-error",
+                        crate::error::ErrorReport::from_text(&error),
+                    ),
+                ))
             })
             .child(body)
             .when(self.mode == LibraryMode::History && history_count > 0, |this| {
@@ -1511,7 +1509,7 @@ impl Render for QueryLibraryDialog {
                             )
                             .child(
                                 Button::new("query-clear-confirm")
-                                    .compact()
+                                    .xsmall()
                                     .danger()
                                     .label("Delete history")
                                     .on_click({
@@ -1529,7 +1527,7 @@ impl Render for QueryLibraryDialog {
                             )
                             .child(
                                 Button::new("query-clear-cancel")
-                                    .compact()
+                                    .xsmall()
                                     .label("Keep history")
                                     .on_click({
                                         let view = view.clone();
@@ -1545,7 +1543,7 @@ impl Render for QueryLibraryDialog {
                         .when(!self.confirm_clear, |row| {
                             row.child(
                                 Button::new("query-clear")
-                                    .compact()
+                                    .xsmall()
                                     .ghost()
                                     .label("Clear History")
                                     .on_click({

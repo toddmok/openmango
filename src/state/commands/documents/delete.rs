@@ -1,4 +1,4 @@
-use gpui::{App, AppContext as _, Entity};
+use gpui_kit::{App, AppContext as _, Entity};
 
 use crate::bson::DocumentKey;
 use crate::state::{AppCommands, AppEvent, AppState, SessionKey};
@@ -11,7 +11,7 @@ impl AppCommands {
         doc_key: DocumentKey,
         cx: &mut App,
     ) {
-        if !Self::ensure_writable(&state, Some(session_key.connection_id), cx) {
+        if !Self::ensure_collection_writable(&state, &session_key, cx) {
             return;
         }
         let Some(client) = Self::client_for_session(&state, &session_key, cx) else {
@@ -40,10 +40,10 @@ impl AppCommands {
             let state = state.clone();
             let session_key = session_key.clone();
             let doc_key = doc_key.clone();
-            async move |cx: &mut gpui::AsyncApp| {
+            async move |cx: &mut gpui_kit::AsyncApp| {
                 let result: Result<(), crate::error::Error> = task.await;
 
-                let _ = cx.update(|cx| match result {
+                cx.update(|cx| match result {
                     Ok(()) => {
                         state.update(cx, |state, cx| {
                             if let Some(session) = state.session_mut(&session_key) {
@@ -61,6 +61,7 @@ impl AppCommands {
                                     session.data.total = session.data.total.saturating_sub(1);
                                 }
                                 session.view.drafts.remove(&doc_key);
+                                session.view.draft_baselines.remove(&doc_key);
                                 session.view.dirty.remove(&doc_key);
                                 session.view.selected_docs.remove(&doc_key);
                                 if session.view.selected_doc.as_ref() == Some(&doc_key) {

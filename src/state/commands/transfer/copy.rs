@@ -4,7 +4,7 @@ use std::collections::HashSet;
 
 use futures::StreamExt;
 use futures::channel::mpsc;
-use gpui::{App, AppContext as _, Entity};
+use gpui_kit::{App, AppContext as _, Entity};
 use uuid::Uuid;
 
 use crate::state::app_state::CollectionTransferStatus;
@@ -47,11 +47,11 @@ impl AppCommands {
             return;
         }
 
-        let Some(src_client) = Self::active_client(&state, src_conn_id, cx) else {
+        let Some(src_client) = Self::transfer_client(&state, transfer_id, src_conn_id, cx) else {
             return;
         };
 
-        let Some(dest_client) = Self::active_client(&state, dest_conn_id, cx) else {
+        let Some(dest_client) = Self::transfer_client(&state, transfer_id, dest_conn_id, cx) else {
             return;
         };
 
@@ -90,12 +90,13 @@ impl AppCommands {
                 tab.runtime.is_running = true;
                 tab.runtime.has_started = true;
                 tab.runtime.cancellation_requested = false;
+                tab.runtime.cancellation_unconfirmed = false;
                 tab.runtime.progress_count = 0;
                 tab.runtime.error_message = None;
                 tab.runtime.database_progress = None; // Reset on new copy
                 tab.runtime.cancellation_token = Some(cancellation_token.clone());
             }
-            state.set_status_message(Some(StatusMessage::info("Copying...")));
+            state.set_status_message(Some(StatusMessage::info("Copying…")));
             cx.emit(AppEvent::TransferStarted { transfer_id });
             cx.notify();
         });
@@ -178,6 +179,7 @@ impl AppCommands {
                     Err(e) => {
                         let _ = tx.unbounded_send(TransferProgressMessage::Failed {
                             error: e.to_string(),
+                            transient: e.is_transient(),
                         });
                         return;
                     }
@@ -342,7 +344,7 @@ impl AppCommands {
         // Batch progress updates to reduce cx.notify() calls from 1000s to ~20
         cx.spawn({
             let state = state.clone();
-            async move |cx: &mut gpui::AsyncApp| {
+            async move |cx: &mut gpui_kit::AsyncApp| {
                 let mut rx = rx;
                 let mut progress_count = 0u32;
                 const BATCH_SIZE: u32 = 50;
@@ -361,7 +363,7 @@ impl AppCommands {
                         }
                     };
 
-                    let _ = cx.update(|cx| {
+                    cx.update(|cx| {
                         state.update(cx, |state, cx| {
                             match msg {
                                 TransferProgressMessage::Started { collections } => {
@@ -403,11 +405,9 @@ impl AppCommands {
                                         tab.runtime.error_message = failure_summary;
                                     }
                                     if had_error {
-                                        state.set_status_message(Some(StatusMessage::error(
-                                            format!(
+                                        state.report_transfer_error(transfer_id, crate::error::ErrorReport::from_text(&format!(
                                                 "Copy completed with errors: {failed_count} collection(s) failed; {total_count} documents processed"
-                                            ),
-                                        )));
+                                            )));
                                     } else {
                                         state.set_status_message(Some(StatusMessage::info(
                                             format!(
@@ -423,14 +423,15 @@ impl AppCommands {
                                     });
                                 }
                                 TransferProgressMessage::Cancelled { .. } => {}
-                                TransferProgressMessage::Failed { error } => {
+                                TransferProgressMessage::Failed { error, transient } => {
                                     if let Some(tab) = state.transfer_tab_mut(transfer_id) {
+                                        tab.runtime.failure_transient = transient;
                                         tab.runtime.is_running = false;
                                         tab.runtime.error_message = Some(error.clone());
                                     }
-                                    state.set_status_message(Some(StatusMessage::error(format!(
+                                    state.report_transfer_error(transfer_id, crate::error::ErrorReport::from_text(&format!(
                                         "Copy failed: {error}"
-                                    ))));
+                                    )));
                                     cx.emit(AppEvent::TransferFailed { transfer_id, error });
                                 }
                             }
@@ -512,6 +513,7 @@ impl AppCommands {
                         let _ = tx.unbounded_send(CollectionProgressMessage::Failed {
                             error: err.to_string(),
                             processed,
+                            transient: err.is_transient(),
                         });
                     }
                 }
@@ -523,7 +525,7 @@ impl AppCommands {
         // Batch progress updates to reduce cx.notify() calls from 1000s to ~20
         cx.spawn({
             let state = state.clone();
-            async move |cx: &mut gpui::AsyncApp| {
+            async move |cx: &mut gpui_kit::AsyncApp| {
                 let mut rx = rx;
                 let mut progress_count = 0u32;
                 const BATCH_SIZE: u32 = 50;
@@ -540,7 +542,7 @@ impl AppCommands {
                         }
                     };
 
-                    let _ = cx.update(|cx| {
+                    cx.update(|cx| {
                         state.update(cx, |state, cx| {
                             match msg {
                                 CollectionProgressMessage::Progress(processed) => {
@@ -561,16 +563,24 @@ impl AppCommands {
                                     state.set_status_message(Some(StatusMessage::info(message)));
                                     cx.emit(AppEvent::TransferCompleted { transfer_id, count });
                                 }
-                                CollectionProgressMessage::Failed { error, processed } => {
+                                CollectionProgressMessage::Failed {
+                                    error,
+                                    processed,
+                                    transient,
+                                } => {
                                     if let Some(tab) = state.transfer_tab_mut(transfer_id) {
+                                        tab.runtime.failure_transient = transient;
                                         tab.runtime.is_running = false;
                                         tab.runtime.progress_count =
                                             tab.runtime.progress_count.max(processed);
                                         tab.runtime.error_message = Some(error.clone());
                                     }
-                                    state.set_status_message(Some(StatusMessage::error(format!(
-                                        "Copy failed: {error}"
-                                    ))));
+                                    state.report_transfer_error(
+                                        transfer_id,
+                                        crate::error::ErrorReport::from_text(&format!(
+                                            "Copy failed: {error}"
+                                        )),
+                                    );
                                     cx.emit(AppEvent::TransferFailed { transfer_id, error });
                                 }
                             }

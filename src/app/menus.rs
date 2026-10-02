@@ -1,18 +1,16 @@
-use gpui::prelude::FluentBuilder as _;
-use gpui::*;
-use gpui_component::ActiveTheme as _;
-use gpui_component::menu::{PopupMenu, PopupMenuItem};
-use gpui_component::{Icon, IconName};
+use gpui_kit::component::ActiveTheme as _;
+use gpui_kit::component::menu::{PopupMenu, PopupMenuItem};
+use gpui_kit::component::{Icon, IconName};
+use gpui_kit::prelude::FluentBuilder as _;
+use gpui_kit::*;
 use uuid::Uuid;
 
-use crate::components::{
-    ConnectionManager, WriteConfirmation, open_confirm_dialog, request_connection_write,
-    request_disconnect_connection, request_remove_connection,
-};
+use crate::components::node_commands::{confirm_delete_node, copy_node_name};
+use crate::components::{ConnectionManager, request_disconnect_connection};
 use crate::keyboard::{
     CopyConnectionUri, CopySelectionName, CopyTreeItem, CreateCollection, DeleteSelection,
-    DisconnectConnection, EditConnection, OpenForge, OpenSelection, PasteTreeItem, RefreshView,
-    RenameCollection, TransferCopy, TransferExport, TransferImport,
+    DisconnectConnection, EditConnection, OpenForge, OpenSelection, OpenSelectionInNewTab,
+    PasteTreeItem, RefreshView, RenameCollection, TransferCopy, TransferExport, TransferImport,
 };
 use crate::models::TreeNodeId;
 use crate::state::{
@@ -26,39 +24,13 @@ use super::sidebar::Sidebar;
 pub(crate) fn build_connection_menu(
     mut menu: PopupMenu,
     state: Entity<AppState>,
-    sidebar: Entity<Sidebar>,
     connection_id: Uuid,
-    connecting_id: Option<Uuid>,
     _window: &mut Window,
-    cx: &mut Context<PopupMenu>,
+    _cx: &mut Context<PopupMenu>,
 ) -> PopupMenu {
-    let is_connected = state.read(cx).is_connected(connection_id);
-    let is_connecting = connecting_id == Some(connection_id);
-
     menu = menu
         .item(
-            PopupMenuItem::new("Connect")
-                .icon(Icon::new(IconName::Globe))
-                .action(Box::new(OpenSelection))
-                .disabled(is_connected || is_connecting)
-                .on_click({
-                    let state = state.clone();
-                    let sidebar = sidebar.clone();
-                    move |_, _window, cx| {
-                        if state.read(cx).is_connected(connection_id) {
-                            return;
-                        }
-
-                        sidebar.update(cx, |sidebar, cx| {
-                            sidebar.expand_connection_and_refresh(connection_id, cx);
-                        });
-
-                        AppCommands::connect(state.clone(), connection_id, cx);
-                    }
-                }),
-        )
-        .item(
-            PopupMenuItem::new("Edit Connection...")
+            PopupMenuItem::new("Edit connection…")
                 .icon(Icon::new(IconName::Settings))
                 .action(Box::new(EditConnection))
                 .on_click({
@@ -69,36 +41,14 @@ pub(crate) fn build_connection_menu(
                 }),
         )
         .item(
-            PopupMenuItem::new("Remove Connection...")
+            PopupMenuItem::new("Remove connection…")
                 .icon(Icon::new(IconName::Delete))
                 .action(Box::new(DeleteSelection))
                 .on_click({
                     let state = state.clone();
                     move |_, window, cx| {
-                        let name = state
-                            .read(cx)
-                            .connection_name(connection_id)
-                            .unwrap_or_else(|| "connection".to_string());
-                        let message = format!("Remove connection \"{name}\"?");
-                        open_confirm_dialog(
-                            window,
-                            cx,
-                            "Remove connection",
-                            message,
-                            "Remove",
-                            true,
-                            {
-                                let state = state.clone();
-                                move |window, cx| {
-                                    request_remove_connection(
-                                        state.clone(),
-                                        connection_id,
-                                        window,
-                                        cx,
-                                    );
-                                }
-                            },
-                        );
+                        let node = TreeNodeId::connection(connection_id);
+                        confirm_delete_node(state.clone(), node, window, cx);
                     }
                 }),
         )
@@ -128,15 +78,13 @@ pub(crate) fn build_connection_menu(
                 }),
         )
         .item(
-            PopupMenuItem::new("Copy Name")
+            PopupMenuItem::new("Copy name")
                 .icon(Icon::new(IconName::Copy))
                 .action(Box::new(CopySelectionName))
                 .on_click({
                     let state = state.clone();
                     move |_, _window, cx| {
-                        if let Some(name) = state.read(cx).connection_name(connection_id) {
-                            cx.write_to_clipboard(ClipboardItem::new_string(name));
-                        }
+                        copy_node_name(&state, &TreeNodeId::connection(connection_id), cx);
                     }
                 }),
         );
@@ -152,14 +100,14 @@ fn menu_item_with_shortcut(
     let shortcut = window.highest_precedence_binding_for_action(action).map(|binding| {
         binding.keystrokes().iter().map(ToString::to_string).collect::<Vec<_>>().join(" ")
     });
-    let icon = match label {
-        "Open Forge" => IconName::SquareTerminal,
-        "Reload Database" => IconName::Redo,
-        "Export Data..." => IconName::Download,
-        "Import Data..." => IconName::Upload,
-        "Copy Data To..." | "Copy" => IconName::Copy,
-        "Paste" => IconName::Inbox,
-        _ => IconName::Menu,
+    let icon: Icon = match label {
+        "Open Forge" => IconName::SquareTerminal.into(),
+        "Reload Database" => IconName::Redo.into(),
+        "Export data…" => crate::assets::AppIcon::Download.into(),
+        "Import data…" => crate::assets::AppIcon::Upload.into(),
+        "Copy data…" | "Copy" => IconName::Copy.into(),
+        "Paste" => IconName::Inbox.into(),
+        _ => IconName::Menu.into(),
     };
     PopupMenuItem::element(move |_window, cx| {
         div()
@@ -195,11 +143,12 @@ pub(crate) fn build_database_menu(
     let database_for_import = database.clone();
     let database_for_transfer_copy = database.clone();
     let database_for_forge = database.clone();
+    let database_for_compare = database.clone();
     let database_for_copy = database;
 
     menu = menu
         .item(
-            PopupMenuItem::new("Select Database")
+            PopupMenuItem::new("Select database")
                 .icon(Icon::new(IconName::LayoutDashboard))
                 .action(Box::new(OpenSelection))
                 .on_click({
@@ -228,7 +177,29 @@ pub(crate) fn build_database_menu(
                 .action(Box::new(OpenForge)),
         )
         .item(
-            PopupMenuItem::new("Create Collection...")
+            PopupMenuItem::new("Compare with…")
+                .icon(crate::views::compare::app_icon("git-compare-arrows"))
+                .on_click({
+                    let state = state.clone();
+                    let connection_id = node_id.connection_id();
+                    let database = database_for_compare.clone();
+                    move |_, _, cx| {
+                        state.update(cx, |state, cx| {
+                            state.open_scoped_compare_tab(
+                                crate::state::compare::CompareScope::Databases,
+                                Some(crate::state::compare::CompareEndpoint {
+                                    connection_id: Some(connection_id),
+                                    database: database.clone(),
+                                    collection: String::new(),
+                                }),
+                                cx,
+                            );
+                        })
+                    }
+                }),
+        )
+        .item(
+            PopupMenuItem::new("Create collection…")
                 .icon(Icon::new(IconName::Plus))
                 .action(Box::new(CreateCollection))
                 .on_click({
@@ -265,7 +236,7 @@ pub(crate) fn build_database_menu(
                 }),
         )
         .item(
-            menu_item_with_shortcut("Export Data...", &TransferExport, window)
+            menu_item_with_shortcut("Export data…", &TransferExport, window)
                 .action(Box::new(TransferExport))
                 .on_click({
                     let state = state.clone();
@@ -286,7 +257,7 @@ pub(crate) fn build_database_menu(
                 }),
         )
         .item(
-            menu_item_with_shortcut("Import Data...", &TransferImport, window)
+            menu_item_with_shortcut("Import data…", &TransferImport, window)
                 .action(Box::new(TransferImport))
                 .on_click({
                     let state = state.clone();
@@ -307,7 +278,7 @@ pub(crate) fn build_database_menu(
                 }),
         )
         .item(
-            menu_item_with_shortcut("Copy Data To...", &TransferCopy, window)
+            menu_item_with_shortcut("Copy data…", &TransferCopy, window)
                 .action(Box::new(TransferCopy))
                 .on_click({
                     let state = state.clone();
@@ -328,42 +299,15 @@ pub(crate) fn build_database_menu(
                 }),
         )
         .item(
-            PopupMenuItem::new("Drop Database...")
+            PopupMenuItem::new("Drop database…")
                 .icon(Icon::new(IconName::Delete))
                 .action(Box::new(DeleteSelection))
                 .on_click({
                     let state = state.clone();
-                    let connection_id = node_id.connection_id();
-                    let database = database_for_drop.clone();
+                    let node =
+                        TreeNodeId::database(node_id.connection_id(), database_for_drop.clone());
                     move |_, window, cx| {
-                        let message =
-                            format!("Drop database \"{database}\"? This cannot be undone.");
-                        let state_for_write = state.clone();
-                        let database_for_write = database.clone();
-                        request_connection_write(
-                            state.clone(),
-                            crate::components::WriteRequest::new(
-                                connection_id,
-                                database.clone(),
-                                "Drop a database",
-                                Some(WriteConfirmation {
-                                    title: "Drop database".into(),
-                                    message,
-                                    confirm_label: "Drop".into(),
-                                    destructive: true,
-                                }),
-                            ),
-                            window,
-                            cx,
-                            move |_window, cx| {
-                                AppCommands::drop_database(
-                                    state_for_write,
-                                    connection_id,
-                                    database_for_write,
-                                    cx,
-                                );
-                            },
-                        );
+                        confirm_delete_node(state.clone(), node.clone(), window, cx);
                     }
                 }),
         )
@@ -471,11 +415,19 @@ pub(crate) fn build_collection_menu(
     let label_for_copy = label.clone();
     let database_for_copy = database.clone();
     let collection_for_copy = collection.clone();
+    let is_view = state
+        .read(_cx)
+        .active_connection_by_id(connection_id)
+        .and_then(|conn| conn.collection_detail(&database, &collection))
+        .is_some_and(|detail| matches!(detail, crate::models::CollectionDetail::View { .. }));
 
     menu = menu
         .item(
-            PopupMenuItem::new("Open Collection View").icon(Icon::new(IconName::Braces)).on_click(
-                {
+            // Fork: Enter / OpenSelection opens a collection Forge tab, so this item carries no
+            // shortcut hint; it is the explicit way to reach the document browser.
+            PopupMenuItem::new("Open collection view")
+                .icon(Icon::new(crate::assets::AppIcon::Braces))
+                .on_click({
                     let state = state.clone();
                     let database = database.clone();
                     let collection = collection.clone();
@@ -485,8 +437,48 @@ pub(crate) fn build_collection_menu(
                             state.select_collection(database.clone(), collection.clone(), cx);
                         });
                     }
-                },
-            ),
+                }),
+        )
+        .item(
+            menu_item_with_shortcut("Open in new tab", &OpenSelectionInNewTab, window)
+                .icon(Icon::new(crate::assets::AppIcon::Braces))
+                .on_click({
+                    let state = state.clone();
+                    let database = database.clone();
+                    let collection = collection.clone();
+                    move |_, _window, cx| {
+                        state.update(cx, |state, cx| {
+                            state.select_connection(Some(connection_id), cx);
+                            state.open_collection_in_new_tab(
+                                database.clone(),
+                                collection.clone(),
+                                String::new(),
+                                None,
+                                cx,
+                            );
+                        });
+                    }
+                }),
+        )
+        .item(
+            PopupMenuItem::new("Infer relations")
+                .icon(Icon::new(crate::assets::AppIcon::Workflow))
+                .on_click({
+                    let state = state.clone();
+                    let database = database.clone();
+                    let collection = collection.clone();
+                    move |_, _window, cx| {
+                        state.update(cx, |state, cx| {
+                            state.select_connection(Some(connection_id), cx);
+                        });
+                        AppCommands::infer_relations(
+                            state.clone(),
+                            database.clone(),
+                            collection.clone(),
+                            cx,
+                        );
+                    }
+                }),
         )
         .item(
             menu_item_with_shortcut("Open Forge", &OpenForge, window)
@@ -507,11 +499,31 @@ pub(crate) fn build_collection_menu(
                 })
                 .action(Box::new(OpenForge)),
         )
-        .item(
-            PopupMenuItem::new("Rename Collection...")
-                .icon(Icon::new(IconName::Settings2))
-                .action(Box::new(RenameCollection))
-                .on_click({
+        // A view can't be renamed, only redefined or copied under another name.
+        .when(is_view, |menu: PopupMenu| {
+            menu.item(
+                PopupMenuItem::new("Edit view definition")
+                    .icon(Icon::new(IconName::Settings2))
+                    .on_click({
+                        let state = state.clone();
+                        let database = database.clone();
+                        let collection = collection.clone();
+                        move |_, _window, cx| {
+                            state.update(cx, |state, cx| {
+                                state.select_connection(Some(connection_id), cx);
+                            });
+                            AppCommands::edit_view_definition(
+                                state.clone(),
+                                connection_id,
+                                database.clone(),
+                                collection.clone(),
+                                cx,
+                            );
+                        }
+                    }),
+            )
+            .item(
+                PopupMenuItem::new("Duplicate view…").icon(Icon::new(IconName::Copy)).on_click({
                     let state = state.clone();
                     let database = database.clone();
                     let collection = collection.clone();
@@ -519,61 +531,57 @@ pub(crate) fn build_collection_menu(
                         state.update(cx, |state, cx| {
                             state.select_connection(Some(connection_id), cx);
                         });
-                        open_rename_collection_dialog(
+                        super::dialogs::open_new_view_dialog(
                             state.clone(),
+                            connection_id,
                             database.clone(),
-                            collection.clone(),
+                            super::dialogs::NewView::CopyOf(collection.clone()),
                             window,
                             cx,
                         );
                     }
                 }),
-        )
+            )
+        })
+        .when(!is_view, |menu: PopupMenu| {
+            menu.item(
+                PopupMenuItem::new("Rename collection…")
+                    .icon(Icon::new(IconName::Settings2))
+                    .action(Box::new(RenameCollection))
+                    .on_click({
+                        let state = state.clone();
+                        let database = database.clone();
+                        let collection = collection.clone();
+                        move |_, window, cx| {
+                            state.update(cx, |state, cx| {
+                                state.select_connection(Some(connection_id), cx);
+                            });
+                            open_rename_collection_dialog(
+                                state.clone(),
+                                database.clone(),
+                                collection.clone(),
+                                window,
+                                cx,
+                            );
+                        }
+                    }),
+            )
+        })
         .item(
-            PopupMenuItem::new("Drop Collection...")
+            PopupMenuItem::new(if is_view { "Drop view…" } else { "Drop collection…" })
                 .icon(Icon::new(IconName::Delete))
                 .action(Box::new(DeleteSelection))
                 .on_click({
                     let state = state.clone();
-                    let database = database.clone();
-                    let collection = collection.clone();
+                    let node =
+                        TreeNodeId::collection(connection_id, database.clone(), collection.clone());
                     move |_, window, cx| {
-                        let message = format!(
-                            "Drop collection \"{database}.{collection}\"? This cannot be undone."
-                        );
-                        let state_for_write = state.clone();
-                        let database_for_write = database.clone();
-                        let collection_for_write = collection.clone();
-                        request_connection_write(
-                            state.clone(),
-                            crate::components::WriteRequest::new(
-                                connection_id,
-                                format!("{database}.{collection}"),
-                                "Drop a collection",
-                                Some(WriteConfirmation {
-                                    title: "Drop collection".into(),
-                                    message,
-                                    confirm_label: "Drop".into(),
-                                    destructive: true,
-                                }),
-                            ),
-                            window,
-                            cx,
-                            move |_window, cx| {
-                                AppCommands::drop_collection(
-                                    state_for_write,
-                                    connection_id,
-                                    database_for_write,
-                                    collection_for_write,
-                                    cx,
-                                );
-                            },
-                        );
+                        confirm_delete_node(state.clone(), node.clone(), window, cx);
                     }
                 }),
         )
         .item(
-            menu_item_with_shortcut("Export Data...", &TransferExport, window)
+            menu_item_with_shortcut("Export data…", &TransferExport, window)
                 .action(Box::new(TransferExport))
                 .on_click({
                     let state = state.clone();
@@ -594,8 +602,10 @@ pub(crate) fn build_collection_menu(
                 }),
         )
         .item(
-            menu_item_with_shortcut("Import Data...", &TransferImport, window)
+            menu_item_with_shortcut("Import data…", &TransferImport, window)
                 .action(Box::new(TransferImport))
+                // Nothing can be imported into a view; the data goes into its source.
+                .disabled(is_view)
                 .on_click({
                     let state = state.clone();
                     let database = database.clone();
@@ -615,7 +625,7 @@ pub(crate) fn build_collection_menu(
                 }),
         )
         .item(
-            menu_item_with_shortcut("Copy Data To...", &TransferCopy, window)
+            menu_item_with_shortcut("Copy data…", &TransferCopy, window)
                 .action(Box::new(TransferCopy))
                 .on_click({
                     let state = state.clone();
@@ -632,6 +642,27 @@ pub(crate) fn build_collection_menu(
                                 cx,
                             );
                         });
+                    }
+                }),
+        )
+        .item(
+            PopupMenuItem::new("Compare with…")
+                .icon(crate::views::compare::app_icon("git-compare-arrows"))
+                .on_click({
+                    let state = state.clone();
+                    let database = database.clone();
+                    let collection = collection.clone();
+                    move |_, _, cx| {
+                        state.update(cx, |state, cx| {
+                            state.open_compare_tab(
+                                Some(crate::state::compare::CompareEndpoint {
+                                    connection_id: Some(connection_id),
+                                    database: database.clone(),
+                                    collection: collection.clone(),
+                                }),
+                                cx,
+                            )
+                        })
                     }
                 }),
         )
@@ -728,7 +759,7 @@ pub(crate) fn build_collection_menu(
             )
         })
         .item(
-            PopupMenuItem::new("Copy Name")
+            PopupMenuItem::new("Copy name")
                 .icon(Icon::new(IconName::Copy))
                 .action(Box::new(CopySelectionName))
                 .on_click({

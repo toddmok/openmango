@@ -1,4 +1,4 @@
-use gpui::{AsyncApp, Context, Entity, WeakEntity};
+use gpui_kit::{AsyncApp, Context, Entity, WeakEntity};
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
@@ -7,7 +7,7 @@ use mongodb::Client;
 use crate::actions::model::{
     BackupManifest, OperationRecord, ProposedAction, ProposedActionContent,
 };
-use crate::state::{AppEvent, AppState};
+use crate::state::AppState;
 use crate::sync::plan::ActionPreflight;
 
 use super::{McpConnection, policy::PolicyEvaluator};
@@ -22,6 +22,9 @@ pub struct McpBridge {
     requests: mpsc::Sender<BridgeRequest>,
 }
 
+/// A snapshot of the relation graph, handed across to the server's runtime.
+pub type SharedRelations = std::sync::Arc<crate::state::relations::RelationGraph>;
+
 enum BridgeRequest {
     ListConnections(oneshot::Sender<Vec<McpConnection>>),
     ListDatabases {
@@ -31,6 +34,11 @@ enum BridgeRequest {
     ResolveRead {
         connection_id: Uuid,
         response: oneshot::Sender<Result<Client, String>>,
+    },
+    Relations {
+        connection_id: Uuid,
+        database: String,
+        response: oneshot::Sender<Result<SharedRelations, String>>,
     },
     ResolveDirectWrite {
         connection_id: Uuid,
@@ -87,7 +95,7 @@ impl McpBridge {
         let (requests, mut receiver) = mpsc::channel(16);
         cx.spawn(async move |_view: WeakEntity<V>, cx: &mut AsyncApp| {
             while let Some(request) = receiver.recv().await {
-                let result = cx.update(|cx| match request {
+                cx.update(|cx| match request {
                     BridgeRequest::ListConnections(response) => {
                         let _ = response.send(shared_connections(state.read(cx)));
                     }
@@ -97,6 +105,11 @@ impl McpBridge {
                     }
                     BridgeRequest::ResolveRead { connection_id, response } => {
                         let result = shared_client(state.read(cx), connection_id);
+                        let _ = response.send(result);
+                    }
+                    BridgeRequest::Relations { connection_id, database, response } => {
+                        let result = PolicyEvaluator::new(state.read(cx))
+                            .relations(connection_id, &database);
                         let _ = response.send(result);
                     }
                     BridgeRequest::ResolveDirectWrite { connection_id, response } => {
@@ -179,9 +192,8 @@ impl McpBridge {
                                 .propose(*content)
                                 .map_err(|error| error.to_string());
                             let _ = response.send(result);
-                            state.update(cx, |_state, cx| {
-                                cx.emit(AppEvent::AgentActivityChanged);
-                                cx.notify();
+                            state.update(cx, |state, cx| {
+                                state.agent_activity_changed(cx);
                             });
                         }
                     }
@@ -225,15 +237,11 @@ impl McpBridge {
                             .cancel_operation_for_grant(operation_id, grant_id)
                             .map_err(|error| error.to_string());
                         let _ = response.send(result);
-                        state.update(cx, |_state, cx| {
-                            cx.emit(AppEvent::AgentActivityChanged);
-                            cx.notify();
+                        state.update(cx, |state, cx| {
+                            state.agent_activity_changed(cx);
                         });
                     }
                 });
-                if result.is_err() {
-                    break;
-                }
             }
         })
         .detach();
@@ -253,6 +261,19 @@ impl McpBridge {
         let (response, receiver) = oneshot::channel();
         self.requests
             .send(BridgeRequest::ListDatabases { connection_id, response })
+            .await
+            .map_err(|_| "OpenMango is shutting down".to_string())?;
+        receiver.await.map_err(|_| "OpenMango is shutting down".to_string())?
+    }
+
+    pub async fn relations(
+        &self,
+        connection_id: Uuid,
+        database: String,
+    ) -> Result<SharedRelations, String> {
+        let (response, receiver) = oneshot::channel();
+        self.requests
+            .send(BridgeRequest::Relations { connection_id, database, response })
             .await
             .map_err(|_| "OpenMango is shutting down".to_string())?;
         receiver.await.map_err(|_| "OpenMango is shutting down".to_string())?
@@ -440,6 +461,23 @@ impl McpBridge {
                                     .connected
                                     .then(|| connection.databases.clone())
                                     .ok_or_else(|| "Connection is not connected".to_string())
+                            });
+                        let _ = response.send(result);
+                    }
+                    BridgeRequest::Relations { connection_id, database, response } => {
+                        // The fixed bridge knows no relations, but it keeps the same gate.
+                        let result = connections
+                            .iter()
+                            .find(|connection| connection.id == connection_id)
+                            .ok_or_else(|| "Connection is not shared with agents".to_string())
+                            .and_then(|connection| {
+                                connection
+                                    .databases
+                                    .contains(&database)
+                                    .then(SharedRelations::default)
+                                    .ok_or_else(|| {
+                                        "Database is not available on this connection".to_string()
+                                    })
                             });
                         let _ = response.send(result);
                     }

@@ -1,9 +1,12 @@
+// Release builds are GUI apps; debug builds keep a console for logs.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 #[cfg(feature = "mimalloc")]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-use gpui::*;
-use gpui_component::Root;
+use gpui_kit::component::{Root, TitleBar};
+use gpui_kit::*;
 use openmango::app::AppRoot;
 use openmango::assets::{Assets, embedded_fonts};
 use openmango::keyboard;
@@ -11,11 +14,37 @@ use openmango::state::ConfigManager;
 use openmango::theme;
 
 fn main() {
+    // reqwest has no crypto provider of its own and panics without one.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    if std::env::args_os().any(|argument| argument == "--version") {
+        println!("OpenMango {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
+    #[cfg(target_os = "linux")]
+    if std::env::args_os().any(|argument| argument == "--install-desktop") {
+        match openmango::helpers::linux::install_desktop() {
+            Ok(path) => println!(
+                "Installed OpenMango to {}. Open it from your application menu.",
+                path.display()
+            ),
+            Err(error) => {
+                eprintln!("Could not install OpenMango: {error:#}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
     openmango::helpers::support::init_logging();
+    // Started by the system scheduler: runs what is due while OpenMango is closed, no window.
+    if std::env::args_os().any(|argument| argument == "--run-due-tasks") {
+        openmango::app::background::run_due_tasks();
+        return;
+    }
 
-    Application::new().with_assets(Assets).run(|cx: &mut gpui::App| {
-        // Initialize gpui-component library, then add the effective app keymap.
-        gpui_component::init(cx);
+    gpui_kit::application().with_assets(Assets).run(|cx: &mut gpui_kit::App| {
+        // Initialize the toolkit before applying the app keymap and theme.
+        gpui_kit::init(cx);
+        cx.set_app_identity("com.openmango.app", "OpenMango");
         let saved_settings = ConfigManager::default().load_settings().unwrap_or_default();
         keyboard::bind_keymap(cx, &saved_settings.keybindings);
         if let Err(err) = cx.text_system().add_fonts(embedded_fonts()) {
@@ -24,27 +53,16 @@ fn main() {
 
         // Load saved appearance.
 
-        let saved_theme = saved_settings.appearance.theme;
-        let vibrancy = theme::effective_vibrancy(saved_theme, saved_settings.appearance.vibrancy);
+        let saved_theme = theme::resolved_theme(&saved_settings.appearance, cx.window_appearance());
 
         // Load the saved theme (or default)
         {
             if let Some(config) = theme::load_theme_config(saved_theme.theme_id()) {
-                gpui_component::theme::Theme::global_mut(cx).apply_config(&config);
+                gpui_kit::component::theme::Theme::global_mut(cx).apply_config(&config);
             }
         }
 
-        // Override font families (after apply_config so they take precedence)
-        {
-            let theme = gpui_component::theme::Theme::global_mut(cx);
-            theme.font_family = theme::fonts::ui().into();
-            theme.mono_font_family = theme::fonts::mono().into();
-        }
-
-        // Apply vibrancy alpha overrides after theme is fully configured
-        if vibrancy {
-            theme::apply_vibrancy(cx);
-        }
+        theme::apply_design_tokens(cx);
 
         let workspace = ConfigManager::default().load_workspace().unwrap_or_default();
         let default_bounds = Bounds::centered(None, size(px(1200.0), px(800.0)), cx);
@@ -54,22 +72,21 @@ fn main() {
             .map(|state| state.to_bounds())
             .unwrap_or(WindowBounds::Windowed(default_bounds));
 
-        cx.open_window(
+        let opened = cx.open_window(
             WindowOptions {
+                app_id: Some("com.openmango.app".into()),
+                #[cfg(target_os = "linux")]
+                window_decorations: Some(WindowDecorations::Client),
                 window_bounds: Some(window_bounds),
-                window_background: if vibrancy {
-                    WindowBackgroundAppearance::Blurred
-                } else {
-                    WindowBackgroundAppearance::Opaque
-                },
                 titlebar: Some(TitlebarOptions {
                     title: Some("OpenMango".into()),
-                    appears_transparent: vibrancy,
-                    ..Default::default()
+                    ..TitleBar::title_bar_options()
                 }),
-                ..Default::default()
+                ..TitleBar::window_options()
             },
             |window, cx| {
+                #[cfg(target_os = "linux")]
+                window.on_next_frame(|_, _| openmango::helpers::linux::notify_update_ready());
                 let app_view = cx.new(|cx| AppRoot::new(window, cx));
                 let app_view_for_close = app_view.clone();
 
@@ -82,7 +99,11 @@ fn main() {
 
                 cx.new(|cx| Root::new(app_view, window, cx))
             },
-        )
-        .unwrap();
+        );
+        // Release GUI builds have no console, so the log is the only place this is visible.
+        if let Err(error) = opened {
+            log::error!("Could not open the main window: {error:#}");
+            std::process::exit(1);
+        }
     });
 }

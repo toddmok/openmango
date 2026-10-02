@@ -69,10 +69,6 @@ impl ActionBroker {
         Ok(action)
     }
 
-    pub fn expire_action_if_needed(&self, id: Uuid) -> Result<ProposedAction> {
-        self.expire_if_needed(self.load_verified_action(id)?)
-    }
-
     pub fn get_for_grant(&self, id: Uuid, grant_id: Uuid) -> Result<ProposedAction> {
         let action = self.load_verified_action(id)?;
         ensure_grant_visibility(&action, grant_id)?;
@@ -316,6 +312,29 @@ pub fn content_hash(content: &ProposedActionContent) -> Result<String> {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     Ok(to_hex(&hasher.finalize()))
+}
+
+/// A hash of what makes a saved connection this server with these rights: its address, transport,
+/// environment, protection and read-only flag. Agent Activity and task approval compare it to
+/// notice a connection that changed since.
+pub fn connection_identity_hash(connection: &crate::models::SavedConnection) -> Result<String> {
+    let stripped = connection.with_secrets_stripped();
+    let mut identity = serde_json::json!({
+        "id": stripped.id,
+        "name": stripped.name,
+        "uri": stripped.uri,
+        "environment": stripped.environment,
+        "protected": stripped.protected,
+        "read_only": stripped.read_only,
+        "ssh": stripped.ssh,
+        "proxy": stripped.proxy,
+        "secret_id": stripped.secret_id,
+    });
+    // Only when set: connections without one keep the hash they had before the field existed.
+    if let Some(command) = &stripped.before_connect {
+        identity["before_connect"] = serde_json::json!(command);
+    }
+    hash_serializable(&identity)
 }
 
 pub fn hash_serializable(value: &impl serde::Serialize) -> Result<String> {

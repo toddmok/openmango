@@ -1,6 +1,6 @@
 //! Command helpers for async operations + event emission.
 
-use gpui::{App, Entity};
+use gpui_kit::{App, Entity};
 use mongodb::Client;
 use uuid::Uuid;
 
@@ -42,6 +42,23 @@ impl AppCommands {
         authorized
     }
 
+    /// `ensure_writable` for a write aimed at one namespace. The view check runs first so a
+    /// refused write never spends a production-write authorization.
+    pub(super) fn ensure_collection_writable(
+        state: &Entity<AppState>,
+        session_key: &SessionKey,
+        cx: &mut App,
+    ) -> bool {
+        if let Some(reason) = state.read(cx).view_read_only_reason(session_key) {
+            state.update(cx, |state, cx| {
+                state.set_status_message(Some(StatusMessage::error(reason)));
+                cx.notify();
+            });
+            return false;
+        }
+        Self::ensure_writable(state, Some(session_key.connection_id), cx)
+    }
+
     pub(super) fn active_client(
         state: &Entity<AppState>,
         connection_id: Uuid,
@@ -63,17 +80,25 @@ mod actions;
 mod aggregation;
 mod collection_meta;
 mod collections;
+pub(crate) mod compare;
+mod compare_sync;
 mod connections;
 mod databases;
 mod documents;
 mod explain;
 mod indexes;
 mod operations;
+mod relations;
 mod schema;
+pub(crate) use aggregation::view_pipeline;
+pub use collections::{ViewSave, ViewSource};
 pub use documents::save_as::ExportProgress;
 pub(crate) use schema::{SCHEMA_SAMPLE_SIZE, build_schema_analysis};
 pub use schema::{schema_to_compass, schema_to_json_schema, schema_to_summary};
 mod stats;
+mod task_run;
+mod task_schedule;
+mod tasks;
 mod transfer;
 mod updater;
 

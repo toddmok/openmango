@@ -5,10 +5,10 @@ mod key_rows;
 mod render;
 pub(super) mod support;
 
-use gpui::*;
-use gpui_component::WindowExt as _;
-use gpui_component::dialog::Dialog;
-use gpui_component::input::InputState;
+use gpui_kit::component::WindowExt as _;
+use gpui_kit::component::dialog::Dialog;
+use gpui_kit::component::input::{EditorState, InputState};
+use gpui_kit::*;
 use mongodb::IndexModel;
 use mongodb::bson::{Bson, Document, doc, to_bson};
 
@@ -32,9 +32,9 @@ pub struct IndexCreateDialog {
     pub(super) suggestions: Vec<FieldSuggestion>,
     pub(super) name_state: Entity<InputState>,
     pub(super) ttl_state: Entity<InputState>,
-    pub(super) partial_state: Entity<InputState>,
-    pub(super) collation_state: Entity<InputState>,
-    pub(super) json_state: Entity<InputState>,
+    pub(super) partial_state: Entity<EditorState>,
+    pub(super) collation_state: Entity<EditorState>,
+    pub(super) json_state: Entity<EditorState>,
     pub(super) unique: bool,
     pub(super) sparse: bool,
     pub(super) hidden: bool,
@@ -55,7 +55,7 @@ impl IndexCreateDialog {
         let dialog_view =
             cx.new(|cx| IndexCreateDialog::new(state.clone(), session_key, window, cx));
         window.open_dialog(cx, move |dialog: Dialog, _window: &mut Window, _cx: &mut App| {
-            dialog.title("Create Index").w(px(912.0)).child(dialog_view.clone())
+            dialog.title("Create index").w(px(912.0)).child(dialog_view.clone())
         });
     }
 
@@ -70,7 +70,7 @@ impl IndexCreateDialog {
             IndexCreateDialog::new_with_index(state.clone(), session_key, model, window, cx)
         });
         window.open_dialog(cx, move |dialog: Dialog, _window: &mut Window, _cx: &mut App| {
-            dialog.title("Edit Index").w(px(912.0)).child(dialog_view.clone())
+            dialog.title("Edit index").w(px(912.0)).child(dialog_view.clone())
         });
     }
 
@@ -80,24 +80,24 @@ impl IndexCreateDialog {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let name_state = cx.new(|cx| InputState::new(window, cx).placeholder("Index name"));
-        let ttl_state = cx.new(|cx| InputState::new(window, cx).placeholder("TTL seconds"));
+        let name_state = cx.new(|cx| InputState::new(window, cx).placeholder("status_1"));
+        let ttl_state = cx.new(|cx| InputState::new(window, cx).placeholder("3600"));
         let partial_state = cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder("Partial filter (JSON)")
-                .code_editor("javascript")
+            EditorState::new(window, cx)
+                .placeholder("{ status: \"active\" }")
+                .language("javascript")
                 .soft_wrap(true)
         });
         let collation_state = cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder("Collation (JSON)")
-                .code_editor("javascript")
+            EditorState::new(window, cx)
+                .placeholder("{ locale: \"en\", strength: 2 }")
+                .language("javascript")
                 .soft_wrap(true)
         });
         let json_state = cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder("{ \"key\": { \"field\": 1 } }")
-                .code_editor("javascript")
+            EditorState::new(window, cx)
+                .placeholder("{ key: { status: 1 }, name: \"status_1\" }")
+                .language("javascript")
                 .line_number(true)
                 .soft_wrap(true)
         });
@@ -145,6 +145,18 @@ impl IndexCreateDialog {
                 }
             });
         dialog._subscriptions.push(state_subscription);
+
+        // Cmd/Ctrl+Enter submits, as in the other multi-line query and value dialogs.
+        let weak = cx.entity().downgrade();
+        dialog._subscriptions.push(cx.intercept_keystrokes(move |event, window, cx| {
+            if matches!(event.keystroke.key.as_str(), "enter" | "return")
+                && event.keystroke.modifiers.secondary()
+                && let Some(view) = weak.upgrade()
+            {
+                IndexCreateDialog::submit(view, window, cx);
+                cx.stop_propagation();
+            }
+        }));
 
         dialog.add_row(window, cx);
         dialog.load_sample_fields(cx);
@@ -287,9 +299,9 @@ impl IndexCreateDialog {
             async move { manager.sample_documents(&client, &database, &collection, SAMPLE_SIZE) }
         });
 
-        cx.spawn(async move |view: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+        cx.spawn(async move |view: WeakEntity<Self>, cx: &mut gpui_kit::AsyncApp| {
             let result: Result<Vec<Document>, crate::error::Error> = task.await;
-            let _ = cx.update(|cx| {
+            cx.update(|cx| {
                 let _ = view.update(cx, |this, cx: &mut Context<Self>| match result {
                     Ok(docs) => {
                         this.suggestions = build_field_suggestions(&docs);

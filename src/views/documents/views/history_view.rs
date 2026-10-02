@@ -1,12 +1,15 @@
+use gpui_kit::component::button::ButtonVariants as _;
 use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
-use gpui::prelude::FluentBuilder as _;
-use gpui::*;
-use gpui_component::scroll::ScrollableElement as _;
-use gpui_component::{ActiveTheme as _, Icon, IconName, Sizable as _};
+use gpui_kit::component::scroll::ScrollableElement as _;
+use gpui_kit::component::{ActiveTheme as _, Icon, IconName, Sizable as _, Size};
+use gpui_kit::prelude::FluentBuilder as _;
+use gpui_kit::*;
 
-use crate::components::{Button, WriteConfirmation, WriteRequest, request_connection_write};
+use crate::components::{
+    Button, WriteConfirmation, WriteRequest, busy_label, request_connection_write,
+};
 use crate::history::{BatchStatus, BatchSummary, HistoryGap};
 use crate::state::{AppCommands, AppState, SessionKey};
 use crate::theme::{fonts, spacing};
@@ -103,18 +106,19 @@ pub(crate) fn render_history_view(
                     let state = state.clone();
                     let session_key = session_key.clone();
                     div().flex().justify_center().p(spacing::lg()).child(
-                        Button::new("load-more-collection-history")
-                            .ghost()
-                            .compact()
-                            .label(if loading { "Loading…" } else { "Load more" })
-                            .disabled(loading)
-                            .on_click(move |_, _, cx| {
-                                AppCommands::load_more_collection_history(
-                                    state.clone(),
-                                    session_key.clone(),
-                                    cx,
-                                );
-                            }),
+                        busy_label(
+                            Button::new("load-more-collection-history").ghost(),
+                            Size::XSmall,
+                            "Load more",
+                            loading,
+                        )
+                        .on_click(move |_, _, cx| {
+                            AppCommands::load_more_collection_history(
+                                state.clone(),
+                                session_key.clone(),
+                                cx,
+                            );
+                        }),
                     )
                 })),
         )
@@ -160,7 +164,7 @@ fn history_header(
         .child(
             Button::new("refresh-collection-history")
                 .ghost()
-                .compact()
+                .xsmall()
                 .label("Refresh")
                 .on_click(move |_, _, cx| {
                     AppCommands::load_collection_history(
@@ -173,7 +177,7 @@ fn history_header(
         .child(
             Button::new("clear-collection-history")
                 .ghost()
-                .compact()
+                .xsmall()
                 .label("Clear collection")
                 .on_click(move |_, window, cx| {
                     let state_for_clear = state.clone();
@@ -379,17 +383,12 @@ fn batch_row(
                 .justify_end()
                 .gap(spacing::xs())
                 .child(
-                    Button::new(("history-batch-details", batch_id.as_u128() as u64))
-                        .ghost()
-                        .compact()
-                        .label(if detail_loading {
-                            "Loading…"
-                        } else if details_loaded {
-                            "Hide"
-                        } else {
-                            "Details"
-                        })
-                        .disabled(detail_loading)
+                    busy_label(
+                        Button::new(("history-batch-details", batch_id.as_u128() as u64)).ghost(),
+                        Size::XSmall,
+                        if details_loaded { "Hide" } else { "Details" },
+                        detail_loading,
+                    )
                         .on_click({
                             let state = state.clone();
                             let session_key = session_key.clone();
@@ -409,7 +408,7 @@ fn batch_row(
                     actions.child(
                         Button::new(("delete-history-batch", batch_id.as_u128() as u64))
                             .ghost()
-                            .compact()
+                            .xsmall()
                             .label("Delete")
                             .on_click(move |_, window, cx| {
                                 let state_for_delete = state.clone();
@@ -446,7 +445,7 @@ fn batch_row(
                     actions.child(
                         Button::new(("cancel-history-restore", batch_id.as_u128() as u64))
                             .ghost()
-                            .compact()
+                            .xsmall()
                             .label("Cancel")
                             .on_click(move |_, _, cx| {
                                 AppCommands::cancel_history_restore(state.clone(), batch_id, cx);
@@ -457,7 +456,7 @@ fn batch_row(
                     actions.child(
                         Button::new(("restore-history-batch", batch_id.as_u128() as u64))
                             .ghost()
-                            .compact()
+                            .xsmall()
                             .label(if resuming { "Resume" } else { "Restore" })
                             .on_click(move |_, window, cx| {
                                 let state_for_write = state.clone();
@@ -597,7 +596,7 @@ fn empty_state(icon: IconName, title: &str, description: &str, cx: &App) -> Div 
                     .flex()
                     .items_center()
                     .justify_center()
-                    .rounded(px(8.0))
+                    .rounded(crate::theme::borders::radius_md())
                     .bg(cx.theme().secondary.opacity(0.45))
                     .child(Icon::new(icon).small().text_color(cx.theme().muted_foreground)),
             )

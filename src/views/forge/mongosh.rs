@@ -1,6 +1,6 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, ChildStdin, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -52,11 +52,82 @@ struct CompletionItem {
 #[derive(Debug, Deserialize)]
 pub struct RuntimeEvaluationResult {
     #[serde(rename = "type")]
-    #[allow(dead_code)]
     pub result_type: Option<String>,
     pub printable: serde_json::Value,
-    #[allow(dead_code)]
+    #[serde(default)]
+    pub is_undefined: bool,
     pub source: Option<serde_json::Value>,
+    /// Present when the result is kept in the sidecar and only this page was sent.
+    #[serde(default)]
+    pub paging: Option<ResultPaging>,
+}
+
+/// Where a page sits in a result the sidecar keeps. `total` is known once the result has been
+/// read to its end, or at once for an array.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct ResultPaging {
+    pub result_id: String,
+    pub page: u64,
+    pub page_size: u64,
+    pub offset: u64,
+    pub count: u64,
+    pub has_more: bool,
+    #[serde(default)]
+    pub total: Option<u64>,
+}
+
+impl ResultPaging {
+    /// Pages in the result when the total is known.
+    pub fn total_pages(&self) -> Option<u64> {
+        self.total.map(|total| total.div_ceil(self.page_size.max(1)).max(1))
+    }
+
+    /// `1–1,000 of 18,000`, or `1–1,000 of 1,000+` while the end has not been read.
+    pub fn range_label(&self) -> String {
+        let start = if self.count == 0 { 0 } else { self.offset + 1 };
+        let end = self.offset + self.count;
+        let of = match self.total {
+            Some(total) => group_thousands(total),
+            None => format!("{}+", group_thousands(end)),
+        };
+        format!("{}–{} of {of}", group_thousands(start), group_thousands(end))
+    }
+}
+
+pub fn group_thousands(value: u64) -> String {
+    let digits = value.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, ch) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// Which page to fetch from a kept result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PageRequest {
+    Index(u64),
+    Last,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PageResult {
+    pub printable: serde_json::Value,
+    pub paging: ResultPaging,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ExportOpened {
+    pub export_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ExportChunk {
+    pub documents: serde_json::Value,
+    pub done: bool,
 }
 
 pub struct MongoshBridge {
@@ -80,7 +151,7 @@ impl MongoshBridge {
             Error::ToolNotFound(guidance.into())
         })?;
 
-        let mut cmd = Command::new(sidecar);
+        let mut cmd = crate::connection::tools::tool_command(sidecar);
         cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
 
         let mut child = cmd.spawn()?;
@@ -254,23 +325,117 @@ impl MongoshBridge {
         run_id: Option<u64>,
         timeout: Duration,
     ) -> Result<RuntimeEvaluationResult> {
-        let value = self
-            .send_request(
-                "evaluate",
-                json!({
-                    "session_id": session_id,
-                    "code": code,
-                    "run_id": run_id,
-                }),
-                timeout,
-            )
-            .inspect_err(|err| {
-                if err.to_string().contains("Session not found") {
-                    self.invalidate_session(session_id);
-                }
-            })?;
+        self.evaluate_paged(session_id, code, run_id, None, timeout)
+    }
 
+    /// Evaluate with a page size: a cursor or an array of documents comes back one page at a
+    /// time, and the rest stays in the sidecar for [`Self::page`].
+    pub fn evaluate_paged(
+        &self,
+        session_id: Uuid,
+        code: &str,
+        run_id: Option<u64>,
+        page_size: Option<u64>,
+        timeout: Duration,
+    ) -> Result<RuntimeEvaluationResult> {
+        let mut params = json!({
+            "session_id": session_id,
+            "code": code,
+            "run_id": run_id,
+        });
+        if let Some(page_size) = page_size {
+            params["page_size"] = json!(page_size);
+        }
+        let value = self.session_request(session_id, "evaluate", params, timeout)?;
         serde_json::from_value(value).map_err(Error::from)
+    }
+
+    pub fn page(
+        &self,
+        session_id: Uuid,
+        result_id: &str,
+        page: PageRequest,
+        page_size: u64,
+        timeout: Duration,
+    ) -> Result<PageResult> {
+        let page = match page {
+            PageRequest::Index(index) => json!(index),
+            PageRequest::Last => json!("last"),
+        };
+        let value = self.session_request(
+            session_id,
+            "page",
+            json!({
+                "session_id": session_id,
+                "result_id": result_id,
+                "page": page,
+                "page_size": page_size,
+            }),
+            timeout,
+        )?;
+        serde_json::from_value(value).map_err(Error::from)
+    }
+
+    pub fn release_result(&self, session_id: Uuid, result_id: &str) {
+        let _ = self.send_request(
+            "release_result",
+            json!({ "session_id": session_id, "result_id": result_id }),
+            Duration::from_secs(8),
+        );
+    }
+
+    /// Run code for an export. Nothing is read from the result until [`Self::export_next`].
+    pub fn export_open(
+        &self,
+        session_id: Uuid,
+        code: &str,
+        timeout: Duration,
+    ) -> Result<ExportOpened> {
+        let value = self.session_request(
+            session_id,
+            "export_open",
+            json!({ "session_id": session_id, "code": code }),
+            timeout,
+        )?;
+        serde_json::from_value(value).map_err(Error::from)
+    }
+
+    pub fn export_next(
+        &self,
+        session_id: Uuid,
+        export_id: &str,
+        max: u64,
+        timeout: Duration,
+    ) -> Result<ExportChunk> {
+        let value = self.session_request(
+            session_id,
+            "export_next",
+            json!({ "session_id": session_id, "export_id": export_id, "max": max }),
+            timeout,
+        )?;
+        serde_json::from_value(value).map_err(Error::from)
+    }
+
+    pub fn export_close(&self, session_id: Uuid, export_id: &str) {
+        let _ = self.send_request(
+            "export_close",
+            json!({ "session_id": session_id, "export_id": export_id }),
+            Duration::from_secs(8),
+        );
+    }
+
+    fn session_request(
+        &self,
+        session_id: Uuid,
+        method: &str,
+        params: serde_json::Value,
+        timeout: Duration,
+    ) -> Result<serde_json::Value> {
+        self.send_request(method, params, timeout).inspect_err(|err| {
+            if err.to_string().contains("Session not found") {
+                self.invalidate_session(session_id);
+            }
+        })
     }
 
     pub fn subscribe_events(&self) -> broadcast::Receiver<MongoshEvent> {
@@ -289,20 +454,6 @@ impl MongoshBridge {
         }
 
         Ok(())
-    }
-
-    #[allow(dead_code)]
-    pub fn prune_sessions(&self, keep: &HashSet<Uuid>) {
-        let session_ids: Vec<Uuid> = match self.sessions.lock() {
-            Ok(sessions) => sessions.keys().cloned().collect(),
-            Err(_) => return,
-        };
-
-        for session_id in session_ids {
-            if !keep.contains(&session_id) {
-                let _ = self.dispose_session(session_id);
-            }
-        }
     }
 
     fn send_request(

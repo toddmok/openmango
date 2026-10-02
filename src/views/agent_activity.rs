@@ -1,10 +1,12 @@
 use chrono::{DateTime, Utc};
-use gpui::prelude::FluentBuilder as _;
-use gpui::*;
-use gpui_component::dialog::Dialog;
-use gpui_component::input::InputState;
-use gpui_component::scroll::ScrollableElement as _;
-use gpui_component::{ActiveTheme as _, Icon, IconName, Sizable as _, WindowExt as _};
+use gpui_kit::component::Disableable as _;
+use gpui_kit::component::button::ButtonVariants as _;
+use gpui_kit::component::dialog::Dialog;
+use gpui_kit::component::input::InputState;
+use gpui_kit::component::scroll::ScrollableElement as _;
+use gpui_kit::component::{ActiveTheme as _, Icon, IconName, Sizable as _, WindowExt as _};
+use gpui_kit::prelude::FluentBuilder as _;
+use gpui_kit::*;
 
 use crate::actions::model::{
     ActionRequest, ActionStatus, OperationRecord, OperationStatus, ProposedAction,
@@ -15,41 +17,69 @@ use crate::theme::{islands, sizing, spacing};
 
 pub struct AgentActivityView {
     state: Entity<AppState>,
+    /// What the broker's store held at the last reload. The store is a directory of JSON files,
+    /// so it is read here and never while rendering.
+    actions: Vec<ProposedAction>,
+    operations: Vec<OperationRecord>,
     _subscription: Subscription,
     _refresh: Task<()>,
 }
 
 impl AgentActivityView {
     pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
-        let subscription = cx.observe(&state, |_view, _state, cx| cx.notify());
+        let subscription = cx.observe(&state, |view, _state, cx| {
+            view.reload(cx);
+            cx.notify();
+        });
+        // Operations run outside the app's event stream and actions expire on their own, so the
+        // store is polled while this view is open. A poll that finds nothing new redraws nothing.
         let refresh = cx.spawn(async move |view: WeakEntity<Self>, cx: &mut AsyncApp| {
             loop {
-                Timer::after(std::time::Duration::from_millis(500)).await;
-                if view.update(cx, |_view, cx| cx.notify()).is_err() {
+                cx.background_executor().timer(std::time::Duration::from_millis(500)).await;
+                if view.update(cx, |view, cx| view.reload(cx)).is_err() {
                     break;
                 }
             }
         });
-        Self { state, _subscription: subscription, _refresh: refresh }
+        let mut view = Self {
+            state,
+            actions: Vec::new(),
+            operations: Vec::new(),
+            _subscription: subscription,
+            _refresh: refresh,
+        };
+        view.reload(cx);
+        view
+    }
+
+    fn reload(&mut self, cx: &mut Context<Self>) {
+        let broker = self.state.read(cx).action_broker();
+        let actions = broker.list_all().unwrap_or_default();
+        let operations = broker.store().list_operations().unwrap_or_default();
+        if actions != self.actions || operations != self.operations {
+            self.actions = actions;
+            self.operations = operations;
+            cx.notify();
+        }
     }
 }
 
 impl Render for AgentActivityView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let broker = self.state.read(cx).action_broker();
-        let actions = broker.list_all().unwrap_or_default();
-        let operations = broker.store().list_operations().unwrap_or_default();
+        let actions = &self.actions;
+        let operations = &self.operations;
         let pending = actions
             .iter()
             .filter(|action| action.status == ActionStatus::PendingApproval)
             .cloned()
             .collect::<Vec<_>>();
         let reviewed = actions
-            .into_iter()
+            .iter()
             .filter(|action| {
                 action.status != ActionStatus::PendingApproval && action.operation_id.is_none()
             })
             .take(20)
+            .cloned()
             .collect::<Vec<_>>();
         let pending_count = pending.len();
         let has_reviewed = !reviewed.is_empty();
@@ -104,13 +134,14 @@ impl Render for AgentActivityView {
                 .flex_col()
                 .border_1()
                 .border_color(cx.theme().border)
-                .rounded(px(8.0))
+                .rounded(crate::theme::borders::radius_md())
                 .overflow_hidden()
                 .bg(cx.theme().background)
                 .children(
                     operations
-                        .into_iter()
+                        .iter()
                         .take(50)
+                        .cloned()
                         .map(|operation| operation_row(self.state.clone(), operation, cx)),
                 )
                 .into_any_element()
@@ -121,7 +152,7 @@ impl Render for AgentActivityView {
             .flex_col()
             .border_1()
             .border_color(cx.theme().border)
-            .rounded(px(8.0))
+            .rounded(crate::theme::borders::radius_md())
             .overflow_hidden()
             .bg(cx.theme().background)
             .children(reviewed.into_iter().map(|action| reviewed_action_row(action, cx)));
@@ -252,7 +283,7 @@ fn action_card(
         .flex_col()
         .gap(spacing::md())
         .p(spacing::lg())
-        .rounded(px(8.0))
+        .rounded(crate::theme::borders::radius_md())
         .border_1()
         .border_color(if protected {
             cx.theme().warning.opacity(0.45)
@@ -280,7 +311,7 @@ fn action_card(
                                 .flex()
                                 .items_center()
                                 .justify_center()
-                                .rounded(px(6.0))
+                                .rounded(crate::theme::borders::radius_sm())
                                 .bg(cx.theme().secondary.opacity(0.55))
                                 .child(
                                     Icon::new(action_icon(&action.content.request))
@@ -331,7 +362,7 @@ fn action_card(
             div()
                 .flex()
                 .flex_col()
-                .rounded(px(6.0))
+                .rounded(crate::theme::borders::radius_sm())
                 .bg(cx.theme().secondary.opacity(0.25))
                 .px(spacing::md())
                 .children(preview.source.as_ref().map(|source| {
@@ -386,7 +417,7 @@ fn action_card(
                 .items_start()
                 .gap(spacing::sm())
                 .p(spacing::sm())
-                .rounded(px(6.0))
+                .rounded(crate::theme::borders::radius_sm())
                 .bg(cx.theme().warning.opacity(0.08))
                 .text_color(cx.theme().warning)
                 .child(Icon::new(IconName::TriangleAlert).xsmall())
@@ -421,7 +452,7 @@ fn action_card(
                         .gap(spacing::sm())
                         .child(
                             Button::new(("reject-agent-action", action_id.as_u128() as u64))
-                                .compact()
+                                .xsmall()
                                 .label("Reject")
                                 .on_click(move |_, window, cx| {
                                     let state = reject_state.clone();
@@ -444,9 +475,9 @@ fn action_card(
                         )
                         .child(
                             Button::new(("approve-agent-action", action_id.as_u128() as u64))
-                                .compact()
+                                .xsmall()
                                 .primary()
-                                .label("Approve & Run")
+                                .label("Approve and run")
                                 .on_click(move |_, window, cx| {
                                     if protected {
                                         open_typed_approval_dialog(
@@ -463,7 +494,7 @@ fn action_card(
                                             cx,
                                             "Approve and run",
                                             "OpenMango will revalidate this request, create a durable operation, and begin execution.",
-                                            "Approve & Run",
+                                            "Approve and run",
                                             false,
                                             move |_window, cx| {
                                                 AppCommands::approve_agent_action(
@@ -540,7 +571,7 @@ fn operation_row(state: Entity<AppState>, operation: OperationRecord, cx: &App) 
                 .when(can_cancel, |actions| {
                     actions.child(
                         Button::new(("cancel-agent-operation", operation_id.as_u128() as u64))
-                            .compact()
+                            .xsmall()
                             .danger()
                             .label("Cancel")
                             .on_click(move |_, _, cx| {
@@ -635,27 +666,26 @@ fn open_typed_approval_dialog(
                 let state = state.clone();
                 let input = input.clone();
                 let target_database = target_database.clone();
-                move |_ok, _cancel, _window, cx| {
-                    let matches = input.read(cx).value().as_ref() == target_database;
-                    let state = state.clone();
-                    let input_for_click = input.clone();
-                    let target_for_click = target_database.clone();
-                    vec![
-                        cancel_button("cancel-protected-approval"),
-                        Button::new("approve-protected-action")
-                            .danger()
-                            .label("Approve & Run")
-                            .disabled(!matches)
-                            .on_click(move |_, window, cx| {
-                                if input_for_click.read(cx).value().as_ref() != target_for_click {
-                                    return;
-                                }
-                                window.close_dialog(cx);
-                                AppCommands::approve_agent_action(state.clone(), action_id, cx);
-                            })
-                            .into_any_element(),
-                    ]
-                }
+
+                let matches = input.read(cx).value().as_ref() == target_database;
+                let state = state.clone();
+                let input_for_click = input.clone();
+                let target_for_click = target_database.clone();
+                gpui_kit::component::dialog::DialogFooter::new().children(vec![
+                    cancel_button("cancel-protected-approval"),
+                    Button::new("approve-protected-action")
+                        .danger()
+                        .label("Approve and run")
+                        .disabled(!matches)
+                        .on_click(move |_, window, cx| {
+                            if input_for_click.read(cx).value().as_ref() != target_for_click {
+                                return;
+                            }
+                            window.close_dialog(cx);
+                            AppCommands::approve_agent_action(state.clone(), action_id, cx);
+                        })
+                        .into_any_element(),
+                ])
             })
     });
 }
@@ -688,7 +718,7 @@ fn empty_state(icon: IconName, title: &str, description: &str, cx: &App) -> Div 
         .items_center()
         .gap(spacing::md())
         .p(spacing::lg())
-        .rounded(px(8.0))
+        .rounded(crate::theme::borders::radius_md())
         .border_1()
         .border_color(cx.theme().border)
         .bg(cx.theme().background)
@@ -698,7 +728,7 @@ fn empty_state(icon: IconName, title: &str, description: &str, cx: &App) -> Div 
                 .flex()
                 .items_center()
                 .justify_center()
-                .rounded(px(7.0))
+                .rounded(crate::theme::borders::radius_md())
                 .bg(cx.theme().secondary.opacity(0.45))
                 .child(Icon::new(icon).small().text_color(cx.theme().muted_foreground)),
         )
@@ -776,7 +806,7 @@ fn status_badge(label: &str, color: Hsla, _cx: &App) -> Div {
     div()
         .px(spacing::sm())
         .py(px(2.0))
-        .rounded(px(5.0))
+        .rounded(crate::theme::borders::radius_sm())
         .bg(color.opacity(0.11))
         .text_xs()
         .font_weight(FontWeight::MEDIUM)
@@ -785,11 +815,11 @@ fn status_badge(label: &str, color: Hsla, _cx: &App) -> Div {
         .child(label.to_string())
 }
 
-fn action_icon(request: &ActionRequest) -> IconName {
+fn action_icon(request: &ActionRequest) -> Icon {
     match request {
-        ActionRequest::DatabaseBackup { .. } => IconName::Download,
-        ActionRequest::DatabaseSync { .. } => IconName::Replace,
-        ActionRequest::OperationRevert { .. } => IconName::Undo2,
+        ActionRequest::DatabaseBackup { .. } => crate::assets::AppIcon::Download.into(),
+        ActionRequest::DatabaseSync { .. } => IconName::Replace.into(),
+        ActionRequest::OperationRevert { .. } => IconName::Undo2.into(),
     }
 }
 

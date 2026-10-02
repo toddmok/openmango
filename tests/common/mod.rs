@@ -40,7 +40,9 @@ unsafe extern "C" {
 extern "C" fn remove_container() {
     if let Some(id) = CONTAINER_ID.get() {
         let _ = std::process::Command::new("docker")
-            .args(["rm", "-f", id])
+            // `-v` takes the container's anonymous volumes with it. The Mongo image declares two,
+            // and without the flag every test run left both behind.
+            .args(["rm", "-f", "-v", id])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status();
@@ -153,16 +155,6 @@ impl MongoTestContainer {
 /// Create a simple test document with common fields.
 pub fn test_document(name: &str) -> Document {
     doc! {
-        "name": name,
-        "value": 42,
-        "active": true,
-    }
-}
-
-/// Create a test document with an explicit _id field.
-pub fn test_document_with_id(id: &str, name: &str) -> Document {
-    doc! {
-        "_id": id,
         "name": name,
         "value": 42,
         "active": true,

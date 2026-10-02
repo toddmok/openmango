@@ -2,21 +2,23 @@
 
 mod keybindings;
 
-use gpui::prelude::FluentBuilder as _;
-use gpui::*;
-use gpui_component::ActiveTheme as _;
-use gpui_component::button::ButtonVariants as _;
-use gpui_component::group_box::GroupBoxVariant;
-use gpui_component::input::{Input, InputEvent, InputState, NumberInput};
-use gpui_component::menu::{DropdownMenu as _, PopupMenu, PopupMenuItem};
-use gpui_component::setting::{SettingGroup, SettingItem, SettingPage, Settings};
-use gpui_component::switch::Switch;
-use gpui_component::{Disableable as _, Icon, IconName, Sizable as _, Size};
+use gpui_kit::component::ActiveTheme as _;
+use gpui_kit::component::button::{ButtonGroup, ButtonVariants as _};
+use gpui_kit::component::group_box::GroupBoxVariant;
+use gpui_kit::component::input::{Input, InputEvent, InputState, NumberInput};
+use gpui_kit::component::menu::{DropdownMenu as _, PopupMenu, PopupMenuItem};
+use gpui_kit::component::setting::{SettingGroup, SettingItem, SettingPage, Settings};
+use gpui_kit::component::switch::Switch;
+use gpui_kit::component::{Disableable as _, Icon, IconName, Selectable as _, Sizable as _, Size};
+use gpui_kit::prelude::FluentBuilder as _;
+use gpui_kit::*;
 
 use crate::ai::bridge::AiBridge;
 use crate::ai::model_registry::{self, ModelCache};
 use crate::ai::provider::{AiGenerationRequest, generate_text};
-use crate::components::{Button, open_confirm_dialog, request_app_quit};
+use crate::ai::settings::ModelPreset;
+use crate::components::model_select::{ModelSelectState, ModelSelector};
+use crate::components::{Button, open_confirm_dialog};
 use crate::state::settings::CollectionDoubleClickAction;
 use crate::state::{
     AiProvider, AppCommands, AppSettings, AppState, AppTheme, DEFAULT_FILENAME_TEMPLATE,
@@ -44,6 +46,7 @@ pub struct SettingsView {
     ai_ollama_base_url_input_state: Option<Entity<InputState>>,
     ai_test_in_flight: bool,
     ai_test_result: Option<AiTestResult>,
+    model_selector: Option<ModelSelector>,
     last_seen_provider: AiProvider,
 }
 
@@ -66,6 +69,7 @@ impl SettingsView {
             _subscriptions: subscriptions,
             keybindings_view,
             template_input_state: None,
+            model_selector: None,
             batch_size_input_state: None,
             query_timeout_input_state: None,
             ai_api_key_input_state: None,
@@ -77,6 +81,19 @@ impl SettingsView {
     }
 
     /// Initialize input states on first render (when window is available)
+    /// The model picker keeps its own search state, so it is built once and then synced.
+    fn ensure_model_selector(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<ModelSelectState> {
+        let state = self.state.clone();
+        let selector =
+            self.model_selector.get_or_insert_with(|| ModelSelector::new(&state, window, cx));
+        selector.sync(&state, window, cx);
+        selector.entity()
+    }
+
     fn ensure_input_states(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.template_input_state.is_some()
             && self.batch_size_input_state.is_some()
@@ -253,6 +270,10 @@ impl SettingsView {
                     system_prompt: "You are a health-check assistant. Respond briefly.".to_string(),
                     history: Vec::new(),
                     user_prompt: "Return exactly: AI test passed.".to_string(),
+                    conversation_id: "provider-test".to_string(),
+                    memory: None,
+                    context_tokens: None,
+                    price: None,
                 };
                 generate_text(&settings, request).await
             })
@@ -260,7 +281,7 @@ impl SettingsView {
 
         cx.spawn(async move |_view: WeakEntity<Self>, cx: &mut AsyncApp| {
             let result = task.await;
-            let _ = cx.update(|cx| {
+            cx.update(|cx| {
                 view.update(cx, |this, cx| {
                     this.ai_test_in_flight = false;
                     this.ai_test_result = Some(match result {
@@ -278,6 +299,7 @@ impl SettingsView {
 impl Render for SettingsView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.ensure_input_states(window, cx);
+        let model_select = self.ensure_model_selector(window, cx);
 
         let view = cx.entity();
         let state = self.state.clone();
@@ -311,8 +333,13 @@ impl Render for SettingsView {
                     .keywords([
                         "theme",
                         "appearance",
-                        "vibrancy",
                         "status bar",
+                        "dates",
+                        "time zone",
+                        "utc",
+                        "local time",
+                        "system collections",
+                        "views",
                         "query timeout",
                         "collection",
                         "double click",
@@ -329,7 +356,7 @@ impl Render for SettingsView {
         let template_input = self.template_input_state.clone().unwrap();
         let batch_size_input = self.batch_size_input_state.clone().unwrap();
         let transfer = SettingPage::new("Transfer")
-            .icon(Icon::new(IconName::Download))
+            .icon(Icon::new(crate::assets::AppIcon::Download))
             .description("Defaults used when importing and exporting data.")
             .resettable(false)
             .group(
@@ -362,6 +389,7 @@ impl Render for SettingsView {
         let ai_state = state.clone();
         let ai_view = view.clone();
         let ai_ui = AiSectionUiState {
+            model_select,
             api_key_input_state: self.ai_api_key_input_state.clone().unwrap(),
             ollama_base_url_input_state: self.ai_ollama_base_url_input_state.clone().unwrap(),
             ai_test_in_flight: self.ai_test_in_flight,
@@ -455,7 +483,6 @@ impl Render for SettingsView {
                 ]),
             ));
 
-        let state_for_page_change = state.clone();
         div()
             .size_full()
             .min_w(px(0.0))
@@ -466,13 +493,7 @@ impl Render for SettingsView {
                 Settings::new("openmango-settings")
                     .sidebar_width(px(220.0))
                     .with_group_variant(GroupBoxVariant::Normal)
-                    .pages([general, transfer, ai, agents, keybindings_page])
-                    .on_page_change(move |_, _, cx| {
-                        state_for_page_change.update(cx, |state, cx| {
-                            state.cancel_keybinding_capture();
-                            cx.notify();
-                        });
-                    }),
+                    .pages([general, transfer, ai, agents, keybindings_page]),
             )
     }
 }
@@ -488,99 +509,41 @@ fn render_appearance_section(
     // Theme dropdown
     let theme_dropdown = {
         let state = state.clone();
-        gpui_component::button::Button::new("theme-dropdown")
-            .compact()
+        gpui_kit::component::button::Button::new("theme-dropdown")
+            .xsmall()
             .label(current_theme.label())
             .dropdown_caret(true)
             .rounded(borders::radius_sm())
             .with_size(Size::Small)
-            .dropdown_menu_with_anchor(Corner::BottomLeft, move |menu: PopupMenu, _window, _cx| {
-                let mut m = menu;
-                // Dark themes section
-                m = m.label("Dark");
-                for theme in AppTheme::dark_themes() {
-                    let s = state.clone();
-                    let t = *theme;
-                    m = m.item(PopupMenuItem::new(theme.label()).on_click(move |_, window, cx| {
-                        s.update(cx, |state, cx| {
-                            state.settings.appearance.theme = t;
-                            state.save_settings();
-                            cx.notify();
-                        });
-                        let (user_vibrancy, startup_vibrancy) = {
-                            let state_ref = s.read(cx);
-                            (state_ref.settings.appearance.vibrancy, state_ref.startup_vibrancy)
-                        };
-                        let target_vibrancy = crate::theme::effective_vibrancy(t, user_vibrancy);
-                        crate::theme::apply_theme(t, target_vibrancy, window, cx);
-                        if crate::theme::requires_vibrancy_restart(
-                            startup_vibrancy,
-                            t,
-                            user_vibrancy,
-                        ) {
-                            crate::components::open_confirm_dialog(
-                                window,
-                                cx,
-                                "Restart required",
-                                "Switching this theme changes window vibrancy mode. Restart now to fully apply it.",
-                                "Restart now",
-                                false,
-                                {
-                                    let state = s.clone();
-                                    move |window, cx| {
-                                        request_app_quit(state.clone(), window, cx);
-                                    }
-                                },
-                            );
-                        }
-                    }));
-                }
-                // Light themes section (when available)
-                let light = AppTheme::light_themes();
-                if !light.is_empty() {
-                    m = m.separator().label("Light");
-                    for theme in light {
-                        let s = state.clone();
-                        let t = *theme;
-                        m = m.item(PopupMenuItem::new(theme.label()).on_click(
+            .dropdown_menu_with_anchor(Anchor::BottomLeft, move |menu: PopupMenu, _window, _cx| {
+                let mut menu = menu;
+                for (label, themes) in
+                    [("Dark", AppTheme::dark_themes()), ("Light", AppTheme::light_themes())]
+                {
+                    if label == "Light" {
+                        menu = menu.separator();
+                    }
+                    menu = menu.label(label);
+                    for &theme in themes {
+                        let state = state.clone();
+                        menu = menu.item(PopupMenuItem::new(theme.label()).on_click(
                             move |_, window, cx| {
-                                s.update(cx, |state, cx| {
-                                    state.settings.appearance.theme = t;
-                                    state.save_settings();
-                                    cx.notify();
-                                });
-                                let (user_vibrancy, startup_vibrancy) = {
-                                    let state_ref = s.read(cx);
-                                    (state_ref.settings.appearance.vibrancy, state_ref.startup_vibrancy)
-                                };
-                                let target_vibrancy =
-                                    crate::theme::effective_vibrancy(t, user_vibrancy);
-                                crate::theme::apply_theme(t, target_vibrancy, window, cx);
-                                if crate::theme::requires_vibrancy_restart(
-                                    startup_vibrancy,
-                                    t,
-                                    user_vibrancy,
-                                ) {
-                                    crate::components::open_confirm_dialog(
-                                        window,
-                                        cx,
-                                        "Restart required",
-                                        "Switching this theme changes window vibrancy mode. Restart now to fully apply it.",
-                                        "Restart now",
-                                        false,
-                                        {
-                                            let state = s.clone();
-                                            move |window, cx| {
-                                                request_app_quit(state.clone(), window, cx);
-                                            }
-                                        },
-                                    );
-                                }
+                                crate::theme::pick_theme(&state, theme, window, cx)
                             },
                         ));
                     }
                 }
-                m
+                menu
+            })
+    };
+
+    let follow_system_checkbox = {
+        let state = state.clone();
+        let checked = settings.appearance.follow_system;
+        gpui_kit::component::checkbox::Checkbox::new("follow-system-appearance")
+            .checked(checked)
+            .on_click(move |_, window, cx| {
+                crate::theme::set_follow_system(&state, !checked, window, cx)
             })
     };
 
@@ -588,7 +551,7 @@ fn render_appearance_section(
     let status_bar_checkbox = {
         let state = state.clone();
         let checked = show_status_bar;
-        gpui_component::checkbox::Checkbox::new("show-status-bar").checked(checked).on_click(
+        gpui_kit::component::checkbox::Checkbox::new("show-status-bar").checked(checked).on_click(
             move |_, _, cx| {
                 state.update(cx, |state, cx| {
                     state.settings.appearance.show_status_bar = !checked;
@@ -599,31 +562,40 @@ fn render_appearance_section(
         )
     };
 
-    // Vibrancy toggle
-    let vibrancy_checkbox = {
+    let system_collections_checkbox = {
         let state = state.clone();
-        let checked = settings.appearance.vibrancy;
-        gpui_component::checkbox::Checkbox::new("vibrancy").checked(checked).on_click(
-            move |_, window, cx| {
-                state.update(cx, |state, cx| {
-                    state.settings.appearance.vibrancy = !checked;
-                    state.save_settings();
-                    cx.notify();
-                });
-                crate::components::open_confirm_dialog(
-                    window,
-                    cx,
-                    "Restart required",
-                    "Vibrancy changes require a restart to take effect.",
-                    "Restart now",
-                    false,
-                    {
-                        let state = state.clone();
-                        move |window, cx| request_app_quit(state.clone(), window, cx)
-                    },
-                );
-            },
-        )
+        let checked = settings.appearance.show_system_collections;
+        gpui_kit::component::checkbox::Checkbox::new("show-system-collections")
+            .checked(checked)
+            .on_click(move |_, _, cx| {
+                state.update(cx, |state, cx| state.set_show_system_collections(!checked, cx));
+            })
+    };
+
+    let date_display_dropdown = {
+        use crate::bson::DateDisplay;
+        let label = |display| match display {
+            DateDisplay::Utc => "UTC",
+            DateDisplay::Local => "Local time",
+        };
+        let state = state.clone();
+        gpui_kit::component::button::Button::new("date-display-dropdown")
+            .xsmall()
+            .label(label(settings.appearance.date_display))
+            .dropdown_caret(true)
+            .rounded(borders::radius_sm())
+            .with_size(Size::Small)
+            .dropdown_menu_with_anchor(Anchor::BottomLeft, move |menu: PopupMenu, _window, _cx| {
+                let mut menu = menu;
+                for display in [DateDisplay::Utc, DateDisplay::Local] {
+                    let state = state.clone();
+                    menu =
+                        menu.item(PopupMenuItem::new(label(display)).on_click(move |_, _, cx| {
+                            state.update(cx, |state, cx| state.set_date_display(display, cx));
+                        }));
+                }
+                menu
+            })
     };
 
     section(
@@ -634,15 +606,27 @@ fn render_appearance_section(
             .gap(spacing::md())
             .child(setting_row("Theme", theme_dropdown, cx))
             .child(setting_row_with_description(
+                "Match system appearance",
+                "Use Mango Dark or Mango Light to follow your system's dark or light mode. Choosing a theme turns this off.",
+                follow_system_checkbox,
+                cx,
+            ))
+            .child(setting_row_with_description(
                 "Show status bar",
                 "Display the status bar at the bottom of the window",
                 status_bar_checkbox,
                 cx,
             ))
             .child(setting_row_with_description(
-                "Vibrancy",
-                "Blurred transparent window background (restart required)",
-                vibrancy_checkbox,
+                "Show dates in",
+                "The time zone dates are displayed in. Copied and exported dates are always UTC. You can also switch from the status bar.",
+                date_display_dropdown,
+                cx,
+            ))
+            .child(setting_row_with_description(
+                "Show system collections",
+                "List server-internal collections such as system.views in the sidebar",
+                system_collections_checkbox,
                 cx,
             )),
         cx,
@@ -656,24 +640,56 @@ fn render_query_section(
     cx: &App,
 ) -> impl IntoElement {
     let timeout_input = NumberInput::new(&query_timeout_input_state).small().w(px(120.0));
-    let double_click_action = gpui_component::button::Button::new("collection-double-click-action")
-        .compact()
-        .label(settings.collection_double_click_action.label())
-        .dropdown_caret(true)
-        .with_size(Size::Small)
-        .dropdown_menu_with_anchor(Corner::BottomLeft, move |mut menu: PopupMenu, _, _| {
-            for action in [CollectionDoubleClickAction::Data, CollectionDoubleClickAction::Forge] {
-                let state = state.clone();
-                menu = menu.item(PopupMenuItem::new(action.label()).on_click(move |_, _, cx| {
-                    state.update(cx, |state, cx| {
-                        state.settings.collection_double_click_action = action;
-                        state.save_settings();
-                        cx.notify();
-                    });
-                }));
-            }
-            menu
-        });
+    let page_size_state = state.clone();
+    let double_click_action =
+        gpui_kit::component::button::Button::new("collection-double-click-action")
+            .xsmall()
+            .label(settings.collection_double_click_action.label())
+            .dropdown_caret(true)
+            .with_size(Size::Small)
+            .dropdown_menu_with_anchor(Anchor::BottomLeft, move |mut menu: PopupMenu, _, _| {
+                for action in
+                    [CollectionDoubleClickAction::Data, CollectionDoubleClickAction::Forge]
+                {
+                    let state = state.clone();
+                    menu =
+                        menu.item(PopupMenuItem::new(action.label()).on_click(move |_, _, cx| {
+                            state.update(cx, |state, cx| {
+                                state.settings.collection_double_click_action = action;
+                                state.save_settings();
+                                cx.notify();
+                            });
+                        }));
+                }
+                menu
+            });
+    let forge_page_size = settings.forge_page_size();
+    let forge_page_size_dropdown =
+        gpui_kit::component::button::Button::new("forge-page-size-setting")
+            .xsmall()
+            .label(crate::views::forge::mongosh_group_thousands(forge_page_size))
+            .dropdown_caret(true)
+            .with_size(Size::Small)
+            .dropdown_menu_with_anchor(Anchor::BottomLeft, {
+                let state = page_size_state;
+                move |mut menu: PopupMenu, _, _| {
+                    for &size in crate::state::settings::FORGE_PAGE_SIZES {
+                        let state = state.clone();
+                        menu = menu.item(
+                            PopupMenuItem::new(crate::views::forge::mongosh_group_thousands(size))
+                                .checked(size == forge_page_size)
+                                .on_click(move |_, _, cx| {
+                                    state.update(cx, |state, cx| {
+                                        state.settings.forge_page_size = size;
+                                        state.save_settings();
+                                        cx.notify();
+                                    });
+                                }),
+                        );
+                    }
+                    menu
+                }
+            });
     section(
         "Queries",
         div()
@@ -691,6 +707,12 @@ fn render_query_section(
                 "Forge opens a find-all query for the collection, ready to run.",
                 double_click_action,
                 cx,
+            ))
+            .child(setting_row_with_description(
+                "Forge results per page",
+                "Forge shows this many documents at a time and fetches the next page when you ask for it. Export to Excel always writes every document.",
+                forge_page_size_dropdown,
+                cx,
             )),
         cx,
     )
@@ -702,13 +724,15 @@ fn render_updates_section(
     cx: &App,
 ) -> impl IntoElement {
     let auto_update = settings.auto_update;
+    #[cfg(target_os = "linux")]
+    let desktop_state = state.clone();
 
     let auto_update_checkbox = {
         let state = state.clone();
-        gpui_component::checkbox::Checkbox::new("auto-update").checked(auto_update).on_click(
-            move |_, _, cx| {
+        gpui_kit::component::checkbox::Checkbox::new("auto-update").checked(auto_update).on_click(
+            move |checked, _, cx| {
                 state.update(cx, |state, cx| {
-                    state.settings.auto_update = !auto_update;
+                    state.settings.auto_update = *checked;
                     state.save_settings();
                     cx.notify();
                 });
@@ -716,26 +740,69 @@ fn render_updates_section(
         )
     };
 
-    section(
-        "Updates",
-        div().flex().flex_col().gap(spacing::md()).child(setting_row_with_description(
+    let content = div()
+        .flex()
+        .flex_col()
+        .gap(spacing::md())
+        .child(setting_row_with_description(
             "Automatic updates",
-            "Automatically check for and download updates; restart to install",
+            "Check and download in the background; installation always waits for your approval",
             auto_update_checkbox,
             cx,
-        )),
+        ))
+        .child(setting_row_with_description(
+            "Update channel",
+            "Stable releases by default; nightly builds include unreleased changes",
+            crate::components::updater::channel_picker(
+                "settings-update-channel",
+                state.clone(),
+                cx,
+            ),
+            cx,
+        ))
+        .child(setting_row_with_description(
+            "Software Update",
+            "Review available versions, download progress, and installation errors",
+            Button::new("settings-check-updates").small().label("Check for updates…").on_click(
+                move |_, window, cx| {
+                    AppCommands::check_for_updates(state.clone(), cx);
+                    crate::components::updater::open_updates(state.clone(), window, cx);
+                },
+            ),
+            cx,
+        ));
+    #[cfg(target_os = "linux")]
+    let content = content.child(setting_row_with_description(
+        "Desktop shortcut",
+        "Install this AppImage in your user applications folder and add it to the application menu",
+        Button::new("install-desktop-shortcut").small().label("Install shortcut").on_click(move |_, _, cx| {
+            let state = desktop_state.clone();
+            let task = cx.background_spawn(async { crate::helpers::linux::install_desktop() });
+            cx.spawn(async move |cx: &mut gpui_kit::AsyncApp| {
+                let result = task.await;
+                cx.update(|cx| state.update(cx, |state, cx| {
+                    let message = match result {
+                        Ok(path) => crate::state::StatusMessage::info(format!("Desktop shortcut installed. Open {} from your application menu", path.display())),
+                        Err(error) => crate::state::StatusMessage::error(format!("Desktop installation failed: {error:#}")),
+                    };
+                    state.set_status_message(Some(message));
+                    cx.notify();
+                }));
+            }).detach();
+        }),
         cx,
-    )
+    ));
+    section("Updates", content, cx)
 }
 
 fn render_support_section(state: Entity<AppState>, cx: &App) -> impl IntoElement {
     let log_path = crate::helpers::support::app_log_path();
     let export_button = Button::new("export-support-bundle")
-        .compact()
-        .label("Export Support Bundle...")
+        .xsmall()
+        .label("Export support bundle…")
         .on_click(move |_, _, cx| {
             let state = state.clone();
-            cx.spawn(async move |cx: &mut gpui::AsyncApp| {
+            cx.spawn(async move |cx: &mut gpui_kit::AsyncApp| {
                 let path = crate::components::file_picker::open_file_dialog_async(
                     crate::components::file_picker::FilePickerMode::Save,
                     vec![crate::components::file_picker::FileFilter::new(
@@ -751,17 +818,12 @@ fn render_support_section(state: Entity<AppState>, cx: &App) -> impl IntoElement
                 let result = cx.update(|cx| {
                     crate::helpers::support::export_support_bundle(state.read(cx), &path)
                 });
-                let _ = cx.update(|cx| {
+                cx.update(|cx| {
                     state.update(cx, |state, cx| {
                         match result {
-                            Ok(Ok(())) => {
+                            Ok(()) => {
                                 state.set_status_message(Some(crate::state::StatusMessage::info(
                                     format!("Support bundle exported to {}", path.display()),
-                                )))
-                            }
-                            Ok(Err(error)) => {
-                                state.set_status_message(Some(crate::state::StatusMessage::error(
-                                    format!("Support bundle export failed: {error}"),
                                 )))
                             }
                             Err(error) => {
@@ -825,7 +887,7 @@ fn render_mcp_section(
             }
         });
     let copy_endpoint = Button::new("copy-mcp-endpoint")
-        .compact()
+        .xsmall()
         .icon(Icon::new(IconName::Copy).xsmall())
         .label("Copy")
         .disabled(settings.mcp.port == 0)
@@ -891,8 +953,8 @@ fn render_mcp_grants_section(
     let active_count = settings.mcp.grants.iter().filter(|grant| grant.active()).count();
     let create_button = {
         let state = state.clone();
-        gpui_component::button::Button::new("create-mcp-grant")
-            .compact()
+        gpui_kit::component::button::Button::new("create-mcp-grant")
+            .xsmall()
             .primary()
             .icon(Icon::new(IconName::Plus).xsmall())
             .label("Add client")
@@ -900,7 +962,7 @@ fn render_mcp_grants_section(
             .rounded(borders::radius_sm())
             .with_size(Size::Small)
             .disabled(port == 0)
-            .dropdown_menu_with_anchor(Corner::BottomRight, move |menu: PopupMenu, _window, _cx| {
+            .dropdown_menu_with_anchor(Anchor::BottomRight, move |menu: PopupMenu, _window, _cx| {
                 McpClientKind::ALL.into_iter().fold(menu, |menu, client| {
                     let state = state.clone();
                     menu.item(PopupMenuItem::new(client.label()).on_click(move |_, _, cx| {
@@ -918,7 +980,7 @@ fn render_mcp_grants_section(
         .map(|grant| grant.id)
         .collect::<Vec<_>>();
     let reset_button = Button::new("reset-mcp-access")
-        .compact()
+        .xsmall()
         .danger()
         .label("Revoke all clients")
         .disabled(!settings.mcp.legacy_access && grant_ids.is_empty())
@@ -965,7 +1027,7 @@ fn render_mcp_grants_section(
                 "Compatibility access used by the initial OpenMango MCP setup",
                 div().flex().items_center().gap(spacing::xs()).child(
                     Button::new("revoke-legacy-mcp-grant")
-                        .compact()
+                        .xsmall()
                         .danger()
                         .label("Revoke")
                         .on_click(move |_, window, cx| {
@@ -1010,7 +1072,7 @@ fn render_mcp_grants_section(
                 .gap(spacing::xs())
                 .child(
                     Button::new(("copy-mcp-grant", id.as_u128() as u64))
-                        .compact()
+                        .xsmall()
                         .label("Copy config")
                         .on_click(move |_, _, cx| {
                             cx.write_to_clipboard(ClipboardItem::new_string(mcp_client_config(
@@ -1026,7 +1088,7 @@ fn render_mcp_grants_section(
                     |actions| {
                         actions.child(
                             Button::new(("copy-mcp-grant-token", id.as_u128() as u64))
-                                .compact()
+                                .xsmall()
                                 .label("Copy token")
                                 .on_click(move |_, _, cx| {
                                     copy_mcp_grant_token(state_for_token.clone(), id, cx);
@@ -1036,7 +1098,7 @@ fn render_mcp_grants_section(
                 )
                 .child(
                     Button::new(("revoke-mcp-grant", id.as_u128() as u64))
-                        .compact()
+                        .xsmall()
                         .danger()
                         .label("Revoke")
                         .on_click(move |_, window, cx| {
@@ -1081,7 +1143,7 @@ fn render_mcp_grants_section(
                 .into_any_element()
         } else {
             Button::new(("remove-mcp-grant", id.as_u128() as u64))
-                .compact()
+                .xsmall()
                 .danger()
                 .label("Remove")
                 .on_click(move |_, _, cx| {
@@ -1187,7 +1249,7 @@ fn mcp_grant_row(label: &str, description: &str, actions: impl IntoElement, cx: 
                         .flex()
                         .items_center()
                         .justify_center()
-                        .rounded(px(6.0))
+                        .rounded(crate::theme::borders::radius_sm())
                         .bg(cx.theme().secondary.opacity(0.5))
                         .text_color(cx.theme().secondary_foreground)
                         .child(Icon::new(IconName::Bot).xsmall()),
@@ -1224,7 +1286,7 @@ fn create_mcp_client_grant(state: Entity<AppState>, client: McpClientKind, cx: &
     let write = crate::helpers::keystore::KeyStore::write_mcp_grant(cx, id, &token);
     cx.spawn(async move |cx: &mut AsyncApp| match write.await {
         Ok(()) => {
-            let _ = cx.update(|cx| {
+            cx.update(|cx| {
                 let (label, port) = {
                     let settings = &state.read(cx).settings.mcp;
                     let count =
@@ -1258,7 +1320,7 @@ fn create_mcp_client_grant(state: Entity<AppState>, client: McpClientKind, cx: &
             });
         }
         Err(error) => {
-            let _ = cx.update(|cx| {
+            cx.update(|cx| {
                 state.update(cx, |state, cx| {
                     state.set_status_message(Some(crate::state::StatusMessage::error(format!(
                         "Could not create MCP client grant: {error}"
@@ -1275,7 +1337,7 @@ fn copy_mcp_grant_token(state: Entity<AppState>, id: uuid::Uuid, cx: &mut App) {
     let read = crate::helpers::keystore::KeyStore::read_mcp_grant(cx, id);
     cx.spawn(async move |cx: &mut AsyncApp| match read.await {
         Ok(Some(token)) => {
-            let _ = cx.update(|cx| {
+            cx.update(|cx| {
                 cx.write_to_clipboard(ClipboardItem::new_string(token));
                 state.update(cx, |state, cx| {
                     state.set_status_message(Some(crate::state::StatusMessage::info(
@@ -1286,7 +1348,7 @@ fn copy_mcp_grant_token(state: Entity<AppState>, id: uuid::Uuid, cx: &mut App) {
             });
         }
         Ok(None) => {
-            let _ = cx.update(|cx| {
+            cx.update(|cx| {
                 state.update(cx, |state, cx| {
                     state.set_status_message(Some(crate::state::StatusMessage::error(
                         "Client token is missing from macOS Keychain",
@@ -1296,7 +1358,7 @@ fn copy_mcp_grant_token(state: Entity<AppState>, id: uuid::Uuid, cx: &mut App) {
             });
         }
         Err(error) => {
-            let _ = cx.update(|cx| {
+            cx.update(|cx| {
                 state.update(cx, |state, cx| {
                     state.set_status_message(Some(crate::state::StatusMessage::error(format!(
                         "Could not copy client token: {error}"
@@ -1742,7 +1804,7 @@ fn render_agent_connections_section(
                                 controls.child(
                                     Button::new(("inspect-history", connection_id.as_u128() as u64))
                                         .ghost()
-                                        .compact()
+                                        .xsmall()
                                         .label(if history_inspecting {
                                             "Inspecting…"
                                         } else if history_needs_setup {
@@ -1790,7 +1852,7 @@ fn render_agent_connections_section(
                                         .child(
                                             Button::new(("history-age", connection_id.as_u128() as u64))
                                                 .ghost()
-                                                .compact()
+                                                .xsmall()
                                                 .label(format!("{} days", history_max_age_days))
                                                 .on_click(move |_, _, cx| {
                                                     state_for_age.update(cx, |state, cx| {
@@ -1806,7 +1868,7 @@ fn render_agent_connections_section(
                                         .child(
                                             Button::new(("history-size", connection_id.as_u128() as u64))
                                                 .ghost()
-                                                .compact()
+                                                .xsmall()
                                                 .label(format!(
                                                     "{} MiB",
                                                     history_max_bytes / mib
@@ -1825,7 +1887,7 @@ fn render_agent_connections_section(
                                         .child(
                                             Button::new(("clear-connection-history", connection_id.as_u128() as u64))
                                                 .ghost()
-                                                .compact()
+                                                .xsmall()
                                                 .label("Clear connection")
                                                 .on_click(move |_, window, cx| {
                                                     let state = state_for_clear.clone();
@@ -1872,7 +1934,7 @@ fn render_agent_connections_section(
             .child(
                 Button::new("clear-all-history")
                     .ghost()
-                    .compact()
+                    .xsmall()
                     .label("Clear all History")
                     .on_click({
                         let state = state.clone();
@@ -1881,9 +1943,9 @@ fn render_agent_connections_section(
                             open_confirm_dialog(
                                 window,
                                 cx,
-                                "Clear all History",
+                                "Clear all history?",
                                 "Delete every non-active local encrypted History batch, gap, and resume cursor. Recording restarts from the current point. This cannot be undone.",
-                                "Clear all History",
+                                "Clear all",
                                 true,
                                 move |_, cx| {
                                     AppCommands::clear_all_history(state_for_clear.clone(), cx);
@@ -1911,13 +1973,13 @@ fn render_transfer_section(
     // Format dropdown
     let format_dropdown = {
         let state = state.clone();
-        gpui_component::button::Button::new("format-dropdown")
-            .compact()
+        gpui_kit::component::button::Button::new("format-dropdown")
+            .xsmall()
             .label(current_format.label())
             .dropdown_caret(true)
             .rounded(borders::radius_sm())
             .with_size(Size::Small)
-            .dropdown_menu_with_anchor(Corner::BottomLeft, move |menu: PopupMenu, _window, _cx| {
+            .dropdown_menu_with_anchor(Anchor::BottomLeft, move |menu: PopupMenu, _window, _cx| {
                 let formats = [
                     TransferFormat::JsonLines,
                     TransferFormat::JsonArray,
@@ -1945,13 +2007,13 @@ fn render_transfer_section(
     // Import mode dropdown
     let import_mode_dropdown = {
         let state = state.clone();
-        gpui_component::button::Button::new("import-mode-dropdown")
-            .compact()
+        gpui_kit::component::button::Button::new("import-mode-dropdown")
+            .xsmall()
             .label(current_import_mode.label())
             .dropdown_caret(true)
             .rounded(borders::radius_sm())
             .with_size(Size::Small)
-            .dropdown_menu_with_anchor(Corner::BottomLeft, move |menu, _window, _cx| {
+            .dropdown_menu_with_anchor(Anchor::BottomLeft, move |menu, _window, _cx| {
                 let modes = [InsertMode::Insert, InsertMode::Upsert, InsertMode::Replace];
                 let mut m = menu;
                 for mode in modes {
@@ -1985,8 +2047,8 @@ fn render_transfer_section(
 
         let state_for_browse = state.clone();
         let browse_button = crate::components::Button::new("browse-folder")
-            .compact()
-            .label("Browse...")
+            .xsmall()
+            .label("Browse…")
             .on_click(move |_, _, cx| {
                 let state = state_for_browse.clone();
                 cx.spawn(async move |cx| {
@@ -2000,8 +2062,7 @@ fn render_transfer_section(
                                 state.save_settings();
                                 cx.notify();
                             });
-                        })
-                        .ok();
+                        });
                     }
                 })
                 .detach();
@@ -2012,7 +2073,7 @@ fn render_transfer_section(
             Some(
                 crate::components::Button::new("clear-folder")
                     .ghost()
-                    .compact()
+                    .xsmall()
                     .label("Clear")
                     .on_click(move |_, _, cx| {
                         state.update(cx, |state, cx| {
@@ -2057,12 +2118,12 @@ fn render_transfer_section(
         let template_state_for_dropdown = template_input_state.clone();
         let template_state_for_reset = template_input_state.clone();
 
-        let placeholder_button = gpui_component::button::Button::new("placeholder-dropdown")
-            .compact()
+        let placeholder_button = gpui_kit::component::button::Button::new("placeholder-dropdown")
+            .xsmall()
             .label("${}")
             .rounded(borders::radius_sm())
             .with_size(Size::Small)
-            .dropdown_menu_with_anchor(Corner::BottomLeft, move |mut menu, _window, _cx| {
+            .dropdown_menu_with_anchor(Anchor::BottomLeft, move |mut menu, _window, _cx| {
                 for (placeholder, description) in FILENAME_PLACEHOLDERS {
                     let p = (*placeholder).to_string();
                     let template_state = template_state_for_dropdown.clone();
@@ -2151,6 +2212,7 @@ fn render_transfer_section(
 struct AiSectionUiState {
     api_key_input_state: Entity<InputState>,
     ollama_base_url_input_state: Entity<InputState>,
+    model_select: Entity<ModelSelectState>,
     ai_test_in_flight: bool,
     ai_test_result: Option<AiTestResult>,
 }
@@ -2165,6 +2227,7 @@ fn render_ai_section(
     let AiSectionUiState {
         api_key_input_state,
         ollama_base_url_input_state,
+        model_select,
         ai_test_in_flight,
         ai_test_result,
     } = ai_ui;
@@ -2175,7 +2238,7 @@ fn render_ai_section(
 
     let enabled_checkbox = {
         let state = state.clone();
-        gpui_component::checkbox::Checkbox::new("ai-enabled").checked(ai_enabled).on_click(
+        gpui_kit::component::checkbox::Checkbox::new("ai-enabled").checked(ai_enabled).on_click(
             move |_, window, cx| {
                 if ai_enabled {
                     state.update(cx, |state, cx| {
@@ -2215,10 +2278,66 @@ fn render_ai_section(
         )
     };
 
+    let remember_conversations_checkbox = {
+        let state = state.clone();
+        let checked = settings.ai.remember_conversations;
+        gpui_kit::component::checkbox::Checkbox::new("ai-remember-conversations")
+            .checked(checked)
+            .on_click(move |_, _, cx| {
+                state.update(cx, |state, cx| {
+                    state.settings.ai.remember_conversations = !checked;
+                    state.save_settings();
+                    cx.notify();
+                });
+            })
+    };
+
+    let forget_conversations_button = {
+        let state = state.clone();
+        let stored = state
+            .read(cx)
+            .ai_chat
+            .memory
+            .as_ref()
+            .and_then(|memory| memory.conversation_count().ok().filter(|count| *count > 0));
+        Button::new("ai-forget-conversations")
+            .xsmall()
+            .danger()
+            .label(match stored {
+                Some(1) => "Delete 1 conversation".to_string(),
+                Some(count) => format!("Delete {count} conversations"),
+                None => "Delete all".to_string(),
+            })
+            .disabled(stored.is_none())
+            .on_click(move |_, window, cx| {
+                let state = state.clone();
+                open_confirm_dialog(
+                    window,
+                    cx,
+                    "Delete stored conversations",
+                    "The assistant forgets every earlier conversation on this machine. The chat \
+                     you can see stays as it is.",
+                    "Delete",
+                    true,
+                    move |_, cx| {
+                        state.update(cx, |state, cx| {
+                            if let Some(memory) = &state.ai_chat.memory
+                                && let Err(error) = memory.forget_everything()
+                            {
+                                log::error!("Could not delete stored conversations: {error}");
+                            }
+                            state.ai_chat.conversation_id = None;
+                            cx.notify();
+                        });
+                    },
+                );
+            })
+    };
+
     let selected_documents_checkbox = {
         let state = state.clone();
         let checked = settings.ai.share_selected_documents;
-        gpui_component::checkbox::Checkbox::new("ai-share-selected-documents")
+        gpui_kit::component::checkbox::Checkbox::new("ai-share-selected-documents")
             .checked(checked)
             .on_click(move |_, _, cx| {
                 state.update(cx, |state, cx| {
@@ -2232,7 +2351,7 @@ fn render_ai_section(
     let sample_documents_checkbox = {
         let state = state.clone();
         let checked = settings.ai.share_sample_documents;
-        gpui_component::checkbox::Checkbox::new("ai-share-sample-documents")
+        gpui_kit::component::checkbox::Checkbox::new("ai-share-sample-documents")
             .checked(checked)
             .on_click(move |_, _, cx| {
                 state.update(cx, |state, cx| {
@@ -2246,20 +2365,17 @@ fn render_ai_section(
     let provider_dropdown = {
         let state = state.clone();
         let view = view.clone();
-        gpui_component::button::Button::new("ai-provider-dropdown")
+        gpui_kit::component::button::Button::new("ai-provider-dropdown")
             .ghost()
-            .compact()
+            .xsmall()
             .label(current_provider.label())
             .dropdown_caret(true)
             .rounded(islands::radius_sm(&settings.appearance))
             .with_size(Size::Small)
-            .dropdown_menu_with_anchor(Corner::BottomLeft, move |menu, _window, _cx| {
-                let providers = [
-                    AiProvider::Gemini,
-                    AiProvider::OpenAi,
-                    AiProvider::Anthropic,
-                    AiProvider::Ollama,
-                ];
+            .dropdown_menu_with_anchor(Anchor::BottomLeft, move |menu, _window, _cx| {
+                // Every provider the app knows, so adding one does not mean remembering to add
+                // it here as well.
+                let providers = AiProvider::ALL;
                 let mut menu = menu;
                 for provider in providers {
                     let state = state.clone();
@@ -2283,113 +2399,49 @@ fn render_ai_section(
             })
     };
 
-    let model_dropdown = {
+    // Presets are what most people want; the picker below is for naming an exact model.
+    let has_presets = current_provider.preset_model(ModelPreset::Balanced).is_some();
+    let preset_picker = has_presets.then(|| {
+        let selected = current_provider.preset_for_model(&settings.ai.model);
         let state = state.clone();
-        let current_model = settings.ai.model.clone();
-
-        let models: Vec<String> = match current_provider {
-            AiProvider::Ollama => match cached {
-                ModelCache::Loaded(list) => {
-                    let mut m = list.clone();
-                    if !current_model.trim().is_empty() && !m.contains(&current_model) {
-                        m.push(current_model.clone());
-                        m.sort();
-                    }
-                    m
-                }
-                _ => {
-                    if !current_model.trim().is_empty() {
-                        vec![current_model.clone()]
-                    } else {
-                        vec![]
-                    }
-                }
-            },
-            _ => current_provider.model_options(&current_model),
-        };
-
-        let cached_hint: Option<String> = if current_provider == AiProvider::Ollama {
-            match cached {
-                ModelCache::Loading => Some("Loading models...".to_string()),
-                ModelCache::Error(msg) => {
-                    let hint =
-                        if msg.len() > 60 { format!("{}...", &msg[..57]) } else { msg.clone() };
-                    Some(hint)
-                }
-                ModelCache::NotFetched => Some("Fetching models...".to_string()),
-                _ => None,
-            }
-        } else if matches!(cached, ModelCache::NoKey) {
-            Some("Add API key in Settings".to_string())
-        } else {
-            None
-        };
-
-        gpui_component::button::Button::new("ai-model-dropdown")
-            .ghost()
+        ButtonGroup::new("ai-model-presets")
             .compact()
-            .label(current_model)
-            .dropdown_caret(true)
-            .rounded(islands::radius_sm(&settings.appearance))
-            .with_size(Size::Small)
-            .dropdown_menu_with_anchor(Corner::BottomLeft, move |menu, _window, _cx| {
-                let mut menu = menu;
-                if let Some(hint) = &cached_hint {
-                    menu = menu.item(PopupMenuItem::new(hint.clone()).disabled(true));
-                }
-                for model in &models {
-                    let state = state.clone();
-                    let m = model.clone();
-                    let note = AiProvider::model_note(model);
-                    let item = if let Some(note) = note {
-                        let model_label = model.clone();
-                        let note = note.to_string();
-                        PopupMenuItem::element(move |_window, cx| {
-                            div()
-                                .flex()
-                                .flex_col()
-                                .child(
-                                    div()
-                                        .text_sm()
-                                        .text_color(cx.theme().foreground)
-                                        .child(model_label.clone()),
-                                )
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(cx.theme().muted_foreground)
-                                        .child(note.clone()),
-                                )
-                        })
-                    } else {
-                        PopupMenuItem::new(model.clone())
+            .children(ModelPreset::ALL.into_iter().map(|preset| {
+                gpui_kit::component::button::Button::new(SharedString::from(preset.label()))
+                    .label(preset.label())
+                    .tooltip(preset.description())
+                    .selected(selected == Some(preset))
+                    .with_size(Size::Small)
+            }))
+            .on_click(move |selection, _window, cx| {
+                let Some(preset) = selection.first().and_then(|index| ModelPreset::ALL.get(*index))
+                else {
+                    return;
+                };
+                state.update(cx, |app_state, cx| {
+                    let provider = app_state.settings.ai.provider;
+                    let Some(model) = provider.preset_model(*preset) else {
+                        return;
                     };
-                    menu = menu.item(item.on_click(move |_, _, cx| {
-                        state.update(cx, |app_state, cx| {
-                            app_state.settings.ai.set_model(m.clone());
-                            app_state.save_settings();
-                            cx.notify();
-                        });
-                    }));
-                }
-                menu
+                    app_state.settings.ai.set_model(model.to_string());
+                    app_state.save_settings();
+                    cx.notify();
+                });
             })
-    };
+    });
+
+    let model_dropdown =
+        crate::components::model_select::model_select(&model_select, Size::Small, px(260.0));
 
     let model_status_badge = {
         let (label, accent) = match (current_provider, cached) {
             (AiProvider::Ollama, ModelCache::Loaded(list)) => {
                 (format!("{} models", list.len()), cx.theme().primary)
             }
-            (AiProvider::Ollama, ModelCache::Loading) => {
+            (_, ModelCache::Loading) | (_, ModelCache::NotFetched) => {
                 ("Loading models".to_string(), cx.theme().warning)
             }
-            (AiProvider::Ollama, ModelCache::NotFetched) => {
-                ("Fetching models".to_string(), cx.theme().warning)
-            }
-            (AiProvider::Ollama, ModelCache::Error(_)) => {
-                ("Model fetch error".to_string(), cx.theme().danger)
-            }
+            (_, ModelCache::Error(_)) => ("Model list unavailable".to_string(), cx.theme().danger),
             (_, ModelCache::NoKey) => ("API key missing".to_string(), cx.theme().warning),
             _ => ("Ready".to_string(), cx.theme().muted_foreground),
         };
@@ -2408,8 +2460,8 @@ fn render_ai_section(
     let test_button = {
         let view = view.clone();
         Button::new("ai-test-provider")
-            .compact()
-            .label(if ai_test_in_flight { "Testing..." } else { "Test provider" })
+            .xsmall()
+            .label(if ai_test_in_flight { "Testing…" } else { "Test provider" })
             .disabled(ai_test_in_flight || !ai_enabled)
             .on_click(move |_: &ClickEvent, _window: &mut Window, cx: &mut App| {
                 view.update(cx, |this, cx| {
@@ -2423,7 +2475,7 @@ fn render_ai_section(
             (format!("Provider test succeeded: {}", message.trim()), cx.theme().primary)
         }
         AiTestResult::Error(message) => {
-            (format!("Provider test failed: {}", message.trim()), cx.theme().danger_foreground)
+            (format!("Provider test failed: {}", message.trim()), cx.theme().danger)
         }
     });
 
@@ -2461,6 +2513,7 @@ fn render_ai_section(
                                             .text_color(cx.theme().secondary_foreground)
                                             .child("Model"),
                                     )
+                                    .children(preset_picker)
                                     .child(model_dropdown),
                             )
                             .child(model_status_badge),
@@ -2492,6 +2545,21 @@ fn render_ai_section(
                         "Share document samples",
                         "Include up to five documents from the current result set in automatic AI context.",
                         sample_documents_checkbox,
+                        cx,
+                    ))
+                    .child(setting_row_with_description(
+                        "Remember conversations",
+                        "Keep conversations between runs so the assistant can follow up on earlier \
+                         work. What you and the assistant said is encrypted on this machine; tool \
+                         results, which hold your data, are never written to disk. Conversations \
+                         are deleted after 30 days.",
+                        remember_conversations_checkbox,
+                        cx,
+                    ))
+                    .child(setting_row_with_description(
+                        "Stored conversations",
+                        "Delete every conversation the assistant has kept on this machine.",
+                        forget_conversations_button,
                         cx,
                     )),
                 &settings.appearance,
@@ -2633,6 +2701,8 @@ fn setting_row_with_description(
             div()
                 .flex()
                 .flex_col()
+                .flex_1()
+                .min_w(px(0.0))
                 .gap(px(2.0))
                 .child(
                     div()
@@ -2647,7 +2717,7 @@ fn setting_row_with_description(
                         .child(description.to_string()),
                 ),
         )
-        .child(control)
+        .child(div().flex_shrink_0().child(control))
 }
 
 #[cfg(test)]

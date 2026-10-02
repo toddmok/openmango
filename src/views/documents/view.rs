@@ -1,16 +1,16 @@
+use gpui_kit::component::Disableable as _;
 use std::rc::Rc;
 
 use crate::state::{AppCommands, CollectionStats, CollectionSubview, SchemaAnalysis, SessionKey};
 use crate::theme::spacing;
-use gpui::prelude::FluentBuilder as _;
-use gpui::*;
-use gpui_component::ActiveTheme as _;
-use gpui_component::RopeExt as _;
-use gpui_component::Sizable as _;
-use gpui_component::calendar::{Calendar, CalendarEvent, CalendarState, Date};
-use gpui_component::h_flex;
-use gpui_component::input::{Input, InputEvent, InputState};
-use gpui_component::scroll::ScrollableElement;
+use gpui_kit::component::ActiveTheme as _;
+use gpui_kit::component::Sizable as _;
+use gpui_kit::component::calendar::{Calendar, CalendarEvent, CalendarState, Date};
+use gpui_kit::component::h_flex;
+use gpui_kit::component::input::{EditorState, Input, InputEvent, InputState};
+use gpui_kit::component::scroll::ScrollableElement;
+use gpui_kit::prelude::FluentBuilder as _;
+use gpui_kit::*;
 
 use crate::components::Button;
 use crate::components::filter_builder::FilterBuilderPanel;
@@ -19,13 +19,14 @@ use super::CollectionView;
 use super::header::render_stats_row;
 use super::query::{
     filter_query_validation_error, format_filter_query, is_valid_query, normalized_filter_query,
-    query_validation_error, strict_filter_query_validation_error,
+    query_drafts_equal, query_validation_error, strict_filter_query_validation_error,
 };
 use super::query_completion::{
-    FilterCompletionProvider, QueryCompletionProvider, QueryInputKind,
-    is_query_input_in_string_or_comment,
+    QueryCompletionProvider, QueryInputKind, is_query_input_in_string_or_comment,
 };
+use super::query_editor::{QueryEditorCompletions, new_field_filter_editor, new_query_editor};
 use super::schema_filter_completion::SchemaFilterCompletionProvider;
+use crate::views::editor_completion::{CompletionScope, EditorCompletionMenu};
 
 fn collapse_to_single_line(s: &str) -> String {
     if !s.contains('\n') {
@@ -73,17 +74,6 @@ fn subscribe_time_input(
     )
 }
 
-fn move_cursor_inside_query_object(
-    input: &mut InputState,
-    window: &mut Window,
-    cx: &mut Context<InputState>,
-) {
-    if input.value().trim() == "{}" {
-        let position = input.text().offset_to_position(1);
-        input.set_cursor_position(position, window, cx);
-    }
-}
-
 impl Render for CollectionView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if self.search_state.is_none() {
@@ -127,7 +117,7 @@ impl Render for CollectionView {
             selected_doc,
             selected_docs,
             selected_count,
-            any_selected_dirty,
+            dirty_count,
             filter_raw,
             filter_compiled_raw,
             sort_raw,
@@ -169,7 +159,7 @@ impl Render for CollectionView {
                 snapshot.selected_doc,
                 snapshot.selected_docs,
                 snapshot.selected_count,
-                snapshot.any_selected_dirty,
+                snapshot.dirty_count,
                 snapshot.filter_raw,
                 snapshot.filter_compiled_raw,
                 snapshot.sort_raw,
@@ -208,11 +198,11 @@ impl Render for CollectionView {
                 0,
                 50,
                 false,
-                None::<String>,
+                None::<crate::error::ErrorReport>,
                 None,
                 std::collections::HashSet::new(),
                 0,
-                false,
+                0,
                 String::new(),
                 String::new(),
                 String::new(),
@@ -257,10 +247,8 @@ impl Render for CollectionView {
             });
         }
 
-        let filter_active = !matches!(filter_compiled_raw.trim(), "" | "{}");
         let sort_active = !matches!(sort_raw.trim(), "" | "{}");
         let projection_active = !matches!(projection_raw.trim(), "" | "{}");
-        let filter_valid = self.filter_error_message.is_none();
 
         let filter_dirty = if let Some(ref fs) = self.filter_state {
             let input_text = normalized_filter_query(fs.read(cx).value().as_ref());
@@ -283,34 +271,70 @@ impl Render for CollectionView {
         let range_end = if total == 0 { 0 } else { ((display_page + 1) * per_page_u64).min(total) };
 
         if self.filter_state.is_none() {
-            let filter_state = cx.new(|cx| {
-                let mut state = InputState::new(window, cx)
-                    .multi_line(false)
-                    .placeholder("status:active age>30 or { ... }")
-                    .clean_on_escape();
-                state.lsp.completion_provider =
-                    Some(Rc::new(FilterCompletionProvider::new(self.state.clone())));
-                state
+            let filter_state = cx.new(|cx| new_query_editor(window, cx, "Filter documents…"));
+            let generation = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let menu = cx.new(|cx| {
+                EditorCompletionMenu::new(
+                    &filter_state,
+                    self.state.clone(),
+                    CompletionScope::Collection(session_key.clone()),
+                    generation.clone(),
+                    window,
+                    cx,
+                )
             });
+            let completions = Rc::new(QueryEditorCompletions::new(
+                QueryCompletionProvider::new(self.state.clone(), QueryInputKind::Filter),
+                &filter_state,
+                &menu,
+                generation,
+                window,
+            ));
+            filter_state.update(cx, |input, _| {
+                input.lsp_mut().completion_provider = Some(completions.clone())
+            });
+            self.filter_completions = Some(completions);
+            self.filter_completion_menu = Some(menu);
             let subscription =
                 cx.subscribe_in(&filter_state, window, move |view, state, event, window, cx| {
                     match event {
+                        InputEvent::PressEnter { shift: true, .. } => {}
                         InputEvent::Change => {
                             if view.syncing_query_inputs {
                                 return;
                             }
+                            // Prose is not JSON: no auto-pairing, no validation, no date picker,
+                            // and no field-name menu over the top of what is being typed.
+                            if view.ask_mode {
+                                view.dismiss_filter_completions(cx);
+                                cx.notify();
+                                return;
+                            }
+                            let typed = view
+                                .filter_completions
+                                .as_ref()
+                                .is_some_and(|provider| provider.take_typed_change());
                             let (current_text, cursor) = {
                                 let input = state.read(cx);
                                 (input.value().to_string(), input.cursor())
                             };
+                            let pairing_character = current_text
+                                .get(..cursor)
+                                .and_then(|text| text.chars().next_back());
                             let in_string_or_comment =
-                                is_query_input_in_string_or_comment(&current_text, cursor);
-                            if view.filter_auto_pair.try_auto_pair(
-                                state,
-                                in_string_or_comment,
-                                window,
-                                cx,
-                            ) {
+                                matches!(pairing_character, Some('{' | '[' | '(' | '"'))
+                                    && is_query_input_in_string_or_comment(
+                                        &current_text,
+                                        cursor.saturating_sub(1),
+                                    );
+                            if typed
+                                && view.filter_auto_pair.try_auto_pair(
+                                    state,
+                                    in_string_or_comment,
+                                    window,
+                                    cx,
+                                )
+                            {
                                 return;
                             }
                             let (text, cursor) = {
@@ -318,16 +342,14 @@ impl Render for CollectionView {
                                 (input.value().to_string(), input.cursor())
                             };
                             view.filter_auto_pair.sync(&text);
-                            let next_error = filter_query_validation_error(&text);
-                            let validation_changed = view.filter_error_message != next_error;
-                            view.filter_error_message = next_error;
+                            // Incomplete edits are neutral; Enter requests an actionable error.
+                            view.filter_error_message = None;
 
                             // Detect ISODate("") or Date("") pattern for calendar popup.
                             let show_calendar = cursor <= text.len()
                                 && (text[..cursor].ends_with("ISODate(\"")
                                     || text[..cursor].ends_with("Date(\""))
                                 && text[cursor..].starts_with("\")");
-                            let mut should_notify = validation_changed;
                             if show_calendar {
                                 view.calendar_insert_offset = Some(cursor);
                                 if !view.calendar_open {
@@ -344,19 +366,31 @@ impl Render for CollectionView {
                                             input.set_value(String::new(), window, cx);
                                         });
                                     }
-                                    should_notify = true;
                                 }
                             } else if view.calendar_open {
                                 view.calendar_open = false;
                                 view.calendar_insert_offset = None;
-                                should_notify = true;
                             }
                             view.persist_query_input_drafts(cx);
-                            if should_notify {
-                                cx.notify();
+                            if let Some(provider) = &view.filter_completions
+                                && !provider.take_suppressed_change()
+                                && !typed
+                                && (super::fast_filter::document_id_input(&text).is_some()
+                                    || super::query_values::value_context(&text, cursor)
+                                        .is_some_and(|value| value.prefix.is_empty()))
+                            {
+                                provider.trigger(cx);
                             }
+                            cx.notify();
                         }
-                        InputEvent::PressEnter { .. } => {
+                        InputEvent::PressEnter { shift: false, .. } => {
+                            if let Some(provider) = &view.filter_completions {
+                                provider.dismiss(cx);
+                            }
+                            if view.ask_mode {
+                                view.submit_ask_ai(window, cx);
+                                return;
+                            }
                             let raw = state.read(cx).value().to_string();
                             if let Some(err) = strict_filter_query_validation_error(&raw) {
                                 view.filter_error_message = Some(err);
@@ -386,6 +420,9 @@ impl Render for CollectionView {
                             cx.notify();
                         }
                         InputEvent::Blur => {
+                            if let Some(provider) = &view.filter_completions {
+                                provider.dismiss(cx);
+                            }
                             let current = state.read(cx).value().to_string();
                             if current.trim().is_empty() {
                                 view.filter_auto_pair.sync("");
@@ -396,29 +433,7 @@ impl Render for CollectionView {
                             }
                         }
                         InputEvent::Focus => {
-                            state.update(cx, |input, cx| {
-                                if !input.value().trim().is_empty() {
-                                    move_cursor_inside_query_object(input, window, cx);
-                                }
-                            });
-                            if let Some(session_key) = view.view_model.current_session() {
-                                let should_analyze_schema = {
-                                    let state_ref = view.state.read(cx);
-                                    state_ref.session(&session_key).is_some_and(|session| {
-                                        session.data.schema.is_none()
-                                            && state_ref.collection_meta(&session_key).is_none()
-                                            && !session.data.schema_loading
-                                            && session.data.schema_error.is_none()
-                                    })
-                                };
-                                if should_analyze_schema {
-                                    AppCommands::analyze_collection_schema(
-                                        view.state.clone(),
-                                        session_key,
-                                        cx,
-                                    );
-                                }
-                            }
+                            cx.notify();
                         }
                     }
                 });
@@ -454,17 +469,9 @@ impl Render for CollectionView {
                         let insert_offset = offset;
                         filter_for_calendar.update(cx, |input, cx| {
                             let text = input.value().to_string();
-                            if insert_offset <= text.len() {
-                                let mut new_text =
-                                    String::with_capacity(text.len() + formatted.len());
-                                new_text.push_str(&text[..insert_offset]);
-                                new_text.push_str(&formatted);
-                                new_text.push_str(&text[insert_offset..]);
-                                input.set_value(new_text, _window, cx);
-                                let position = input
-                                    .text()
-                                    .offset_to_position(insert_offset + formatted.len());
-                                input.set_cursor_position(position, _window, cx);
+                            if text.is_char_boundary(insert_offset) {
+                                input.set_selected_range(insert_offset..insert_offset, cx);
+                                input.replace(formatted.clone(), _window, cx);
                             }
                         });
                     }
@@ -484,11 +491,8 @@ impl Render for CollectionView {
 
         if self.sort_state.is_none() {
             let sort_state = cx.new(|cx| {
-                let mut state = InputState::new(window, cx)
-                    .multi_line(false)
-                    .placeholder("sort")
-                    .clean_on_escape();
-                state.lsp.completion_provider = Some(Rc::new(QueryCompletionProvider::new(
+                let mut state = new_query_editor(window, cx, "{ name: 1 }");
+                state.lsp_mut().completion_provider = Some(Rc::new(QueryCompletionProvider::new(
                     self.state.clone(),
                     QueryInputKind::Sort,
                 )));
@@ -497,6 +501,7 @@ impl Render for CollectionView {
             let subscription =
                 cx.subscribe_in(&sort_state, window, move |view, state, event, window, cx| {
                     match event {
+                        InputEvent::PressEnter { shift: true, .. } => {}
                         InputEvent::Change => {
                             if view.syncing_query_inputs {
                                 return;
@@ -517,16 +522,11 @@ impl Render for CollectionView {
                             }
                             let raw = state.read(cx).value().to_string();
                             view.sort_auto_pair.sync(&raw);
-                            let next_error = query_validation_error(&raw).is_some();
-                            if view.sort_error != next_error {
-                                view.sort_error = next_error;
-                                cx.notify();
-                            } else {
-                                view.sort_error = next_error;
-                            }
+                            view.sort_error = query_validation_error(&raw).is_some();
                             view.persist_query_input_drafts(cx);
+                            cx.notify();
                         }
-                        InputEvent::PressEnter { .. } => {
+                        InputEvent::PressEnter { shift: false, .. } => {
                             let raw = state.read(cx).value().to_string();
                             if !is_valid_query(&raw) {
                                 view.sort_error = true;
@@ -555,9 +555,7 @@ impl Render for CollectionView {
                             }
                         }
                         InputEvent::Focus => {
-                            state.update(cx, |input, cx| {
-                                move_cursor_inside_query_object(input, window, cx)
-                            });
+                            cx.notify();
                         }
                     }
                 });
@@ -567,11 +565,8 @@ impl Render for CollectionView {
 
         if self.projection_state.is_none() {
             let projection_state = cx.new(|cx| {
-                let mut state = InputState::new(window, cx)
-                    .multi_line(false)
-                    .placeholder("project {}")
-                    .clean_on_escape();
-                state.lsp.completion_provider = Some(Rc::new(QueryCompletionProvider::new(
+                let mut state = new_query_editor(window, cx, "{ name: 1, _id: 0 }");
+                state.lsp_mut().completion_provider = Some(Rc::new(QueryCompletionProvider::new(
                     self.state.clone(),
                     QueryInputKind::Projection,
                 )));
@@ -601,16 +596,12 @@ impl Render for CollectionView {
                         }
                         let raw = state.read(cx).value().to_string();
                         view.projection_auto_pair.sync(&raw);
-                        let next_error = query_validation_error(&raw).is_some();
-                        if view.projection_error != next_error {
-                            view.projection_error = next_error;
-                            cx.notify();
-                        } else {
-                            view.projection_error = next_error;
-                        }
+                        view.projection_error = query_validation_error(&raw).is_some();
                         view.persist_query_input_drafts(cx);
+                        cx.notify();
                     }
-                    InputEvent::PressEnter { .. } => {
+                    InputEvent::PressEnter { shift: true, .. } => {}
+                    InputEvent::PressEnter { shift: false, .. } => {
                         let raw = state.read(cx).value().to_string();
                         if !is_valid_query(&raw) {
                             view.projection_error = true;
@@ -639,9 +630,7 @@ impl Render for CollectionView {
                         }
                     }
                     InputEvent::Focus => {
-                        state.update(cx, |input, cx| {
-                            move_cursor_inside_query_object(input, window, cx)
-                        });
+                        cx.notify();
                     }
                 },
             );
@@ -651,18 +640,15 @@ impl Render for CollectionView {
 
         if self.schema_filter_state.is_none() {
             let schema_filter_state = cx.new(|cx| {
-                let mut state = InputState::new(window, cx)
-                    .multi_line(false)
-                    .placeholder("Filter fields...")
-                    .clean_on_escape();
-                state.lsp.completion_provider =
+                let mut state = new_field_filter_editor(window, cx, "Filter fields…");
+                state.lsp_mut().completion_provider =
                     Some(Rc::new(SchemaFilterCompletionProvider::new(self.state.clone())));
                 state
             });
             let subscription = cx.subscribe_in(
                 &schema_filter_state,
                 window,
-                move |view, state, event, _window, cx| {
+                move |view, state, event, window, cx| {
                     if !matches!(event, InputEvent::Change) {
                         return;
                     }
@@ -677,6 +663,12 @@ impl Render for CollectionView {
                     }
 
                     let raw = state.read(cx).value().to_string();
+                    if raw.contains('\n') {
+                        state.update(cx, |state, cx| {
+                            state.set_value(collapse_to_single_line(&raw), window, cx);
+                        });
+                        return;
+                    }
                     view.state.update(cx, |state, cx| {
                         state.set_schema_filter(&session_key, raw.clone());
                         cx.notify();
@@ -688,14 +680,21 @@ impl Render for CollectionView {
         }
 
         if self.input_session != session_key {
+            if let Some(menu) = &self.filter_completion_menu {
+                menu.update(cx, |menu, cx| {
+                    menu.set_scope(CompletionScope::Collection(session_key.clone()), cx)
+                });
+            }
+            self.filter_expanded = false;
+            // A different collection has a different filter; there is nothing to go back to.
+            self.ask_mode = false;
+            self.ask_ai_filter = None;
+            self.ask_ai_error = None;
             self.input_session = session_key.clone();
             self.syncing_query_inputs = true;
             if let Some(filter_state) = self.filter_state.clone() {
-                let val = if filter_raw.trim().is_empty() {
-                    String::new()
-                } else {
-                    collapse_to_single_line(&filter_raw)
-                };
+                let val =
+                    if filter_raw.trim().is_empty() { String::new() } else { filter_raw.clone() };
                 filter_state.update(cx, |state, cx| {
                     state.set_value(val.clone(), window, cx);
                 });
@@ -720,20 +719,19 @@ impl Render for CollectionView {
             }
             self.syncing_query_inputs = false;
         } else {
-            // Sync query inputs changed externally (for example Query Library restore).
-            // Never overwrite a field while the user is actively editing it.
+            // Typed drafts are persisted immediately. A different stored draft is an
+            // explicit external change (for example History), even after focus returns here.
             if let Some(filter_state) = self.filter_state.clone() {
-                let expected = if filter_raw.trim().is_empty() {
-                    String::new()
-                } else {
-                    collapse_to_single_line(&filter_raw)
-                };
+                let expected =
+                    if filter_raw.trim().is_empty() { String::new() } else { filter_raw.clone() };
                 let current = filter_state.read(cx).value().to_string();
-                let is_focused = filter_state.read(cx).focus_handle(cx).is_focused(window);
-                if !is_focused && !self.calendar_open && current != expected {
+                // While the bar is being asked a question it holds the question, not the filter.
+                // Syncing it to the stored filter here overwrote every keystroke as it was typed.
+                if !self.ask_mode && !self.calendar_open && !query_drafts_equal(&current, &expected)
+                {
                     self.syncing_query_inputs = true;
                     filter_state.update(cx, |state, cx| {
-                        state.set_value(expected.clone(), window, cx);
+                        state.replace_all(expected.clone(), window, cx);
                     });
                     self.filter_auto_pair.sync(&expected);
                     self.filter_error_message = filter_query_validation_error(&expected);
@@ -742,11 +740,10 @@ impl Render for CollectionView {
             }
             if let Some(sort_state) = self.sort_state.clone() {
                 let current = sort_state.read(cx).value().to_string();
-                let is_focused = sort_state.read(cx).focus_handle(cx).is_focused(window);
-                if !is_focused && current != sort_raw {
+                if !query_drafts_equal(&current, &sort_raw) {
                     self.syncing_query_inputs = true;
                     sort_state.update(cx, |state, cx| {
-                        state.set_value(sort_raw.clone(), window, cx);
+                        state.replace_all(sort_raw.clone(), window, cx);
                     });
                     self.sort_auto_pair.sync(&sort_raw);
                     self.sort_error = query_validation_error(&sort_raw).is_some();
@@ -755,11 +752,10 @@ impl Render for CollectionView {
             }
             if let Some(projection_state) = self.projection_state.clone() {
                 let current = projection_state.read(cx).value().to_string();
-                let is_focused = projection_state.read(cx).focus_handle(cx).is_focused(window);
-                if !is_focused && current != projection_raw {
+                if !query_drafts_equal(&current, &projection_raw) {
                     self.syncing_query_inputs = true;
                     projection_state.update(cx, |state, cx| {
-                        state.set_value(projection_raw.clone(), window, cx);
+                        state.replace_all(projection_raw.clone(), window, cx);
                     });
                     self.projection_auto_pair.sync(&projection_raw);
                     self.projection_error = query_validation_error(&projection_raw).is_some();
@@ -786,7 +782,6 @@ impl Render for CollectionView {
             }
         }
 
-        let filter_state = self.filter_state.clone();
         let sort_state = self.sort_state.clone();
         let projection_state = self.projection_state.clone();
         let schema_filter_state = self.schema_filter_state.clone();
@@ -818,11 +813,8 @@ impl Render for CollectionView {
                     session_key.clone(),
                     selected_doc,
                     selected_count,
-                    any_selected_dirty,
+                    dirty_count,
                     is_loading,
-                    filter_state,
-                    filter_valid,
-                    filter_active,
                     sort_state,
                     projection_state,
                     sort_valid,
@@ -830,10 +822,9 @@ impl Render for CollectionView {
                     sort_active,
                     projection_active,
                     query_options_open,
-                    filter_builder_open,
                     subview,
                     stats_loading,
-                    aggregation.loading,
+                    aggregation.loading || aggregation.stages.is_empty(),
                     explain.loading,
                     schema_loading,
                     col_visibility_search,
@@ -860,7 +851,7 @@ impl Render for CollectionView {
                                         .border_1()
                                         .border_color(border)
                                         .shadow_lg()
-                                        .rounded(px(8.))
+                                        .rounded(crate::theme::borders::radius_md())
                                         .bg(popover_bg)
                                         .text_color(popover_fg)
                                         .on_mouse_up_out(MouseButton::Left, {
@@ -945,6 +936,7 @@ impl Render for CollectionView {
                 schema_filter,
                 schema_filter_state,
                 session_key.clone(),
+                window,
                 cx,
             ),
             CollectionSubview::History => super::views::history_view::render_history_view(
@@ -968,64 +960,30 @@ impl Render for CollectionView {
             if let Some(error) = query_error {
                 let retry_state = self.state.clone();
                 let retry_session = session_key.clone();
-                let details = error.clone();
+                let retry = Button::new("retry-document-query")
+                    .xsmall()
+                    .label("Run again")
+                    .disabled(retry_session.is_none())
+                    .on_click(move |_, _, cx| {
+                        if let Some(session) = retry_session.clone() {
+                            AppCommands::load_documents_for_session(
+                                retry_state.clone(),
+                                session,
+                                cx,
+                            );
+                        }
+                    });
                 div()
                     .flex()
                     .flex_col()
                     .flex_1()
                     .min_h(px(0.0))
                     .child(
-                        div()
-                            .mx(spacing::md())
-                            .mt(spacing::sm())
-                            .p(spacing::sm())
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .gap(spacing::md())
-                            .rounded(px(6.0))
-                            .border_1()
-                            .border_color(cx.theme().danger.opacity(0.4))
-                            .bg(cx.theme().danger.opacity(0.08))
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w(px(0.0))
-                                    .text_sm()
-                                    .text_color(cx.theme().danger_foreground)
-                                    .child(format!("Query failed: {error}")),
-                            )
-                            .child(
-                                div()
-                                    .flex()
-                                    .gap(spacing::xs())
-                                    .child(
-                                        Button::new("retry-document-query")
-                                            .compact()
-                                            .label("Retry")
-                                            .disabled(retry_session.is_none())
-                                            .on_click(move |_, _, cx| {
-                                                if let Some(session) = retry_session.clone() {
-                                                    AppCommands::load_documents_for_session(
-                                                        retry_state.clone(),
-                                                        session,
-                                                        cx,
-                                                    );
-                                                }
-                                            }),
-                                    )
-                                    .child(
-                                        Button::new("copy-document-query-error")
-                                            .ghost()
-                                            .compact()
-                                            .label("Copy Details")
-                                            .on_click(move |_, _, cx| {
-                                                cx.write_to_clipboard(ClipboardItem::new_string(
-                                                    details.clone(),
-                                                ));
-                                            }),
-                                    ),
-                            ),
+                        div().mx(spacing::md()).mt(spacing::sm()).child(
+                            crate::components::ErrorCallout::new("document-query-error", error)
+                                .action(retry)
+                                .state(self.state.clone()),
+                        ),
                     )
                     .child(content)
                     .into_any_element()
@@ -1037,7 +995,7 @@ impl Render for CollectionView {
         };
 
         let explain_layer =
-            self.render_explain_modal_layer(&explain, session_key.clone(), subview, cx);
+            self.render_explain_modal_layer(&explain, session_key.clone(), subview, window, cx);
 
         let show_builder = filter_builder_open && subview == CollectionSubview::Documents;
         if show_builder
@@ -1087,7 +1045,11 @@ impl Render for CollectionView {
             content
         };
 
-        root = root.relative().child(content_with_builder).child(explain_layer);
+        root = root
+            .relative()
+            .child(content_with_builder)
+            .child(explain_layer)
+            .when_some(self.filter_completion_menu.clone(), |root, menu| root.child(menu));
 
         root
     }
@@ -1103,8 +1065,9 @@ impl CollectionView {
         selected_field: Option<String>,
         expanded_fields: std::collections::HashSet<String>,
         schema_filter: String,
-        schema_filter_state: Option<Entity<InputState>>,
+        schema_filter_state: Option<Entity<EditorState>>,
         session_key: Option<SessionKey>,
+        window: &Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         use super::views::schema_view::render_schema_panel;
@@ -1124,6 +1087,8 @@ impl CollectionView {
                 schema_filter_state,
                 session_key,
                 self.state.clone(),
+                self.schema_tree_scroll.clone(),
+                window,
                 cx,
             ))
             .into_any_element()

@@ -1,9 +1,10 @@
 //! Stats row rendering for collection header.
 
-use gpui::*;
-use gpui_component::ActiveTheme as _;
-use gpui_component::Sizable as _;
-use gpui_component::spinner::Spinner;
+use gpui_kit::component::ActiveTheme as _;
+use gpui_kit::component::Disableable as _;
+use gpui_kit::component::Sizable as _;
+use gpui_kit::component::spinner::Spinner;
+use gpui_kit::*;
 
 use crate::components::Button;
 use crate::helpers::{format_bytes, format_number};
@@ -29,33 +30,45 @@ pub fn render_stats_row(
         .border_t_1()
         .border_color(cx.theme().border);
 
+    let view_source =
+        session_key.as_ref().and_then(|key| state.read(cx).view_source(key).map(str::to_owned));
+    if let Some(source) = view_source {
+        return row
+            .child(div().text_sm().text_color(cx.theme().muted_foreground).child(format!(
+                "A view stores nothing of its own, so it has no stats. Its data lives in {source}."
+            )))
+            .into_any_element();
+    }
+
     if stats_loading {
-        row = row.child(Spinner::new().small()).child(
-            div().text_sm().text_color(cx.theme().muted_foreground).child("Loading stats..."),
-        );
+        row = row
+            .child(Spinner::new().small())
+            .child(div().text_sm().text_color(cx.theme().muted_foreground).child("Loading stats…"));
         return row.into_any_element();
     }
 
     if let Some(error) = stats_error {
-        row =
-            row.child(div().text_sm().text_color(cx.theme().danger_foreground).child(error)).child(
-                Button::new("retry-stats")
-                    .ghost()
-                    .compact()
-                    .label("Retry")
-                    .disabled(session_key.is_none())
-                    .on_click({
-                        let state = state.clone();
-                        let session_key = session_key.clone();
-                        move |_: &ClickEvent, _window: &mut Window, cx: &mut App| {
-                            let Some(session_key) = session_key.clone() else {
-                                return;
-                            };
-                            AppCommands::load_collection_stats(state.clone(), session_key, cx);
-                        }
-                    }),
-            );
-        return row.into_any_element();
+        let retry = Button::new("retry-stats")
+            .xsmall()
+            .label("Retry")
+            .disabled(session_key.is_none())
+            .on_click({
+                let state = state.clone();
+                let session_key = session_key.clone();
+                move |_: &ClickEvent, _window: &mut Window, cx: &mut App| {
+                    let Some(session_key) = session_key.clone() else {
+                        return;
+                    };
+                    AppCommands::load_collection_stats(state.clone(), session_key, cx);
+                }
+            });
+        return crate::components::ErrorCallout::new(
+            "stats-error",
+            crate::error::ErrorReport::from_message("Couldn't load stats", &error),
+        )
+        .action(retry)
+        .state(state.clone())
+        .into_any_element();
     }
 
     let Some(stats) = stats else {
